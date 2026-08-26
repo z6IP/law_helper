@@ -1,0 +1,14 @@
+{
+    "permissions": {
+    "allow": [
+    "Read",
+    "write",
+    "Bash(np *)",
+    "Bash(git *)",
+    "Bash(node *)"
+    ],
+    "deny": [
+    "Bash(rn -rf *)"
+    ]
+    }
+}

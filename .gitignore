@@ -1,0 +1,24 @@
+# 环境与密钥
+.env
+
+# 调试脚本
+_debug_*.py
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行时数据
+chroma/
+models/
+data/
+
+# IDE
+.idea/
+
+# 系统
+.DS_Store
+Thumbs.db
