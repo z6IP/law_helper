@@ -24,6 +24,87 @@ app.add_middleware(
 )
 
 
+@app.on_event("startup")
+async def startup_preload():
+    """启动时预加载模型 + 验证索引正确性，消除首次请求冷启动延迟。"""
+    import chromadb
+    from app.ingestion import COLLECTION_NAME
+
+    # Step 0: 强制清理旧 collection（如果模型变更过）
+    settings = get_settings()
+    chroma_path = str(settings.chroma_full_dir)
+    client = chromadb.PersistentClient(path=chroma_path)
+    try:
+        client.delete_collection(COLLECTION_NAME)
+        print("[预加载] 已清理旧索引 collection")
+    except Exception:
+        pass  # collection 不存在时忽略
+
+    # Step 1: 加载 Embedding 模型（local_files_only=True，跳过网络检查）
+    print("[预加载] 正在加载 Embedding 模型...")
+    from app.embeddings import get_embedding_model
+
+    emb_model = get_embedding_model()
+    # warmup: 跑一次推理，确保权重完全加载
+    _ = emb_model.embed_query("小ZAI助手启动预热")
+    print(f"[预加载] Embedding 模型就绪，输出维度: {len(_)}")
+
+    # Step 2: 加载 Reranker 模型（local_files_only=True，跳过网络检查）
+    print("[预加载] 正在加载 Reranker 模型...")
+    from app.rerank import get_reranker
+
+    reranker = get_reranker()
+    # 触发模型加载（懒加载 → 实际加载）
+    reranker._ensure_loaded()
+    # warmup: 跑一次最小推理，确保 CrossEncoder 权重全部加载
+    import torch
+    with torch.inference_mode():
+        _ = reranker._model.predict([("预热查询", "预热文档")])
+    print("[预加载] Reranker 模型就绪")
+
+    # Step 3: 重建 collection 并入库
+    collection = client.get_or_create_collection(
+        name=COLLECTION_NAME,
+        metadata={
+            "hnsw:space": "cosine",
+            "hnsw:construction_ef": 100,
+            "hnsw:search_ef": 16,
+            "hnsw:M": 16,
+        },
+    )
+    count = collection.count()
+    print(f"[预加载] 向量库当前有 {count} 条记录")
+
+    if count == 0:
+        print("[预加载] 向量库为空，开始入库...")
+        n = ingestion.ingest()
+        print(f"[预加载] 入库完成，共 {n} 条")
+    else:
+        print("[预加载] 向量库已有数据")
+
+    # Step 4: 加载检索引擎（BM25 等组件就绪）
+    print("[预加载] 正在加载检索引擎...")
+    from app.retrieval import get_retrieval_engine
+
+    engine = get_retrieval_engine()
+    # 维度检测
+    if engine.needs_rebuild:
+        print("[预加载] 检测到维度不匹配，正在重建索引...")
+        import os
+        # 删除 chroma 目录
+        import shutil
+        if os.path.exists(chroma_path):
+            shutil.rmtree(chroma_path, ignore_errors=True)
+        # 重新入库
+        n = ingestion.ingest()
+        print(f"[预加载] 重建索引完成，共 {n} 条")
+        # 清除缓存重新加载
+        from app.retrieval import get_retrieval_engine as _gre
+        _gre.cache_clear()
+        get_retrieval_engine()
+    print("[预加载] 检索引擎就绪")
+
+
 @app.exception_handler(LawHelperError)
 async def law_error_handler(request, exc: LawHelperError):
     from fastapi.responses import JSONResponse

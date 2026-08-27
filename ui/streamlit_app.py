@@ -7,8 +7,8 @@
 from __future__ import annotations
 
 import json
-import urllib.request
 
+import httpx
 import streamlit as st
 
 BACKEND_URL = "http://127.0.0.1:8000"
@@ -51,39 +51,45 @@ st.markdown(
 
         /* ========== 用户消息 ==========
            - 外层：右对齐到输入框右缘
-           - 内层：气泡贴合文字（inline-block）、给一点内边距（不贴字）
-           - 文字：气泡内左对齐
+           - 内层：气泡给一点内边距，短内容按最小宽度居中
+           - 文字：气泡内居中
          */
-        .stChatMessage:has([data-testid="stChatMessageAvatarUser"]) {
+        [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
             display: flex !important;
             justify-content: flex-end !important;
         }
-        .stChatMessage:has([data-testid="stChatMessageAvatarUser"])
+        [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"])
             [data-testid="stChatMessageContent"] {
-            display: inline-block !important;
+            display: inline-flex !important;
+            justify-content: center !important;
+            align-items: center !important;
             width: auto !important;
             flex: 0 1 auto !important;
-            padding: 5px 14px !important;
+            padding: 8px 14px !important;
             border-radius: 4px !important;
-            background-color: #1e1e2e !important;
+            background-color: rgba(128, 128, 128, 0.15) !important;
+            color: inherit !important;
             margin-left: auto !important;
             margin-right: 0 !important;
             box-sizing: border-box !important;
             max-width: 100% !important;
+            min-width: 60px !important;
         }
-        .stChatMessage:has([data-testid="stChatMessageAvatarUser"])
+        [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"])
             [data-testid="stChatMessageContent"] * {
-            text-align: left !important;
+            text-align: center !important;
         }
-        /* 用户消息内的块级元素不要撑破 inline-block 容器的收缩宽度 */
-        .stChatMessage:has([data-testid="stChatMessageAvatarUser"])
+        /* 用户消息内的块级元素占满 flex 容器宽度，使短内容能在 min-width 内居中 */
+        [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"])
             [data-testid="stChatMessageContent"] > *:first-child,
-        .stChatMessage:has([data-testid="stChatMessageAvatarUser"])
+        [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"])
             [data-testid="stChatMessageContent"] p,
-        .stChatMessage:has([data-testid="stChatMessageAvatarUser"])
+        [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"])
             [data-testid="stChatMessageContent"] div {
-            width: auto !important;
+            width: 100% !important;
             max-width: 100% !important;
+            text-align: center !important;
+            margin: 0 !important;
         }
 
         /* ========== AI 消息 ==========
@@ -91,11 +97,11 @@ st.markdown(
              让 Streamlit 流式输出的容器按默认 block 100% 宽度渲染，避免文字丢失；
            - 只保留：外层左对齐（贴输入框左缘）、文字左对齐、并显式指定颜色为页面前景色。
          */
-        .stChatMessage:has([data-testid="stChatMessageAvatarAssistant"]) {
+        [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) {
             display: flex !important;
             justify-content: flex-start !important;
         }
-        .stChatMessage:has([data-testid="stChatMessageAvatarAssistant"])
+        [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"])
             [data-testid="stChatMessageContent"] {
             /* 仅控制对齐方式与可见性，不改盒模型 */
             text-align: left !important;
@@ -106,7 +112,7 @@ st.markdown(
             margin-right: auto !important;
             max-width: 100% !important;
         }
-        .stChatMessage:has([data-testid="stChatMessageAvatarAssistant"])
+        [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"])
             [data-testid="stChatMessageContent"] * {
             text-align: left !important;
             color: inherit !important;
@@ -119,6 +125,40 @@ st.markdown(
             max-width: 100% !important;
             margin-left: 0 !important;
             margin-right: auto !important;
+        }
+        /* ======== 自定义 spinner / 完成状态 ======== */
+        .thinking-spinner {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            color: #888;
+            font-size: 0.95em;
+            margin-top: 4px;
+        }
+        .thinking-spinner .spinner-ring {
+            width: 14px;
+            height: 14px;
+            border: 2px solid rgba(128, 128, 128, 0.3);
+            border-top-color: #888;
+            border-radius: 50%;
+            animation: thinking-spin 0.8s linear infinite;
+            flex-shrink: 0;
+            display: inline-block;
+        }
+        .thinking-spinner.thinking-done {
+            color: #2a9d8f;
+        }
+        .thinking-spinner .done-icon {
+            width: 14px;
+            height: 14px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 12px;
+            flex-shrink: 0;
+        }
+        @keyframes thinking-spin {
+            to { transform: rotate(360deg); }
         }
         /* ---- 去除底部横杠 ---- */
         /* 底部输入块容器：去除默认背景、顶部分隔线和阴影 */
@@ -153,26 +193,43 @@ st.markdown(
 
 
 def _stream_chat(question: str, refs_holder: dict):
-    """调用后端流式接口，逐段产出回答文本；引用法条写入 refs_holder["references"]。"""
-    payload = json.dumps({"question": question}).encode("utf-8")
-    req = urllib.request.Request(
-        f"{BACKEND_URL}/api/v1/chat/stream",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-    )
+    """调用后端流式接口，yield (kind, payload) 元组。
+
+    使用 httpx 逐行流式读取（iter_lines），确保 reasoning 内容真正实时推送，
+    而不是等待整段思考完成后才一次性显示。
+
+    payload:
+      - references 事件 -> list[dict]（引用法条列表）
+      - reasoning 事件 -> str（思考过程文本块）
+      - delta 事件 -> str（正文文本块）
+    """
+    url = f"{BACKEND_URL}/api/v1/chat/stream"
+    payload = {"question": question}
     try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            for raw in resp:
-                line = raw.decode("utf-8").strip()
-                if not line:
-                    continue
-                data = json.loads(line)
-                if data.get("type") == "references":
-                    refs_holder["references"] = data.get("references", [])
-                elif data.get("type") == "delta":
-                    yield data.get("content", "")
+        with httpx.Client(timeout=180) as client:
+            with client.stream("POST", url, json=payload) as resp:
+                for line in resp.iter_lines():
+                    if not line:
+                        continue
+                    data = json.loads(line)
+                    t = data.get("type")
+                    if t == "references":
+                        yield ("references", data.get("references", []))
+                    elif t == "progress":
+                        yield ("progress", data.get("content", ""))
+                    elif t == "reasoning":
+                        yield ("reasoning", data.get("content", ""))
+                    elif t == "delta":
+                        yield ("delta", data.get("content", ""))
+    except httpx.ConnectError:
+        yield ("delta", "⚠️ 后端服务尚未就绪，请稍后刷新页面重试。")
     except Exception as exc:  # noqa: BLE001
-        yield f"后端调用失败：{exc}"
+        # 连接类错误给出友好提示，其他错误保留原始信息
+        msg = str(exc)
+        if "10061" in msg or "ConnectionRefused" in msg:
+            yield ("delta", "⚠️ 后端服务尚未就绪，请稍后刷新页面重试。")
+        else:
+            yield ("delta", f"后端调用失败：{exc}")
 
 
 if "messages" not in st.session_state:
@@ -182,7 +239,8 @@ if "messages" not in st.session_state:
 def _render_references(references: list[dict]) -> None:
     if not references:
         return
-    with st.expander("查看引用法条"):
+    # 显式 expanded=False + 唯一 key，避免多消息间展开状态串扰
+    with st.expander("查看引用法条", expanded=False, key=f"refs_{id(references)}"):
         for ref in references:
             header = ref.get("article_no", "")
             if ref.get("section_header"):
@@ -264,8 +322,13 @@ if not st.session_state.messages:
 
 # ---- 渲染对话历史 ----
 with chat_placeholder:
-    for msg in st.session_state.messages:
+    for msg_idx, msg in enumerate(st.session_state.messages):
         with st.chat_message(msg["role"]):
+            if msg["role"] == "assistant" and msg.get("reasoning"):
+                # 历史思考过程：用 st.status 展示，标题为"思考完成"，默认收起
+                with st.status("思考完成", state="complete", expanded=False):
+                    st.markdown(msg["reasoning"])
+            # assistant 引用法条渲染
             st.write(msg["content"])
             if msg["role"] == "assistant":
                 _render_references(msg.get("references", []))
@@ -288,13 +351,70 @@ if question := st.chat_input("请输入您的法律问题"):
     refs_holder: dict = {}
     with chat_placeholder:
         with st.chat_message("assistant"):
-            answer = st.write_stream(_stream_chat(question, refs_holder))
-            references = refs_holder.get("references", [])
+            # ===== 思考过程：st.status 容器（标题即状态指示器）=====
+            # 标题在思考中为"思考中"，首个正文 delta 到达后变为"思考完成"；
+            # 默认收起；update 时不传 expanded，尽量保持用户展开/收起状态。
+            think_ph = st.empty()
+            status_container = think_ph.status("思考中", state="running", expanded=False)
+            reasoning_inner = status_container.empty()
+
+            reasoning_buf: list[str] = []
+            answer_buf: list[str] = []
+            answer_placeholder = st.empty()  # 流式正文占位符（替换式更新，避免重复渲染）
+            references: list[dict] = []
+            thinking_done = False
+            has_llm_reasoning = False
+            spinner_label = "思考中"  # 当前状态标签文案
+
+            for kind, data in _stream_chat(question, refs_holder):
+                if kind == "references":
+                    references = data
+                elif kind == "progress":
+                    # 进度文案显示在状态标签上，不写入思考过程
+                    spinner_label = data
+                    status_container.update(label=data, state="running")
+                elif kind == "reasoning":
+                    # 真正的 LLM 思考内容（推理模型才有）
+                    reasoning_buf.append(data)
+                    reasoning_inner.markdown("".join(reasoning_buf))
+                    if not has_llm_reasoning:
+                        has_llm_reasoning = True
+                        # 进入 LLM 思考阶段，状态标签恢复为"思考中"
+                        if spinner_label != "思考中":
+                            spinner_label = "思考中"
+                            status_container.update(label="思考中", state="running")
+                elif kind == "delta":
+                    # 首个 delta 到达：思考结束，状态标签变为"思考完成"
+                    if not thinking_done:
+                        thinking_done = True
+                        status_container.update(label="思考完成", state="complete")
+                    answer_buf.append(data)
+                    answer_placeholder.markdown("".join(answer_buf))
+
+            answer_text = "".join(answer_buf)
+
+            # 只有思考没有正文的情况：同样切换到"思考完成"
+            if not thinking_done:
+                status_container.update(label="思考完成", state="complete")
+                thinking_done = True
+
+            # 非推理模型（无思考内容）：移除思考过程组件
+            if not has_llm_reasoning:
+                think_ph.empty()
+
             _render_references(references)
+
     st.session_state.messages.append(
-        {"role": "assistant", "content": answer, "references": references}
+        {
+            "role": "assistant",
+            "content": answer_text,
+            "references": references,
+            # 仅当有真正的 LLM 思考内容时才保存 reasoning（不含预热文本）
+            "reasoning": "".join(reasoning_buf) if has_llm_reasoning else None,
+        }
     )
-    st.rerun()
+    # 不再 st.rerun()：流式渲染的结果已包含最终状态（思考完成 + 展开），
+    # 避免 rerun 导致 st.status 重建而闪烁。
 
 
 # 初始状态上移输入框、发送后回落到底部（同一元素平滑过渡）

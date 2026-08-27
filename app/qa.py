@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import time
 
 from app.config import get_settings
 from app.llm import get_llm
@@ -142,29 +143,48 @@ def answer_stream(question: str, history: list[dict] | None = None):
 
     每个产出为 dict：
       - {"type": "references", "references": [...]}  （无相关法条时为空列表）
+      - {"type": "reasoning", "content": "..."}  （推理模型的思考过程，普通模型无此事件）
       - {"type": "delta", "content": "..."}
+
+    优化：在检索前立即发送一条 reasoning 事件，让前端思考区域立刻有内容，
+    消除「发送问题后等待几秒才看到思考开始」的空白期。
+    每一步都会向前端 yield 进度 reasoning 事件，让用户看到实时进度。
     """
     settings = get_settings()
+    t0 = time.perf_counter()
 
-    # 无意义输入（单字 / 纯数字 / 问候 / 短词无法律关键词）：先发空 references，
-    # 再让 LLM 流式简短拒答，前端不会出现"查看引用法条"展开器
+    # 无意义输入（单字 / 纯数字 / 问候 / 短词无法律关键词）：不发预热思考，
+    # 直接走拒答分支，前端不会出现思考区域
     if _is_trivial_query(question):
         yield {"type": "references", "references": []}
         user_prompt = _OFF_TOPIC_PROMPT_TEMPLATE.format(question=question)
-        for delta in get_llm().chat_stream(SYSTEM_PROMPT, user_prompt):
-            yield {"type": "delta", "content": delta}
+        for kind, text in get_llm().chat_stream(SYSTEM_PROMPT, user_prompt):
+            if kind == "reasoning":
+                yield {"type": "reasoning", "content": text}
+            else:
+                yield {"type": "delta", "content": text}
         return
 
-    engine = get_retrieval_engine()
-    reranker = get_reranker()
+    # 非 trivial 查询：先发一条进度事件（前端可选择展示或忽略）
+    yield {"type": "progress", "content": "正在分析你的问题..."}
 
+    # Step 1: 检索
+    yield {"type": "progress", "content": "正在检索相关法条..."}
+    engine = get_retrieval_engine()
     candidates = engine.search(question, top_k=settings.top_k_retrieve)
+    t_search = time.perf_counter()
+    print(f"[Timing] 检索耗时: {t_search - t0:.2f}s, 候选数: {len(candidates)}")
+
+    # Step 2: 重排（搜索阶段统一显示"正在搜索..."，不暴露候选数等内部细节）
+    reranker = get_reranker()
     contexts = reranker.rerank(
         question,
         candidates,
         top_n=settings.rerank_top_n,
         min_score=settings.rerank_min_score,
     )
+    t_rerank = time.perf_counter()
+    print(f"[Timing] 重排耗时: {t_rerank - t_search:.2f}s, 命中数: {len(contexts)}")
 
     references = [
         {
@@ -174,15 +194,24 @@ def answer_stream(question: str, history: list[dict] | None = None):
         }
         for c in contexts
     ]
-    # 先发出引用列表（无相关法条时为空），便于前端立即渲染
     yield {"type": "references", "references": references}
 
     if not contexts:
         user_prompt = _OFF_TOPIC_PROMPT_TEMPLATE.format(question=question)
-        for delta in get_llm().chat_stream(SYSTEM_PROMPT, user_prompt):
-            yield {"type": "delta", "content": delta}
+        for kind, text in get_llm().chat_stream(SYSTEM_PROMPT, user_prompt):
+            if kind == "reasoning":
+                yield {"type": "reasoning", "content": text}
+            else:
+                yield {"type": "delta", "content": text}
         return
 
+    # Step 3: LLM 生成
+    yield {"type": "progress", "content": "正在思考回答..."}
     user_prompt = _build_user_prompt(question, contexts)
-    for delta in get_llm().chat_stream(SYSTEM_PROMPT, user_prompt):
-        yield {"type": "delta", "content": delta}
+    for kind, text in get_llm().chat_stream(SYSTEM_PROMPT, user_prompt):
+        if kind == "reasoning":
+            yield {"type": "reasoning", "content": text}
+        else:
+            yield {"type": "delta", "content": text}
+    t_done = time.perf_counter()
+    print(f"[Timing] 总耗时: {t_done - t0:.2f}s")

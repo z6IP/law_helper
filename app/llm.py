@@ -44,7 +44,12 @@ class BailianClient:
             raise LLMError(f"大模型调用失败：{exc}") from exc
 
     def chat_stream(self, system_prompt: str, user_prompt: str):
-        """流式调用百炼生成回答，逐段产出文本增量。"""
+        """流式调用百炼生成回答，逐段产出 (kind, text) 元组。
+
+        kind ∈ {"reasoning", "content"}：
+        - reasoning：推理模型的思考过程（来自 delta.reasoning_content，普通模型为 None）
+        - content：正文（来自 delta.content）
+        """
         self._ensure_loaded()
         settings = get_settings()
         try:
@@ -58,12 +63,16 @@ class BailianClient:
                 stream=True,
             )
             for chunk in resp:
-                if (
-                    chunk.choices
-                    and chunk.choices[0].delta
-                    and chunk.choices[0].delta.content
-                ):
-                    yield chunk.choices[0].delta.content
+                if not (chunk.choices and chunk.choices[0].delta):
+                    continue
+                delta = chunk.choices[0].delta
+                # 思考过程（推理模型才有，普通模型该字段为 None）
+                rc = getattr(delta, "reasoning_content", None)
+                if rc:
+                    yield ("reasoning", rc)
+                # 正文
+                if delta.content:
+                    yield ("content", delta.content)
         except Exception as exc:  # noqa: BLE001 - 统一转为领域异常
             raise LLMError(f"大模型调用失败：{exc}") from exc
 

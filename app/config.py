@@ -28,16 +28,16 @@ class Settings(BaseSettings):
     docx_path: str = "中华人民共和国道路交通安全法_20210429.docx"
     chroma_dir: str = "chroma"
 
-    # Embedding / Rerank 模型
-    embedding_model_id: str = "BAAI/bge-m3"
-    rerank_model_id: str = "BAAI/bge-reranker-v2-m3"
+    # Embedding / Rerank 模型（轻量版，CPU 友好）
+    embedding_model_id: str = "BAAI/bge-small-zh-v1.5"
+    rerank_model_id: str = "BAAI/bge-reranker-base"
     modelscope_cache_dir: str = "models"
 
     # 检索参数
-    top_k_retrieve: int = 20
+    top_k_retrieve: int = 5
     bm25_weight: float = 0.5
     rrf_lambda: int = 60
-    rerank_top_n: int = 5
+    rerank_top_n: int = 3
     # 重排相关性阈值：低于该分的候选视为不相关并丢弃，
     # 全部丢弃时由 LLM 简短拒答，不引用任何法条
     # 实测分布：无关 query top1≈0~0.04，相关 query top1>0.5，0.2 落在两者间留有缓冲

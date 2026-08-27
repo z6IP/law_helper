@@ -3,6 +3,9 @@
 工程约束：
 - 使用 RRF 融合，BM25_WEIGHT=0.5、RRF_LAMBDA=60；
 - 向量检索与 BM25 关键词召回双路，结果用于后续重排序。
+- 动态 embedding 维度检测：如果 ChromaDB 中存储的向量维度
+  与当前 embedding 模型输出维度不匹配，会在加载时自动检测并标记，
+  由上层（main.py startup）负责重建索引。
 """
 from __future__ import annotations
 
@@ -28,6 +31,12 @@ def _rrf(rank: int) -> float:
     return 1.0 / (settings.rrf_lambda + rank)
 
 
+def _get_embedding_dim() -> int:
+    """探测当前 embedding 模型的输出维度。"""
+    test_vec = get_embedding_model().embed_query("维度检测")
+    return len(test_vec)
+
+
 class RetrievalEngine:
     """BM25 + 向量双路召回（RRF 融合）。"""
 
@@ -38,6 +47,7 @@ class RetrievalEngine:
         self._metadatas: list[dict] = []
         self._embeddings: np.ndarray | None = None
         self._bm25: BM25Okapi | None = None
+        self._dim_mismatch: bool = False  # 维度不匹配标记
 
     def _ensure_loaded(self) -> None:
         if self._loaded:
@@ -46,8 +56,16 @@ class RetrievalEngine:
 
         settings = get_settings()
         client = chromadb.PersistentClient(path=str(settings.chroma_full_dir))
+        # HNSW 索引配置：ef_construction 影响构建速度，ef_search 影响查询速度
+        # 小数据集（72 条法条）用较小参数即可，加速构建和查询
         collection = client.get_or_create_collection(
-            name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
+            name=COLLECTION_NAME,
+            metadata={
+                "hnsw:space": "cosine",
+                "hnsw:construction_ef": 100,
+                "hnsw:search_ef": 16,
+                "hnsw:M": 16,
+            },
         )
         result = collection.get(include=["documents", "metadatas", "embeddings"])
         self._ids = result["ids"]
@@ -56,9 +74,25 @@ class RetrievalEngine:
         emb = result.get("embeddings")
         self._embeddings = np.asarray(emb) if emb is not None and len(emb) > 0 else None
 
-        if self._documents:
+        # 维度检测：如果已有向量维度与当前模型不匹配，标记
+        if self._embeddings is not None and len(self._embeddings) > 0:
+            expected_dim = _get_embedding_dim()
+            actual_dim = self._embeddings.shape[1]
+            if actual_dim != expected_dim:
+                print(
+                    f"[Retrieval] 维度不匹配！存储: {actual_dim}维, "
+                    f"当前模型: {expected_dim}维, 需要重建索引"
+                )
+                self._dim_mismatch = True
+
+        if self._documents and not self._dim_mismatch:
             self._bm25 = BM25Okapi([_tokenize(d) for d in self._documents])
         self._loaded = True
+
+    @property
+    def needs_rebuild(self) -> bool:
+        """索引是否需要重建（维度不匹配）。"""
+        return self._dim_mismatch
 
     def search(self, query: str, top_k: int) -> list[dict]:
         """返回融合排序后的 top_k 结果。
@@ -66,8 +100,22 @@ class RetrievalEngine:
         每项结构：{"id", "text", "metadata", "score"}
         """
         self._ensure_loaded()
-        if not self._documents:
-            return []
+        if not self._documents or self._dim_mismatch:
+            # 维度不匹配时回退到仅 BM25 搜索
+            if not self._documents or self._bm25 is None:
+                return []
+            n = len(self._documents)
+            bm25_scores = np.asarray(self._bm25.get_scores(_tokenize(query)))
+            order = np.argsort(-bm25_scores)[:top_k]
+            return [
+                {
+                    "id": self._ids[i],
+                    "text": self._documents[i],
+                    "metadata": self._metadatas[i],
+                    "score": float(bm25_scores[i]),
+                }
+                for i in order
+            ]
 
         n = len(self._documents)
 

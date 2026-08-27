@@ -18,9 +18,9 @@ from app.embeddings import get_embedding_model
 from app.errors import DocumentNotFoundError, IngestionError
 
 # 章 / 节 / 条 标题识别
-CHAPTER_RE = re.compile(r"^第([一二三四五六七八九十百千]+)章\s*(.*)$")
-SECTION_RE = re.compile(r"^第([一二三四五六七八九十百千]+)节\s*(.*)$")
-ARTICLE_RE = re.compile(r"^第([一二三四五六七八九十百千]+)条")
+CHAPTER_RE = re.compile(r"^第([零一二三四五六七八九十百千]+)章\s*(.*)$")
+SECTION_RE = re.compile(r"^第([零一二三四五六七八九十百千]+)节\s*(.*)$")
+ARTICLE_RE = re.compile(r"^第([零一二三四五六七八九十百千]+)条")
 
 COLLECTION_NAME = "road_traffic_law"
 
@@ -48,9 +48,14 @@ class ParserState:
             return self.chapter
         return ""
 
-    def start_article(self, article_no: str) -> None:
+    def flush_current(self) -> None:
+        """把当前法条写入列表并清空，避免章/节切换时丢失最后一条。"""
         if self.current is not None and self.current.text:
             self.articles.append(self.current)
+        self.current = None
+
+    def start_article(self, article_no: str) -> None:
+        self.flush_current()
         self.current = Article(
             article_no=article_no, section_header=self.section_header, text=""
         )
@@ -97,13 +102,14 @@ def parse_docx(docx_path) -> list[Article]:
         m_art = ARTICLE_RE.match(text)
 
         if m_ch and not in_toc:
+            # 先落盘当前法条，再切换章，保证上一章最后一条不丢失
+            state.flush_current()
             state.chapter = f"第{m_ch.group(1)}章 {m_ch.group(2).strip()}"
             state.section = ""
-            state.current = None
             continue
         if m_sec and not in_toc:
+            state.flush_current()
             state.section = f"第{m_sec.group(1)}节 {m_sec.group(2).strip()}"
-            state.current = None
             continue
         if m_art:
             # 进入正文后终止目录识别
@@ -131,7 +137,10 @@ def _make_id(source: str, section_header: str, article_no: str) -> str:
 
 
 def ingest() -> int:
-    """解析 docx 并幂等写入 ChromaDB，返回入库法条数量。"""
+    """解析 docx 并幂等写入 ChromaDB，返回入库法条数量。
+
+    如果 collection 已存在（旧模型创建的），先删除再重建，确保向量维度匹配。
+    """
     settings = get_settings()
     docx_path = settings.docx_full_path
     if not docx_path.exists():
@@ -147,8 +156,22 @@ def ingest() -> int:
 
     chroma_dir = str(settings.chroma_full_dir)
     client = chromadb.PersistentClient(path=chroma_dir)
+
+    # 如果旧 collection 存在，先删除（避免模型变更后维度不匹配）
+    try:
+        client.delete_collection(COLLECTION_NAME)
+    except Exception:
+        pass  # collection 不存在时忽略
+
+    # 重建 collection，使用 HNSW 索引
     collection = client.get_or_create_collection(
-        name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
+        name=COLLECTION_NAME,
+        metadata={
+            "hnsw:space": "cosine",
+            "hnsw:construction_ef": 100,
+            "hnsw:search_ef": 16,
+            "hnsw:M": 16,
+        },
     )
 
     documents = [a.text for a in articles]
