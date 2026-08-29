@@ -6,23 +6,37 @@ import time
 
 from app.config import get_settings
 from app.llm import get_llm
+from app.query_expansion import expand_query
 from app.retrieval import get_retrieval_engine
 from app.rerank import get_reranker
 from app.schemas import Reference
 
 SYSTEM_PROMPT = (
-    "你是「小Z」，一名熟悉《中华人民共和国道路交通安全法》的智能法律助手。"
+    "你是「小Z」，一名熟悉道路交通安全相关法律法规（包括《中华人民共和国道路交通安全法》"
+    "《中华人民共和国道路交通安全法实施条例》《道路交通事故处理程序规定》"
+    "《道路交通安全违法行为记分管理办法》）的智能法律助手。"
     "系统会为你检索并提供与用户问题相关的法条原文供你参考，"
     "这些法条并非用户提供，而是系统根据问题自动检索得到的。"
     "请严格依据提供给你的法条原文回答问题，不要编造法条内容。"
     "回答需简洁、准确，并在涉及具体条款时指出条号。"
     "如果提供的法条不足以回答，请明确说明依据不足。"
-    "如果用户问题明显与道路交通安全法无关，请直接说明你只能回答道路交通安全法相关问题，"
+    "如果用户问题明显与道路交通安全法律法规无关，请直接说明你只能回答道路交通安全相关法律法规的问题，"
     "不要引用任何法条原文，也不要编造法条。"
     "【表述规范】回答中涉及法条来源时，"
-    "请统一使用「系统检索到的法条」「根据检索到的法条」或直接说「根据《中华人民共和国道路交通安全法》」，"
+    "请统一使用「系统检索到的法条」「根据检索到的法条」，"
+    "或根据检索到的法条来源直接说「根据《中华人民共和国道路交通安全法》」"
+    "「根据《中华人民共和国道路交通安全法实施条例》」"
+    "「根据《道路交通事故处理程序规定》」"
+    "「根据《道路交通安全违法行为记分管理办法》」，"
     "绝对不要出现「你提供的法条」「用户提供的法条」等表述。"
     "回答中用「你」指代提问的用户即可。"
+    "【处罚回答规范】回答处罚类问题时请注意：罚款处罚依据《道路交通安全法》"
+    "及其实施条例的相应条款，记分处罚依据《道路交通安全违法行为记分管理办法》的相应条款。"
+    "机动车驾驶人的违法行为通常同时涉及罚款与记分，若两类依据都已检索到，"
+    "应同时给出罚款金额与记分分值，完整回答；"
+    "行人、乘车人、非机动车驾驶人不适用记分制度，仅说明罚款处罚；"
+    "若某行为仅检索到罚款依据而未见记分依据（或反之），"
+    "只依据已检索到的部分回答，不要编造未检索到的处罚内容。"
 )
 
 
@@ -30,8 +44,8 @@ SYSTEM_PROMPT = (
 # 引导 LLM 简短说明职责范围，避免引用不相关法条
 _OFF_TOPIC_PROMPT_TEMPLATE = (
     "用户问题：{question}\n\n"
-    "系统未检索到与该问题相关的《中华人民共和国道路交通安全法》法条。"
-    "请简短说明你只能回答与道路交通安全法相关的问题，不要引用或编造任何法条。"
+    "系统未检索到与该问题相关的道路交通安全法律法规条文。"
+    "请简短说明你只能回答与道路交通安全相关法律法规相关的问题，不要引用或编造任何法条。"
 )
 
 
@@ -51,6 +65,7 @@ _LAW_KEYWORDS = (
     "违法", "罚款", "扣分", "驾照", "驾驶证", "行驶证", "行人", "道路",
     "高速", "红绿灯", "信号灯", "限速", "停车", "超速", "逆行", "闯",
     "保险", "责任", "行人", "非机动车", "电动车", "摩托", "头盔", "安全带",
+    "调解", "复核", "管辖", "鉴定", "逃逸", "协商", "认定", "赔偿",
 )
 
 
@@ -85,13 +100,14 @@ def _build_user_prompt(question: str, contexts: list[dict]) -> str:
     blocks = []
     for c in contexts:
         meta = c.get("metadata", {})
+        source = meta.get("source", "")
         article_no = meta.get("article_no", "")
         section = meta.get("section_header", "")
-        header = f"【{article_no}】" + (f"（{section}）" if section else "")
+        header = f"【{source}·{article_no}】" + (f"（{section}）" if section else "")
         blocks.append(f"{header}\n{c['text']}")
     context_text = "\n\n".join(blocks)
     return (
-        f"以下是系统根据用户问题检索到的《中华人民共和国道路交通安全法》相关法条原文：\n\n"
+        f"以下是系统根据用户问题检索到的相关法律法规条文原文：\n\n"
         f"{context_text}\n\n"
         f"用户问题：{question}\n\n"
         f"请严格依据上述检索到的法条原文回答，回答中不要提及法条的来源（不要说「用户提供」「你提供」等）。"
@@ -110,9 +126,10 @@ def answer(question: str, history: list[dict] | None = None) -> tuple[str, list[
     engine = get_retrieval_engine()
     reranker = get_reranker()
 
-    candidates = engine.search(question, top_k=settings.top_k_retrieve)
+    retrieval_q = expand_query(question)
+    candidates = engine.search(retrieval_q, top_k=settings.top_k_retrieve)
     contexts = reranker.rerank(
-        question,
+        retrieval_q,
         candidates,
         top_n=settings.rerank_top_n,
         min_score=settings.rerank_min_score,
@@ -129,6 +146,7 @@ def answer(question: str, history: list[dict] | None = None) -> tuple[str, list[
 
     references = [
         Reference(
+            source=c["metadata"].get("source", ""),
             article_no=c["metadata"].get("article_no", ""),
             section_header=c["metadata"].get("section_header", ""),
             text=c["text"],
@@ -171,14 +189,15 @@ def answer_stream(question: str, history: list[dict] | None = None):
     # Step 1: 检索
     yield {"type": "progress", "content": "正在检索相关法条..."}
     engine = get_retrieval_engine()
-    candidates = engine.search(question, top_k=settings.top_k_retrieve)
+    retrieval_q = expand_query(question)
+    candidates = engine.search(retrieval_q, top_k=settings.top_k_retrieve)
     t_search = time.perf_counter()
     print(f"[Timing] 检索耗时: {t_search - t0:.2f}s, 候选数: {len(candidates)}")
 
     # Step 2: 重排（搜索阶段统一显示"正在搜索..."，不暴露候选数等内部细节）
     reranker = get_reranker()
     contexts = reranker.rerank(
-        question,
+        retrieval_q,
         candidates,
         top_n=settings.rerank_top_n,
         min_score=settings.rerank_min_score,
@@ -188,6 +207,7 @@ def answer_stream(question: str, history: list[dict] | None = None):
 
     references = [
         {
+            "source": c["metadata"].get("source", ""),
             "article_no": c["metadata"].get("article_no", ""),
             "section_header": c["metadata"].get("section_header", ""),
             "text": c["text"],

@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from app.config import get_settings
 from app.embeddings import get_embedding_model
@@ -23,6 +24,18 @@ SECTION_RE = re.compile(r"^第([零一二三四五六七八九十百千]+)节\s*
 ARTICLE_RE = re.compile(r"^第([零一二三四五六七八九十百千]+)条")
 
 COLLECTION_NAME = "road_traffic_law"
+
+
+def _clean_title(title: str) -> str:
+    """清理章/节标题内部空白（含 U+2002 全角空格），如「总　则」→「总则」。"""
+    return re.sub(r"[\u2002\s]+", "", (title or "").strip())
+
+
+def _clean_source_name(path) -> str:
+    """由文档路径得到干净来源名：去 .docx 后缀 + 去末尾日期后缀。"""
+    name = Path(path).stem
+    name = re.sub(r"_\d{8}$", "", name)
+    return name
 
 
 @dataclass
@@ -104,12 +117,12 @@ def parse_docx(docx_path) -> list[Article]:
         if m_ch and not in_toc:
             # 先落盘当前法条，再切换章，保证上一章最后一条不丢失
             state.flush_current()
-            state.chapter = f"第{m_ch.group(1)}章 {m_ch.group(2).strip()}"
+            state.chapter = f"第{m_ch.group(1)}章 {_clean_title(m_ch.group(2))}"
             state.section = ""
             continue
         if m_sec and not in_toc:
             state.flush_current()
-            state.section = f"第{m_sec.group(1)}节 {m_sec.group(2).strip()}"
+            state.section = f"第{m_sec.group(1)}节 {_clean_title(m_sec.group(2))}"
             continue
         if m_art:
             # 进入正文后终止目录识别
@@ -137,33 +150,19 @@ def _make_id(source: str, section_header: str, article_no: str) -> str:
 
 
 def ingest() -> int:
-    """解析 docx 并幂等写入 ChromaDB，返回入库法条数量。
+    """解析根目录下所有 .docx 并幂等 upsert 到 ChromaDB，返回入库条文总数。
 
-    如果 collection 已存在（旧模型创建的），先删除再重建，确保向量维度匹配。
+    多个文档共用同一 collection，向量 id 基于 md5(source + section_header + article_no)
+    保证同一条文重复入库时覆盖而非重复。
     """
     settings = get_settings()
-    docx_path = settings.docx_full_path
-    if not docx_path.exists():
-        raise DocumentNotFoundError(f"文档不存在：{docx_path}")
-
-    articles = parse_docx(docx_path)
-    if not articles:
-        raise IngestionError("未从文档中解析到任何法条")
-
-    source = docx_path.name
+    paths = settings.docx_full_paths
+    if not paths:
+        raise DocumentNotFoundError("statute/ 目录下未找到任何 .docx 法规文档")
 
     import chromadb
 
-    chroma_dir = str(settings.chroma_full_dir)
-    client = chromadb.PersistentClient(path=chroma_dir)
-
-    # 如果旧 collection 存在，先删除（避免模型变更后维度不匹配）
-    try:
-        client.delete_collection(COLLECTION_NAME)
-    except Exception:
-        pass  # collection 不存在时忽略
-
-    # 重建 collection，使用 HNSW 索引
+    client = chromadb.PersistentClient(path=str(settings.chroma_full_dir))
     collection = client.get_or_create_collection(
         name=COLLECTION_NAME,
         metadata={
@@ -174,26 +173,32 @@ def ingest() -> int:
         },
     )
 
-    documents = [a.text for a in articles]
-    metadatas = [
-        {"article_no": a.article_no, "section_header": a.section_header, "source": source}
-        for a in articles
-    ]
-    ids = [_make_id(source, a.section_header, a.article_no) for a in articles]
-
     embedding_model = get_embedding_model()
-    embeddings = embedding_model.embed_documents(documents)
+    total = 0
+    for path in paths:
+        articles = parse_docx(path)
+        if not articles:
+            raise IngestionError(f"未从文档中解析到任何法条：{path.name}")
 
-    collection.upsert(
-        ids=ids, documents=documents, metadatas=metadatas, embeddings=embeddings
-    )
+        source = _clean_source_name(path)
+        documents = [a.text for a in articles]
+        metadatas = [
+            {"article_no": a.article_no, "section_header": a.section_header, "source": source}
+            for a in articles
+        ]
+        ids = [_make_id(source, a.section_header, a.article_no) for a in articles]
+        embeddings = embedding_model.embed_documents(documents)
+        collection.upsert(
+            ids=ids, documents=documents, metadatas=metadatas, embeddings=embeddings
+        )
+        total += len(articles)
 
-    return len(articles)
+    return total
 
 
 def main() -> None:
     count = ingest()
-    print(f"入库完成，共 {count} 条法条")
+    print(f"入库完成，共 {count} 条")
 
 
 if __name__ == "__main__":

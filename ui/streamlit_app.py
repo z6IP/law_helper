@@ -242,7 +242,9 @@ def _render_references(references: list[dict]) -> None:
     # 显式 expanded=False + 唯一 key，避免多消息间展开状态串扰
     with st.expander("查看引用法条", expanded=False, key=f"refs_{id(references)}"):
         for ref in references:
-            header = ref.get("article_no", "")
+            source = ref.get("source", "")
+            article_no = ref.get("article_no", "")
+            header = f"《{source}》{article_no}" if source else article_no
             if ref.get("section_header"):
                 header += f"（{ref['section_header']}）"
             st.markdown(f"**{header}**")

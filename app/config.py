@@ -25,7 +25,6 @@ class Settings(BaseSettings):
     llm_model: str = "qwen-plus"
 
     # 数据与存储
-    docx_path: str = "中华人民共和国道路交通安全法_20210429.docx"
     chroma_dir: str = "chroma"
 
     # Embedding / Rerank 模型（轻量版，CPU 友好）
@@ -40,18 +39,20 @@ class Settings(BaseSettings):
     rerank_top_n: int = 3
     # 重排相关性阈值：低于该分的候选视为不相关并丢弃，
     # 全部丢弃时由 LLM 简短拒答，不引用任何法条
-    # 实测分布：无关 query top1≈0~0.04，相关 query top1>0.5，0.2 落在两者间留有缓冲
+    # 实测（bge-reranker-v2-m3 + 查询改写，8 场景端到端标定）：
+    #   相关条文 top1 ≈ 0.49~0.99（转弯让直行 0.91 / 酒驾 0.99 / 追尾 0.49 / 闯红灯 0.83 等）
+    #   无关 query / 弱相关候选普遍 <0.11
+    #   0.2 落在两侧之间；注意：相关条文分数依赖查询改写弥合口语→法条术语的鸿沟，
+    #   新增改写规则后需回归此阈值
     rerank_min_score: float = 0.2
 
     # 服务
     backend_url: str = "http://127.0.0.1:8000"
 
     @property
-    def docx_full_path(self) -> Path:
-        p = Path(self.docx_path)
-        if not p.is_absolute():
-            p = BASE_DIR / p
-        return p
+    def docx_full_paths(self) -> list[Path]:
+        """statute/ 目录下所有 .docx 法规文档（语料数据源，自动纳入新法规）。"""
+        return sorted((BASE_DIR / "statute").glob("*.docx"))
 
     @property
     def chroma_full_dir(self) -> Path:

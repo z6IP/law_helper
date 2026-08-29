@@ -30,15 +30,9 @@ async def startup_preload():
     import chromadb
     from app.ingestion import COLLECTION_NAME
 
-    # Step 0: 强制清理旧 collection（如果模型变更过）
     settings = get_settings()
     chroma_path = str(settings.chroma_full_dir)
     client = chromadb.PersistentClient(path=chroma_path)
-    try:
-        client.delete_collection(COLLECTION_NAME)
-        print("[预加载] 已清理旧索引 collection")
-    except Exception:
-        pass  # collection 不存在时忽略
 
     # Step 1: 加载 Embedding 模型（local_files_only=True，跳过网络检查）
     print("[预加载] 正在加载 Embedding 模型...")
@@ -62,7 +56,7 @@ async def startup_preload():
         _ = reranker._model.predict([("预热查询", "预热文档")])
     print("[预加载] Reranker 模型就绪")
 
-    # Step 3: 重建 collection 并入库
+    # Step 3: 校验索引（维度检测优先，条件重建）
     collection = client.get_or_create_collection(
         name=COLLECTION_NAME,
         metadata={
@@ -79,29 +73,27 @@ async def startup_preload():
         print("[预加载] 向量库为空，开始入库...")
         n = ingestion.ingest()
         print(f"[预加载] 入库完成，共 {n} 条")
-    else:
-        print("[预加载] 向量库已有数据")
-
-    # Step 4: 加载检索引擎（BM25 等组件就绪）
-    print("[预加载] 正在加载检索引擎...")
-    from app.retrieval import get_retrieval_engine
-
-    engine = get_retrieval_engine()
-    # 维度检测
-    if engine.needs_rebuild:
-        print("[预加载] 检测到维度不匹配，正在重建索引...")
-        import os
-        # 删除 chroma 目录
-        import shutil
-        if os.path.exists(chroma_path):
-            shutil.rmtree(chroma_path, ignore_errors=True)
-        # 重新入库
-        n = ingestion.ingest()
-        print(f"[预加载] 重建索引完成，共 {n} 条")
-        # 清除缓存重新加载
         from app.retrieval import get_retrieval_engine as _gre
         _gre.cache_clear()
-        get_retrieval_engine()
+    else:
+        from app.retrieval import get_retrieval_engine
+        engine = get_retrieval_engine()
+        if engine.needs_rebuild:
+            print("[预加载] 检测到维度不匹配，正在重建索引...")
+            import os
+            import shutil
+            if os.path.exists(chroma_path):
+                shutil.rmtree(chroma_path, ignore_errors=True)
+            from app.retrieval import get_retrieval_engine as _gre
+            _gre.cache_clear()
+            n = ingestion.ingest()
+            print(f"[预加载] 重建索引完成，共 {n} 条")
+
+    # Step 4: 加载 / 刷新检索引擎（BM25 等组件就绪）
+    print("[预加载] 正在加载检索引擎...")
+    from app.retrieval import get_retrieval_engine as _gre
+    _gre.cache_clear()
+    get_retrieval_engine()
     print("[预加载] 检索引擎就绪")
 
 

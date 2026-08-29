@@ -8,6 +8,7 @@ class ChatRequest(BaseModel):
 
 
 class Reference(BaseModel):
+    source: str = Field("", description="法条来源文档名称")
     article_no: str = Field(..., description="条号，如“第九十一条”")
     section_header: str = Field("", description="所属章/节标题")
     text: str = Field(..., description="法条原文")
