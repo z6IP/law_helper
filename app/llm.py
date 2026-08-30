@@ -26,8 +26,8 @@ class BailianClient:
             base_url=settings.openai_api_base,
         )
 
-    def chat(self, system_prompt: str, user_prompt: str) -> str:
-        """调用百炼生成回答，返回文本内容。"""
+    def chat(self, system_prompt: str, user_prompt: str, temperature: float = 0.2) -> str:
+        """调用百炼生成回答，返回文本内容。temperature 可覆盖默认值（如查询改写用 0.0）。"""
         self._ensure_loaded()
         settings = get_settings()
         try:
@@ -37,7 +37,9 @@ class BailianClient:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                temperature=0.2,
+                temperature=temperature,
+                # qwen3 系列关闭思考输出（非流式调用不需要思考）；其他模型忽略该参数
+                extra_body={"enable_thinking": False},
             )
             return resp.choices[0].message.content or ""
         except Exception as exc:  # noqa: BLE001 - 统一转为领域异常

@@ -1,4 +1,4 @@
-"""CrossEncoder 重排序（bge-reranker-base，CPU 友好）。
+"""CrossEncoder 重排序（bge-reranker-v2-m3，CPU 友好）。
 
 CPU 推理优化：torch.inference_mode() + model.eval() + batch 预测。
 """
@@ -12,7 +12,7 @@ from app.errors import RetrievalError
 
 
 class Reranker:
-    """bge-reranker-base CrossEncoder 封装（懒加载单例）。"""
+    """bge-reranker-v2-m3 CrossEncoder 封装（懒加载单例）。"""
 
     def __init__(self) -> None:
         self._model = None

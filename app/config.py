@@ -6,6 +6,7 @@
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # 项目根目录（app/ 的上一级）
@@ -26,17 +27,22 @@ class Settings(BaseSettings):
 
     # 数据与存储
     chroma_dir: str = "chroma"
+    # 会话持久化目录（本地文件存储，每会话一个 JSON）
+    sessions_dir: str = "data/sessions"
 
     # Embedding / Rerank 模型（轻量版，CPU 友好）
     embedding_model_id: str = "BAAI/bge-small-zh-v1.5"
-    rerank_model_id: str = "BAAI/bge-reranker-base"
+    rerank_model_id: str = "BAAI/bge-reranker-v2-m3"
     modelscope_cache_dir: str = "models"
 
+    # 多轮对话：参与历史改写的最大消息条数（3 轮 = 6 条）
+    history_max_messages: int = Field(6, ge=0, le=20)
+
     # 检索参数
-    top_k_retrieve: int = 5
-    bm25_weight: float = 0.5
-    rrf_lambda: int = 60
-    rerank_top_n: int = 3
+    top_k_retrieve: int = Field(10, ge=1, le=50)
+    bm25_weight: float = Field(0.5, ge=0.0, le=1.0)
+    rrf_lambda: int = Field(60, ge=1)
+    rerank_top_n: int = Field(3, ge=1, le=10)
     # 重排相关性阈值：低于该分的候选视为不相关并丢弃，
     # 全部丢弃时由 LLM 简短拒答，不引用任何法条
     # 实测（bge-reranker-v2-m3 + 查询改写，8 场景端到端标定）：
@@ -44,7 +50,7 @@ class Settings(BaseSettings):
     #   无关 query / 弱相关候选普遍 <0.11
     #   0.2 落在两侧之间；注意：相关条文分数依赖查询改写弥合口语→法条术语的鸿沟，
     #   新增改写规则后需回归此阈值
-    rerank_min_score: float = 0.2
+    rerank_min_score: float = Field(0.2, ge=0.0, le=1.0)
 
     # 服务
     backend_url: str = "http://127.0.0.1:8000"
@@ -57,6 +63,13 @@ class Settings(BaseSettings):
     @property
     def chroma_full_dir(self) -> Path:
         p = Path(self.chroma_dir)
+        if not p.is_absolute():
+            p = BASE_DIR / p
+        return p
+
+    @property
+    def sessions_full_dir(self) -> Path:
+        p = Path(self.sessions_dir)
         if not p.is_absolute():
             p = BASE_DIR / p
         return p

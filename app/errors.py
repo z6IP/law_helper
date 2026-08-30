@@ -39,3 +39,8 @@ class LLMError(LawHelperError):
 class DocumentNotFoundError(LawHelperError):
     status_code = 404
     message = "文档不存在"
+
+
+class SessionError(LawHelperError):
+    status_code = 400
+    message = "会话操作失败"

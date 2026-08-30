@@ -6,12 +6,19 @@ import json
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from pydantic import ValidationError
 
-from app import ingestion
+from app import ingestion, session_store
 from app.config import get_settings
 from app.errors import LawHelperError
 from app.qa import answer, answer_stream
-from app.schemas import ChatRequest, ChatResponse, IngestResponse
+from app.schemas import (
+    ChatRequest,
+    ChatResponse,
+    IngestResponse,
+    SessionData,
+    SessionSaveRequest,
+)
 
 app = FastAPI(title="小Z - 道路交通安全法 AI 助手", version="0.1.0")
 
@@ -120,8 +127,19 @@ def chat_stream(req: ChatRequest):
     """流式返回：先 references 事件，再逐段 delta 文本（NDJSON）。"""
 
     def gen():
-        for payload in answer_stream(req.question, req.history):
-            yield json.dumps(payload, ensure_ascii=False) + "\n"
+        try:
+            for payload in answer_stream(req.question, req.history):
+                yield json.dumps(payload, ensure_ascii=False) + "\n"
+        except LawHelperError as exc:
+            # 生成器中途异常：以 error 事件透传给前端，避免流被静默截断
+            yield json.dumps(
+                {"type": "error", "content": exc.message}, ensure_ascii=False
+            ) + "\n"
+        except ValidationError:
+            # 引用法条等数据校验失败：同样透传，避免流中途 500 截断
+            yield json.dumps(
+                {"type": "error", "content": "引用法条数据校验失败"}, ensure_ascii=False
+            ) + "\n"
 
     return StreamingResponse(gen(), media_type="application/x-ndjson")
 
@@ -135,3 +153,26 @@ def ingest():
 @app.get("/api/v1/settings/llm_model")
 def llm_model():
     return {"llm_model": get_settings().llm_model}
+
+
+@app.get("/api/v1/sessions", response_model=list[SessionData])
+def list_sessions():
+    """全部会话（按 updated_at 降序），前端刷新时恢复。"""
+    return session_store.list_all()
+
+
+@app.put("/api/v1/sessions/{session_id}", response_model=SessionData)
+def save_session(session_id: str, req: SessionSaveRequest):
+    """upsert 会话（空会话不应调用此接口）。"""
+    updated_at = session_store.save(
+        session_id, req.title, [m.model_dump() for m in req.messages]
+    )
+    return SessionData(
+        id=session_id, title=req.title, updated_at=updated_at, messages=req.messages
+    )
+
+
+@app.delete("/api/v1/sessions/{session_id}")
+def delete_session(session_id: str):
+    ok = session_store.delete(session_id)
+    return {"status": "ok" if ok else "not_found"}
