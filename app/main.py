@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import json
+import os
+import uuid
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from fastapi_throttle import RateLimiter
 from pydantic import ValidationError
+from starsessions import CookieStore, SessionAutoloadMiddleware, SessionMiddleware
 
 from app import ingestion, session_store
 from app.config import get_settings
@@ -20,14 +24,27 @@ from app.schemas import (
     SessionSaveRequest,
 )
 
+settings = get_settings()
+
 app = FastAPI(title="小Z - 道路交通安全法 AI 助手", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origins_list,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+# starsessions：基于 Cookie 的服务端会话，自动加载 /api/v1 路径的 session
+# 注意：SessionAutoloadMiddleware 必须在 SessionMiddleware 之前 add，这样运行时 SessionMiddleware 先初始化 session_handler
+app.add_middleware(SessionAutoloadMiddleware, paths=["/api/v1"])
+app.add_middleware(
+    SessionMiddleware,
+    store=CookieStore(secret_key=settings.session_secret_key),
+    lifetime=settings.session_lifetime_seconds,
+    cookie_https_only=False,
+    cookie_same_site="lax",
 )
 
 
@@ -111,20 +128,62 @@ async def law_error_handler(request, exc: LawHelperError):
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
 
 
+def _browser_session_key(req: Request) -> str:
+    """为当前浏览器会话生成/复用一个稳定的 key，用于限流。"""
+    key = req.session.get("browser_session_id")
+    if not key:
+        key = uuid.uuid4().hex
+        req.session["browser_session_id"] = key
+    return key
+
+
+def _ensure_session_access(req: Request, session_id: str | None) -> None:
+    """校验当前浏览器会话有权访问指定的 conversation session_id。
+
+    对于尚未持久化的新会话，自动注册到当前浏览器会话，避免新建空会话无法发送第一条消息。
+    """
+    if session_id is None:
+        return
+    allowed = set(req.session.get("session_ids", []))
+    if session_id in allowed:
+        return
+    try:
+        path = session_store._session_path(session_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="非法的会话 ID")
+    if not os.path.exists(path):
+        _register_session_id(req, session_id)
+        return
+    raise HTTPException(status_code=403, detail="无权访问该会话")
+
+
+def _register_session_id(req: Request, session_id: str) -> None:
+    """将 conversation session_id 注册到当前浏览器会话的允许列表中。"""
+    allowed = set(req.session.get("session_ids", []))
+    allowed.add(session_id)
+    req.session["session_ids"] = list(allowed)
+
+
+# 按浏览器会话限流：每个浏览器会话在 60 秒内最多请求 10 次聊天接口
+chat_limiter = RateLimiter(times=10, seconds=60, key_func=_browser_session_key)
+
+
 @app.get("/api/v1/health")
 def health():
     return {"status": "ok"}
 
 
-@app.post("/api/v1/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
+@app.post("/api/v1/chat", response_model=ChatResponse, dependencies=[Depends(chat_limiter)])
+def chat(req: ChatRequest, request: Request):
+    _ensure_session_access(request, req.session_id)
     text, references = answer(req.question, req.history)
     return ChatResponse(answer=text, references=references)
 
 
-@app.post("/api/v1/chat/stream")
-def chat_stream(req: ChatRequest):
+@app.post("/api/v1/chat/stream", dependencies=[Depends(chat_limiter)])
+def chat_stream(req: ChatRequest, request: Request):
     """流式返回：先 references 事件，再逐段 delta 文本（NDJSON）。"""
+    _ensure_session_access(request, req.session_id)
 
     def gen():
         try:
@@ -156,14 +215,18 @@ def llm_model():
 
 
 @app.get("/api/v1/sessions", response_model=list[SessionData])
-def list_sessions():
-    """全部会话（按 updated_at 降序），前端刷新时恢复。"""
-    return session_store.list_all()
+def list_sessions(request: Request):
+    """当前浏览器会话有权访问的会话列表（按 updated_at 降序）。"""
+    allowed = set(request.session.get("session_ids", []))
+    all_sessions = session_store.list_all()
+    return [SessionData.model_validate(s) for s in all_sessions if s["id"] in allowed]
 
 
 @app.put("/api/v1/sessions/{session_id}", response_model=SessionData)
-def save_session(session_id: str, req: SessionSaveRequest):
+def save_session(session_id: str, req: SessionSaveRequest, request: Request):
     """upsert 会话（空会话不应调用此接口）。"""
+    _ensure_session_access(request, session_id)
+    _register_session_id(request, session_id)
     updated_at = session_store.save(
         session_id, req.title, [m.model_dump() for m in req.messages]
     )
@@ -173,6 +236,11 @@ def save_session(session_id: str, req: SessionSaveRequest):
 
 
 @app.delete("/api/v1/sessions/{session_id}")
-def delete_session(session_id: str):
+def delete_session(session_id: str, request: Request):
+    _ensure_session_access(request, session_id)
     ok = session_store.delete(session_id)
+    if ok:
+        allowed = set(request.session.get("session_ids", []))
+        allowed.discard(session_id)
+        request.session["session_ids"] = list(allowed)
     return {"status": "ok" if ok else "not_found"}

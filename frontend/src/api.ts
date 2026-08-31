@@ -4,6 +4,7 @@ const BASE = '/api/v1'
 
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(`${BASE}${path}`, {
+    credentials: 'include',
     headers: { 'Content-Type': 'application/json' },
     ...init,
   })
@@ -42,12 +43,14 @@ export async function fetchLLMModel(): Promise<string> {
 export function streamChat(
   question: string,
   history: SessionMessage[],
+  sessionId: string,
   onEvent: (event: { type: string; data?: unknown }) => void,
   onDone: () => void,
   onError: (err: Error) => void,
 ): () => void {
   const payload = {
     question,
+    session_id: sessionId,
     history: history.map((m) => ({ role: m.role, content: m.content })),
   }
 
@@ -55,6 +58,7 @@ export function streamChat(
 
   fetch(`${BASE}/chat/stream`, {
     method: 'POST',
+    credentials: 'include',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
     signal: abort.signal,

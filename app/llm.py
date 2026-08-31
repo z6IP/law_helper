@@ -78,6 +78,41 @@ class BailianClient:
         except Exception as exc:  # noqa: BLE001 - 统一转为领域异常
             raise LLMError(f"大模型调用失败：{exc}") from exc
 
+    def ocr_images(self, base64_images: list[str], prompt: str | None = None) -> str:
+        """调用视觉/OCR 模型识别图片中的文字。
+
+        Args:
+            base64_images: PNG 图片的 base64 编码列表（不含 data URI 前缀）。
+            prompt: 用户提示词，为空时使用默认 OCR 提示。
+        """
+        self._ensure_loaded()
+        settings = get_settings()
+        if not base64_images:
+            return ""
+        default_prompt = (
+            "请准确识别图片中的文字，按原始排版输出。"
+            "保留章节标题（如'1 范围'）和条款编号（如'3.1'、'5.2.1'）的格式，每个逻辑行单独一行。"
+            "表格请转换为'列名1 | 列名2 | ...'的文本格式，不要添加多余解释。"
+        )
+        user_content: list[dict] = [{"type": "text", "text": prompt or default_prompt}]
+        for b64 in base64_images:
+            user_content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{b64}"},
+                }
+            )
+        try:
+            resp = self._client.chat.completions.create(
+                model=settings.ocr_model,
+                messages=[{"role": "user", "content": user_content}],
+                temperature=0.1,
+                extra_body={"enable_thinking": False},
+            )
+            return resp.choices[0].message.content or ""
+        except Exception as exc:  # noqa: BLE001
+            raise LLMError(f"OCR 模型调用失败：{exc}") from exc
+
 
 @lru_cache
 def get_llm() -> BailianClient:

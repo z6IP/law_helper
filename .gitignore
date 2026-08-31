@@ -3,6 +3,7 @@
 
 # 调试脚本
 _debug_*.py
+.trae/
 
 # Python
 __pycache__/

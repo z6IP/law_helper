@@ -6,7 +6,7 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # 项目根目录（app/ 的上一级）
@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     openai_api_base: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     openai_api_key: str = ""
     llm_model: str = "qwen-plus"
+
+    # OCR 模型（扫描型 PDF 兜底，默认复用同一 OpenAI 兼容接口）
+    ocr_model: str = "qwen3.5-ocr"
+    ocr_dpi: int = 200
 
     # 数据与存储
     chroma_dir: str = "chroma"
@@ -55,10 +59,33 @@ class Settings(BaseSettings):
     # 服务
     backend_url: str = "http://127.0.0.1:8000"
 
+    # 会话 Cookie（starsessions）
+    session_secret_key: str = ""
+    session_lifetime_seconds: int = 3600 * 24 * 14
+
+    # CORS：开发时前端在 http://localhost:5173；生产通过逗号分隔配置多个来源
+    cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+
+    @field_validator("session_secret_key")
+    @classmethod
+    def _validate_session_secret_key(cls, v: str) -> str:
+        if not v:
+            raise ValueError("SESSION_SECRET_KEY 必须在 .env 中配置")
+        return v
+
+    @property
+    def cors_origins_list(self) -> list[str]:
+        return [x.strip() for x in self.cors_origins.split(",") if x.strip()]
+
     @property
     def docx_full_paths(self) -> list[Path]:
         """statute/ 目录下所有 .docx 法规文档（语料数据源，自动纳入新法规）。"""
         return sorted((BASE_DIR / "statute").glob("*.docx"))
+
+    @property
+    def pdf_full_paths(self) -> list[Path]:
+        """statute/ 目录下所有 .pdf 文档（语料数据源，自动纳入新标准）。"""
+        return sorted((BASE_DIR / "statute").glob("*.pdf"))
 
     @property
     def chroma_full_dir(self) -> Path:

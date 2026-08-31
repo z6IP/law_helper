@@ -35,7 +35,10 @@ function App() {
     const saved = localStorage.getItem(SIDEBAR_KEY)
     return saved ? saved === 'true' : false
   })
-  const [isDark, setIsDark] = useState(false)
+  // 初始主题与 index.html 中内联脚本设置保持一致，避免首屏闪烁
+  const [isDark, setIsDark] = useState(() => {
+    return document.documentElement.getAttribute('data-theme') === 'dark'
+  })
   const [animated, setAnimated] = useState(false)
   const [mounted, setMounted] = useState(false)
   const abortRef = useRef<(() => void) | null>(null)
@@ -51,12 +54,13 @@ function App() {
     document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light')
   }, [])
 
-  // 初始化主题：index.html 已设置 data-theme，这里仅同步按钮状态
+  // 初始化主题：index.html 已设置 data-theme，这里仅同步按钮状态并兜底读取 localStorage
   useEffect(() => {
     const saved = localStorage.getItem('theme')
     const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches
     const initialDark = saved ? saved === 'dark' : prefersDark
     setIsDark(initialDark)
+    document.documentElement.setAttribute('data-theme', initialDark ? 'dark' : 'light')
   }, [])
 
   // 监听系统主题变化
@@ -94,30 +98,31 @@ function App() {
     }
   }, [])
 
-  // 首次渲染完成后再启用输入框位移动画，避免刷新时从底部闪到中间
-  useEffect(() => {
-    const t = setTimeout(() => setAnimated(true), 0)
-    return () => clearTimeout(t)
-  }, [])
-
   // 页面内容淡入，避免刷新时突然出现的刺眼感
   useEffect(() => {
     setMounted(true)
   }, [])
 
-  // 切换会话时中止正在进行的流式回答
+  // 切换会话时中止正在进行的流式回答，并关闭输入框位移动画
+  //（从新建对话切到历史会话时，输入框应直接出现在底部，不要平滑滑过文字）
   useEffect(() => {
     if (abortRef.current) {
       abortRef.current()
       abortRef.current = null
       setLoading(false)
     }
+    setAnimated(false)
   }, [currentId])
 
   const handleSend = useCallback(
     async (text: string) => {
       if (!currentSession) return
       const userMsg: SessionMessage = { role: 'user', content: text }
+
+      // 当前会话为空时，启用输入框平滑下移动画；切换历史会话时动画已关闭
+      if (currentSession.messages.length === 0) {
+        setAnimated(true)
+      }
 
       await appendMessages(currentSession.id, [userMsg])
 
@@ -139,8 +144,8 @@ function App() {
 
       const finalize = async () => {
         setLoading(false)
-        const finalTitle =
-          currentSession.title === '新对话' ? text.slice(0, 18) || '新对话' : currentSession.title
+        const isFirstMessage = currentSession.title === '新对话'
+        const finalTitle = isFirstMessage ? text.slice(0, 18) || '新对话' : currentSession.title
         updateSessionTitle(currentSession.id, finalTitle)
         await api.saveSession({
           ...currentSession,
@@ -157,11 +162,16 @@ function App() {
           title: finalTitle,
           updated_at: localISOString(),
         })
+        // 首次发送消息后，会话从“新对话”变为历史会话，同步 URL hash 以便刷新可恢复
+        if (isFirstMessage) {
+          switchSession(currentSession.id)
+        }
       }
 
       abortRef.current = api.streamChat(
         text,
         currentSession.messages,
+        currentSession.id,
         (event) => {
           const data = event.data as Record<string, unknown>
           switch (event.type) {

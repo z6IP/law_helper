@@ -16,6 +16,10 @@ class _BaseSchema(BaseModel):
 
 class ChatRequest(_BaseSchema):
     question: str = Field(..., min_length=1, description="用户提问")
+    session_id: str | None = Field(
+        None,
+        description="当前会话 ID，用于权限校验与按会话限流",
+    )
     history: list[dict] = Field(
         default_factory=list,
         max_length=50,

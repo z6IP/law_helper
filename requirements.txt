@@ -23,8 +23,13 @@ jieba>=0.42.1
 # LLM
 openai>=1.50.0
 
+# 会话、限流
+starsessions>=2.2.0
+fastapi-throttle>=0.1.8
+
 # 文档解析
 python-docx>=1.1.2
+pymupdf==1.28.0      # PDF 版面解析（GB 19522-2024 等国家标准）
 
 # 模型下载（ModelScope 镜像）
 modelscope>=1.20.0
