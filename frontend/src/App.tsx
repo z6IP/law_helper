@@ -9,6 +9,8 @@ import * as api from './api'
 import type { Reference, SessionMessage } from './types'
 
 const SIDEBAR_KEY = 'sidebarVisible'
+// 输入框最大宽度 800px + 侧边栏宽度 260px，低于此宽度主内容会被挤压
+const SIDEBAR_AUTO_THRESHOLD = 1060
 
 function localISOString(): string {
   const d = new Date()
@@ -41,17 +43,56 @@ function App() {
   })
   const [animated, setAnimated] = useState(false)
   const [mounted, setMounted] = useState(false)
+  const [openBtnVisible, setOpenBtnVisible] = useState(!sidebarVisible)
   const abortRef = useRef<(() => void) | null>(null)
+  // 标记侧边栏是否因窗口变窄被系统自动收起，用于宽度恢复后自动展开
+  const autoCollapsedRef = useRef(false)
 
   const applyTheme = useCallback((dark: boolean, withTransition: boolean) => {
-    if (withTransition) {
-      document.documentElement.classList.add('theme-transition')
-      setTimeout(() => {
-        document.documentElement.classList.remove('theme-transition')
-      }, 260)
+    const apply = () => {
+      document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light')
+      // 同步覆盖 index.html 内联脚本注入的 body 背景 !important 样式
+      // 否则切换后 body 背景会被锁定为初始主题色，视觉上看不到切换
+      document.body.style.setProperty('background-color', dark ? '#1a1a1a' : '#ffffff', 'important')
+      setIsDark(dark)
     }
-    setIsDark(dark)
-    document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light')
+
+    if (!withTransition) {
+      apply()
+      return
+    }
+
+    // 优先使用 View Transitions API + 圆形扩散（从主题按钮位置开始）
+    if (document.startViewTransition) {
+      // 标记切换方向：dark=true（亮→暗）走收缩动画，dark=false（暗→亮）走扩散动画
+      if (dark) {
+        document.documentElement.classList.add('theme-collapsing')
+      } else {
+        document.documentElement.classList.remove('theme-collapsing')
+      }
+      const btn = document.querySelector('.theme-toggle') as HTMLElement | null
+      if (btn) {
+        const rect = btn.getBoundingClientRect()
+        const x = rect.left + rect.width / 2
+        const y = rect.top + rect.height / 2
+        const endRadius = Math.hypot(
+          Math.max(x, window.innerWidth - x),
+          Math.max(y, window.innerHeight - y)
+        )
+        document.documentElement.style.setProperty('--vt-x', `${x}px`)
+        document.documentElement.style.setProperty('--vt-y', `${y}px`)
+        document.documentElement.style.setProperty('--vt-r', `${endRadius}px`)
+      }
+      document.startViewTransition(apply)
+      return
+    }
+
+    // 降级：全局元素过渡（覆盖所有使用主题变量的元素）
+    document.documentElement.classList.add('theme-transition')
+    apply()
+    setTimeout(() => {
+      document.documentElement.classList.remove('theme-transition')
+    }, 260)
   }, [])
 
   // 初始化主题：index.html 已设置 data-theme，这里仅同步按钮状态并兜底读取 localStorage
@@ -77,18 +118,50 @@ function App() {
   }, [applyTheme])
 
   const toggleTheme = useCallback(() => {
-    setIsDark((prev) => {
-      const next = !prev
-      applyTheme(next, true)
-      localStorage.setItem('theme', next ? 'dark' : 'light')
-      return next
-    })
+    // 从 DOM 读取当前主题，避免在 setIsDark updater 内嵌套调用 applyTheme（内含 setState）
+    const current = document.documentElement.getAttribute('data-theme') === 'dark'
+    const next = !current
+    applyTheme(next, true)
+    localStorage.setItem('theme', next ? 'dark' : 'light')
   }, [applyTheme])
 
   const toggleSidebar = useCallback((visible: boolean) => {
     setSidebarVisible(visible)
     localStorage.setItem(SIDEBAR_KEY, String(visible))
   }, [])
+
+  // 用户手动打开/关闭侧边栏时，取消系统自动收起状态
+  const handleToggleSidebar = useCallback((visible: boolean) => {
+    autoCollapsedRef.current = false
+    toggleSidebar(visible)
+  }, [toggleSidebar])
+
+  // 侧边栏关闭动画完成（250ms）后再显示打开按钮，避免按钮在移动过程中提前出现
+  useEffect(() => {
+    if (sidebarVisible) {
+      setOpenBtnVisible(false)
+    } else {
+      const timer = setTimeout(() => setOpenBtnVisible(true), 250)
+      return () => clearTimeout(timer)
+    }
+  }, [sidebarVisible])
+
+  // 窗口宽度低于阈值时自动收起侧边栏，宽度恢复后自动展开（仅处理系统自动收起的状态）
+  useEffect(() => {
+    const handleResize = () => {
+      const width = window.innerWidth
+      if (width <= SIDEBAR_AUTO_THRESHOLD && sidebarVisible && !autoCollapsedRef.current) {
+        autoCollapsedRef.current = true
+        toggleSidebar(false)
+      } else if (width > SIDEBAR_AUTO_THRESHOLD && !sidebarVisible && autoCollapsedRef.current) {
+        autoCollapsedRef.current = false
+        toggleSidebar(true)
+      }
+    }
+    window.addEventListener('resize', handleResize)
+    handleResize()
+    return () => window.removeEventListener('resize', handleResize)
+  }, [sidebarVisible, toggleSidebar])
 
   useEffect(() => {
     return () => {
@@ -234,18 +307,18 @@ function App() {
         onNew={() => {
           createSession()
         }}
-        onClose={() => toggleSidebar(false)}
+        onClose={() => handleToggleSidebar(false)}
         onSelect={(id) => {
           switchSession(id)
         }}
         onDelete={removeSession}
       />
       <main className="main">
-        {!sidebarVisible && (
+        {openBtnVisible && (
           <button
             type="button"
             className="sidebar-open-btn"
-            onClick={() => toggleSidebar(true)}
+            onClick={() => handleToggleSidebar(true)}
             aria-label="打开侧边栏"
           >
             <PanelLeftOpen size={20} />

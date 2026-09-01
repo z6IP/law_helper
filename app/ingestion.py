@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -428,16 +429,95 @@ def parse_pdf(pdf_path) -> list[Article]:
         return articles
 
 
+MANIFEST_FILENAME = "ingestion_manifest.json"
+
+
+@dataclass
+class IngestResult:
+    """增量导入结果统计。"""
+
+    total: int = 0          # 当前库中该 source 的条文总数（新增+更新后）
+    added: int = 0          # 新增 source 的条文数
+    updated: int = 0        # 内容变化后重新写入的条文数
+    removed: int = 0        # 因 source 被删除而从库中移除的条文数
+    skipped: int = 0        # 文件未变化、跳过的 source 条文数
+    message: str = ""       # 人类可读摘要
+
+
 def _make_id(source: str, section_header: str, article_no: str) -> str:
     raw = f"{source}|{section_header}|{article_no}".encode("utf-8")
     return hashlib.md5(raw).hexdigest()
 
 
-def ingest() -> int:
-    """解析 statute/ 下所有 .docx 与 .pdf 并幂等 upsert 到 ChromaDB，返回入库条目总数。
+def _compute_file_hash(path: Path) -> str:
+    """计算文件内容的 md5，用于检测文件是否被修改。"""
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
-    多个文档共用同一 collection，向量 id 基于 md5(source + section_header + article_no)
-    保证同一条文重复入库时覆盖而非重复。
+
+def _manifest_path(chroma_dir: Path) -> Path:
+    return chroma_dir / MANIFEST_FILENAME
+
+
+def _load_manifest(chroma_dir: Path) -> dict:
+    """读取 ingestion manifest；不存在则返回空字典。"""
+    p = _manifest_path(chroma_dir)
+    if not p.exists():
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_manifest(chroma_dir: Path, manifest: dict) -> None:
+    """持久化 ingestion manifest。"""
+    p = _manifest_path(chroma_dir)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+
+def _ingest_single_file(
+    path: Path,
+    collection,
+    embedding_model,
+) -> tuple[str, int]:
+    """解析单个文件并 upsert 到 collection，返回 (source, article_count)。"""
+    suffix = path.suffix.lower()
+    if suffix == ".docx":
+        articles = parse_docx(path)
+    elif suffix == ".pdf":
+        articles = parse_pdf(path)
+    else:
+        raise IngestionError(f"不支持的文件类型：{path.name}")
+    if not articles:
+        raise IngestionError(f"未从文档中解析到任何内容：{path.name}")
+
+    source = _clean_source_name(path)
+    documents = [a.text for a in articles]
+    metadatas = [
+        {"article_no": a.article_no, "section_header": a.section_header, "source": source}
+        for a in articles
+    ]
+    ids = [_make_id(source, a.section_header, a.article_no) for a in articles]
+    embeddings = embedding_model.embed_documents(documents)
+    collection.upsert(
+        ids=ids, documents=documents, metadatas=metadatas, embeddings=embeddings
+    )
+    return source, len(articles)
+
+
+def ingest() -> IngestResult:
+    """增量导入 statute/ 下所有 .docx 与 .pdf 到 ChromaDB。
+
+    - 通过文件内容 hash 检测新增/修改的文档，只重新嵌入变化的文档；
+    - 通过 source 名称检测已被移除的文档，从库中删除；
+    - 向量 id 基于 md5(source + section_header + article_no) 保证幂等 upsert。
     """
     settings = get_settings()
     paths = settings.docx_full_paths + settings.pdf_full_paths
@@ -457,38 +537,72 @@ def ingest() -> int:
         },
     )
 
-    embedding_model = get_embedding_model()
-    total = 0
+    manifest = _load_manifest(settings.chroma_full_dir)
+    current_sources: dict[str, dict] = {}
+    changed_paths: list[Path] = []
+
     for path in paths:
-        suffix = Path(path).suffix.lower()
-        if suffix == ".docx":
-            articles = parse_docx(path)
-        elif suffix == ".pdf":
-            articles = parse_pdf(path)
-        else:
-            continue
-        if not articles:
-            raise IngestionError(f"未从文档中解析到任何内容：{path.name}")
-
         source = _clean_source_name(path)
-        documents = [a.text for a in articles]
-        metadatas = [
-            {"article_no": a.article_no, "section_header": a.section_header, "source": source}
-            for a in articles
-        ]
-        ids = [_make_id(source, a.section_header, a.article_no) for a in articles]
-        embeddings = embedding_model.embed_documents(documents)
-        collection.upsert(
-            ids=ids, documents=documents, metadatas=metadatas, embeddings=embeddings
-        )
-        total += len(articles)
+        file_hash = _compute_file_hash(path)
+        current_sources[source] = {"hash": file_hash, "path": str(path.name)}
+        old = manifest.get(source)
+        if old is None or old.get("hash") != file_hash:
+            changed_paths.append(path)
 
-    return total
+    # 检测已删除的 source：manifest 中有记录但当前 statute/ 中不存在
+    removed_sources = [s for s in manifest if s not in current_sources]
+
+    result = IngestResult()
+    embedding_model = get_embedding_model()
+
+    for source in removed_sources:
+        old_count = manifest.get(source, {}).get("articles", 0)
+        existing = collection.get(where={"source": source}, include=[])
+        ids_to_remove = existing.get("ids", [])
+        if ids_to_remove:
+            collection.delete(ids=ids_to_remove)
+        result.removed += len(ids_to_remove)
+        print(f"[ingest] 移除已删除文档：{source}，共 {len(ids_to_remove)} 条")
+
+    for path in changed_paths:
+        source, count = _ingest_single_file(path, collection, embedding_model)
+        current_sources[source]["articles"] = count
+        if manifest.get(source):
+            result.updated += count
+            print(f"[ingest] 更新文档：{source}，共 {count} 条")
+        else:
+            result.added += count
+            print(f"[ingest] 新增文档：{source}，共 {count} 条")
+
+    # 未变化的 source 计入 skipped
+    for source in manifest:
+        if source in current_sources and source not in removed_sources and source not in [
+            _clean_source_name(p) for p in changed_paths
+        ]:
+            result.skipped += manifest[source].get("articles", 0)
+
+    # 同步所有当前 source 的文章数到 manifest
+    for source in current_sources:
+        if "articles" not in current_sources[source]:
+            # 该 source 未变化，保留原数量
+            current_sources[source]["articles"] = manifest.get(source, {}).get("articles", 0)
+
+    _save_manifest(settings.chroma_full_dir, current_sources)
+
+    result.total = collection.count()
+    if result.added or result.updated or result.removed:
+        result.message = (
+            f"新增 {result.added} 条，更新 {result.updated} 条，"
+            f"移除 {result.removed} 条，跳过 {result.skipped} 条，当前共 {result.total} 条"
+        )
+    else:
+        result.message = f"所有 {len(paths)} 个文档均未变化，跳过导入，当前共 {result.total} 条"
+    return result
 
 
 def main() -> None:
-    count = ingest()
-    print(f"入库完成，共 {count} 条")
+    result = ingest()
+    print(result.message)
 
 
 if __name__ == "__main__":

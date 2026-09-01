@@ -55,9 +55,80 @@ body {
   background: var(--bg);
 }
 
-.theme-transition body,
-body.theme-transition {
-  transition: background 0.25s ease, color 0.25s ease;
+/* ===== 主题切换动效 =====
+   优先使用 View Transitions API 实现圆形扩散/收缩（支持时生效），
+   不支持的浏览器降级为全局元素颜色过渡（见下方 .theme-transition） */
+
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+
+/* 默认方向：暗→亮，新主题（亮色）从按钮位置扩散覆盖旧主题（暗色） */
+::view-transition-old(root) {
+  z-index: 1;
+}
+
+::view-transition-new(root) {
+  z-index: 2;
+  animation: theme-circle-in 0.25s ease-out forwards;
+}
+
+/* 反向：亮→暗，旧主题（亮色）从全屏收缩回按钮位置，露出新主题（暗色） */
+:root.theme-collapsing::view-transition-old(root) {
+  z-index: 2;
+  animation: theme-circle-out 0.25s ease-out forwards;
+}
+
+:root.theme-collapsing::view-transition-new(root) {
+  z-index: 1;
+  animation: none;
+}
+
+@keyframes theme-circle-in {
+  from {
+    clip-path: circle(0 at var(--vt-x, 50%) var(--vt-y, 50%));
+  }
+  to {
+    clip-path: circle(var(--vt-r, 150vmax) at var(--vt-x, 50%) var(--vt-y, 50%));
+  }
+}
+
+@keyframes theme-circle-out {
+  from {
+    clip-path: circle(var(--vt-r, 150vmax) at var(--vt-x, 50%) var(--vt-y, 50%));
+  }
+  to {
+    clip-path: circle(0 at var(--vt-x, 50%) var(--vt-y, 50%));
+  }
+}
+
+/* 降级方案：不支持的浏览器走全局元素过渡，覆盖所有使用主题变量的元素 */
+.theme-transition,
+.theme-transition *,
+.theme-transition *::before,
+.theme-transition *::after {
+  transition: background-color 0.25s ease,
+              color 0.25s ease,
+              border-color 0.25s ease,
+              box-shadow 0.25s ease,
+              fill 0.25s ease;
+}
+
+/* 无障碍：用户系统设置减少动效时禁用切换动画 */
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation: none !important;
+  }
+
+  .theme-transition,
+  .theme-transition *,
+  .theme-transition *::before,
+  .theme-transition *::after {
+    transition: none !important;
+  }
 }
 
 .app-loading {
@@ -87,12 +158,12 @@ body.theme-transition {
   border-right: 1px solid var(--border);
   background: var(--bg-secondary);
   overflow: hidden;
-  transition: width 0.25s ease;
+  margin-left: 0;
+  transition: margin-left 0.25s ease;
 }
 
 .sidebar.collapsed {
-  width: 0;
-  border-right: none;
+  margin-left: -272px;
 }
 
 .sidebar-inner {
@@ -113,6 +184,7 @@ body.theme-transition {
 
 .new-session-btn {
   flex: 1;
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -150,15 +222,20 @@ body.theme-transition {
 }
 
 .session-list {
+  flex: 1;
   display: flex;
   flex-direction: column;
   gap: 4px;
   overflow-y: auto;
+  min-height: 0;
+  scrollbar-gutter: stable;
 }
 
 .session-item {
   display: flex;
   align-items: center;
+  flex-shrink: 0;
+  min-height: 40px;
   border-radius: 6px;
   overflow: hidden;
 }
@@ -271,6 +348,7 @@ body.theme-transition {
   flex: 1;
   display: flex;
   flex-direction: column;
+  min-width: 0;
   overflow: hidden;
   position: relative;
 }
@@ -278,9 +356,43 @@ body.theme-transition {
 .messages-area {
   flex: 1;
   overflow-y: auto;
-  padding: 24px 16px;
+  padding: 60px 0px 0px;
   display: flex;
   flex-direction: column;
+  scrollbar-gutter: stable;
+}
+
+/* ===== 滚动条：与背景融合，默认透明，hover 显示 ===== */
+.session-list,
+.messages-area {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+
+.session-list:hover,
+.messages-area:hover {
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+.session-list::-webkit-scrollbar,
+.messages-area::-webkit-scrollbar {
+  width: 6px;
+}
+
+.session-list::-webkit-scrollbar-track,
+.messages-area::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.session-list::-webkit-scrollbar-thumb,
+.messages-area::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 3px;
+}
+
+.session-list:hover::-webkit-scrollbar-thumb,
+.messages-area:hover::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
 }
 
 .message-list {
@@ -290,6 +402,7 @@ body.theme-transition {
   gap: 20px;
   max-width: 800px;
   width: 100%;
+  min-width: 0;
   margin: 0 auto;
 }
 
@@ -300,7 +413,9 @@ body.theme-transition {
 
 .input-area {
   flex-shrink: 0;
-  padding: 12px 16px 16px;
+  height: 100px;
+  padding: 0;
+  overflow: hidden;
   background: var(--bg);
 }
 
@@ -309,9 +424,14 @@ body.theme-transition {
   transition: transform 0.45s cubic-bezier(0.25, 0.46, 0.45, 0.94);
 }
 
-/* 空状态：输入框上移到 Welcome 下方，整体呈现居中 landing 页 */
+/* 空状态 input-area 位置分段控制：
+   - H >= 320px：translateY = -50vh + 160px（贴在 Welcome 下方，整体居中 landing）
+   - H < 320px：translateY = 0（不再上移）
+     · 320 > H > 100px：input 默认贴底完整可见（文字被裁切消失但不切输入框）
+     · H <= 100px：input 默认贴顶（flex 流中 input 占 0~100，底部超出容器被切割）
+   即文字先消失，输入框贴顶后才被切割 */
 .chat-layout.empty .input-area {
-  transform: translateY(calc(-50vh + 160px));
+  transform: translateY(calc(min(160px - 50vh, 0px)));
 }
 
 /* ===== 欢迎页 ===== */
@@ -322,13 +442,20 @@ body.theme-transition {
 .welcome h1 {
   font-size: 2.5rem;
   font-weight: 700;
-  margin: 0 0 12px;
+  margin: 100px 0 0;
   color: var(--text);
 }
 
 .welcome-sub {
   color: var(--text-muted);
   font-size: 1rem;
+}
+
+/* 空状态下让 messages-area 不滚动而是裁切：
+   缩小窗口高度时 Welcome 文字从上方被视口边缘逐渐切割消失，
+   input-area 由下方 transform 控制位置，vh 较小时下移超出被 chat-layout 裁切 */
+.chat-layout.empty .messages-area {
+  overflow: hidden;
 }
 
 /* ===== 消息 ===== */
@@ -508,15 +635,21 @@ body.theme-transition {
 
 /* ===== 输入框 ===== */
 .chat-input-bar {
-  padding: 12px 16px 16px;
-  background: var(--bg);
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 10px 16px;
+  background: transparent;
 }
 
 .chat-input-wrap {
   display: flex;
   align-items: flex-end;
   gap: 8px;
-  max-width: 800px;
+  width: 700px;
+  height: 100%;
+  min-width: 0;
   margin: 0 auto;
   padding: 8px 12px;
   border: 1px solid var(--border-strong);
@@ -536,7 +669,8 @@ body.theme-transition {
   background: transparent;
   font-size: 15px;
   line-height: 1.5;
-  max-height: 200px;
+  height: 100%;
+  max-height: none;
   font-family: inherit;
   padding: 4px 0;
   color: var(--text);
@@ -565,13 +699,26 @@ body.theme-transition {
   cursor: not-allowed;
 }
 
-/* ===== 移动端 ===== */
-@media (max-width: 768px) {
+/* ===== 响应式：侧边栏抽屉 ===== */
+/* 中小屏幕：侧边栏变为抽屉，不再挤压主内容 */
+@media (max-width: 1060px) {
   .sidebar {
     position: absolute;
     z-index: 100;
     height: 100%;
     box-shadow: 2px 0 8px rgba(0, 0, 0, 0.2);
+  }
+
+  .sidebar .session-list {
+    display: flex;
+  }
+
+  .main {
+    width: 100%;
+  }
+
+  .message-list {
+    padding: 0 12px;
   }
 
   .message-user-bubble {

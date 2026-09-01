@@ -80,7 +80,7 @@ async def startup_preload():
         _ = reranker._model.predict([("预热查询", "预热文档")])
     print("[预加载] Reranker 模型就绪")
 
-    # Step 3: 校验索引（维度检测优先，条件重建）
+    # Step 3: 校验索引（维度检测优先，条件重建；否则启动增量导入）
     collection = client.get_or_create_collection(
         name=COLLECTION_NAME,
         metadata={
@@ -93,29 +93,28 @@ async def startup_preload():
     count = collection.count()
     print(f"[预加载] 向量库当前有 {count} 条记录")
 
-    if count == 0:
-        print("[预加载] 向量库为空，开始入库...")
-        n = ingestion.ingest()
-        print(f"[预加载] 入库完成，共 {n} 条")
+    from app.retrieval import get_retrieval_engine
+
+    engine = get_retrieval_engine()
+    if engine.needs_rebuild:
+        print("[预加载] 检测到维度不匹配，正在重建索引...")
+        import shutil
+
+        if os.path.exists(chroma_path):
+            shutil.rmtree(chroma_path, ignore_errors=True)
         from app.retrieval import get_retrieval_engine as _gre
+
         _gre.cache_clear()
+        result = ingestion.ingest()
+        print(f"[预加载] 重建索引完成，{result.message}")
     else:
-        from app.retrieval import get_retrieval_engine
-        engine = get_retrieval_engine()
-        if engine.needs_rebuild:
-            print("[预加载] 检测到维度不匹配，正在重建索引...")
-            import os
-            import shutil
-            if os.path.exists(chroma_path):
-                shutil.rmtree(chroma_path, ignore_errors=True)
-            from app.retrieval import get_retrieval_engine as _gre
-            _gre.cache_clear()
-            n = ingestion.ingest()
-            print(f"[预加载] 重建索引完成，共 {n} 条")
+        result = ingestion.ingest()
+        print(f"[预加载] {result.message}")
 
     # Step 4: 加载 / 刷新检索引擎（BM25 等组件就绪）
     print("[预加载] 正在加载检索引擎...")
     from app.retrieval import get_retrieval_engine as _gre
+
     _gre.cache_clear()
     get_retrieval_engine()
     print("[预加载] 检索引擎就绪")
@@ -205,8 +204,11 @@ def chat_stream(req: ChatRequest, request: Request):
 
 @app.post("/api/v1/ingest", response_model=IngestResponse)
 def ingest():
-    count = ingestion.ingest()
-    return IngestResponse(status="ok", articles=count, message="入库完成")
+    result = ingestion.ingest()
+    from app.retrieval import get_retrieval_engine as _gre
+
+    _gre.cache_clear()
+    return IngestResponse(status="ok", articles=result.total, message=result.message)
 
 
 @app.get("/api/v1/settings/llm_model")

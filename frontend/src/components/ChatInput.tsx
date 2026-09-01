@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef } from 'react'
 import { ArrowUp } from 'lucide-react'
 
 interface ChatInputProps {
@@ -11,21 +11,11 @@ export function ChatInput({ onSend, disabled, placeholder = '请输入您的法�
   const [text, setText] = useState('')
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
-  useEffect(() => {
-    const el = textareaRef.current
-    if (!el) return
-    el.style.height = 'auto'
-    el.style.height = `${Math.min(el.scrollHeight, 200)}px`
-  }, [text])
-
   const submit = () => {
     const trimmed = text.trim()
     if (!trimmed || disabled) return
     onSend(trimmed)
     setText('')
-    if (textareaRef.current) {
-      textareaRef.current.style.height = 'auto'
-    }
   }
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {

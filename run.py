@@ -9,6 +9,7 @@ Ctrl+C 一次性退出两个子进程。
 """
 from __future__ import annotations
 
+import http.client
 import io
 import os
 import signal
@@ -17,13 +18,14 @@ import sys
 import threading
 from datetime import datetime
 from pathlib import Path
-from time import sleep
+from time import sleep, time as _time
 
-# 设置 Windows 控制台代码页为 UTF-8，避免子进程日志中的中文/特殊字符显示为乱码
+# 尝试设置 Windows 控制台代码页为 UTF-8；同时启用行缓冲避免输出延迟
 subprocess.run("chcp 65001", shell=True, check=False)
-# 重配标准输出为 UTF-8，避免 UnicodeEncodeError
 if hasattr(sys.stdout, 'buffer'):
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
+    sys.stdout = io.TextIOWrapper(
+        sys.stdout.buffer, encoding=sys.stdout.encoding, line_buffering=True
+    )
 
 # law_helper_env conda 环境的 Python 解释器
 _PYTHON = r"D:\miniconda3\envs\law_helper_env\python.exe"
@@ -68,6 +70,24 @@ def _log_tail(path: Path, lines: int = 15) -> str:
         return ""
 
 
+def _wait_for_backend(timeout: float = 120.0, interval: float = 0.5) -> bool:
+    """等待后端 health 接口就绪，避免前端启动后代理不到后端。"""
+    deadline = _time() + timeout
+    while _time() < deadline:
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", 8000, timeout=2)
+            conn.request("GET", "/api/v1/health")
+            resp = conn.getresponse()
+            body = resp.read()
+            conn.close()
+            if resp.status == 200 and b"ok" in body:
+                return True
+        except Exception:
+            pass
+        sleep(interval)
+    return False
+
+
 def main() -> None:
     # 强制子进程使用 UTF-8 输出，避免 Windows 控制台 GBK 编码导致的中文乱码
     _env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
@@ -76,6 +96,30 @@ def main() -> None:
     frontend_log = _open_log("frontend.log")
     _write_banner(backend_log)
     _write_banner(frontend_log)
+
+    # 先声明进程句柄，使 _terminate 在任意时刻调用都能安全引用
+    backend = None
+    frontend = None
+
+    def _terminate(*_):
+        print("\n[退出] 正在终止前后端服务...")
+        for p in (backend, frontend):
+            if p is not None:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+        # 给子进程一点时间清理
+        sleep(0.5)
+        for p in (backend, frontend):
+            if p is not None:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+        backend_log.close()
+        frontend_log.close()
+        sys.exit(0)
 
     # 使用 law_helper_env 的 Python 启动 uvicorn
     backend = subprocess.Popen(
@@ -90,7 +134,14 @@ def main() -> None:
     )
     threading.Thread(target=_stream, args=("backend", backend.stdout, backend_log), daemon=True).start()
 
-    # 直接启动前端，不再等待后端 health 检查；前后端各自独立启动
+    # 等待后端 health 接口就绪后再启动前端，避免前端代理报错
+    print("[启动] 等待后端就绪...")
+    if not _wait_for_backend():
+        print("\n[错误] 后端启动超时，请查看 logs/backend.log")
+        print(_log_tail(_log_dir() / "backend.log"))
+        _terminate()
+    print("[启动] 后端已就绪，启动前端...")
+
     frontend_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend")
     # 直接调用 node 运行 vite.js，避免 npm/.cmd 中间层产生孤儿进程
     frontend = subprocess.Popen(
@@ -109,24 +160,6 @@ def main() -> None:
     print("      logs/frontend.log")
     print("按 Ctrl+C 退出两个服务")
     print("=" * 60)
-
-    def _terminate(*_):
-        print("\n[退出] 正在终止前后端服务...")
-        for p in (backend, frontend):
-            try:
-                p.terminate()
-            except Exception:
-                pass
-        # 给子进程一点时间清理
-        sleep(0.5)
-        for p in (backend, frontend):
-            try:
-                p.kill()
-            except Exception:
-                pass
-        backend_log.close()
-        frontend_log.close()
-        sys.exit(0)
 
     signal.signal(signal.SIGINT, _terminate)
     signal.signal(signal.SIGTERM, _terminate)
