@@ -9,6 +9,7 @@ from functools import lru_cache
 from app.config import get_settings
 from app.embeddings import _download_model
 from app.errors import RetrievalError
+from app.tracing import span
 
 
 class Reranker:
@@ -51,7 +52,8 @@ class Reranker:
         import torch
 
         with torch.inference_mode():
-            scores = self._model.predict(pairs)
+            with span("rerank.predict", candidates=len(candidates)):
+                scores = self._model.predict(pairs)
         if hasattr(scores, "tolist"):
             scores = scores.tolist()
         if isinstance(scores, (int, float)):

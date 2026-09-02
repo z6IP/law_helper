@@ -25,6 +25,11 @@ class ChatRequest(_BaseSchema):
         max_length=50,
         description="可选的历史对话（最多 50 条）",
     )
+    title: str | None = Field(
+        None,
+        max_length=200,
+        description="会话标题；后端后台落库时使用（缺省时按问题前 18 字生成）",
+    )
 
 
 class Reference(_BaseSchema):
@@ -44,6 +49,10 @@ class Reference(_BaseSchema):
 class ChatResponse(_BaseSchema):
     answer: str = Field(..., min_length=1, description="生成的回答")
     references: list[Reference] = Field(default_factory=list, description="引用法条")
+
+
+class RunningJobsResponse(_BaseSchema):
+    sessions: list[str] = Field(default_factory=list, description="正在生成回答的会话 ID 列表")
 
 
 class IngestResponse(_BaseSchema):
@@ -79,3 +88,29 @@ class SessionData(_BaseSchema):
     )
     updated_at: str = Field("", description="最后更新时间（ISO）")
     messages: list[SessionMessage] = Field(default_factory=list, description="会话消息")
+
+
+class TraceItem(_BaseSchema):
+    """Dashboard 展示的一条 trace 摘要。"""
+
+    trace_id: str = Field(..., description="trace 唯一标识")
+    kind: str = Field(..., description="trace 类型：chat/chat_stream/preload/ingest")
+    question: str | None = Field(None, description="用户问题（仅问答类有）")
+    session_id: str | None = Field(None, description="会话 ID")
+    cache_hit: bool = Field(False, description="是否命中答案缓存")
+    status: str = Field("ok", description="trace 状态：ok/error")
+    started_at: str = Field("", description="开始时间（ISO）")
+    duration_ms: float = Field(0, description="总耗时（毫秒）")
+    prompt_tokens: int = Field(0, description="累计输入 token")
+    completion_tokens: int = Field(0, description="累计输出 token")
+    total_tokens: int = Field(0, description="累计总 token")
+
+
+class TracesResponse(_BaseSchema):
+    """trace 列表 + 汇总统计。"""
+
+    traces: list[TraceItem] = Field(default_factory=list, description="trace 摘要列表")
+    total_count: int = Field(0, description="trace 总数")
+    total_tokens: int = Field(0, description="全部 trace 累计 token")
+    cache_hit_count: int = Field(0, description="命中缓存的 trace 数")
+    avg_duration_ms: float = Field(0, description="平均耗时（毫秒）")

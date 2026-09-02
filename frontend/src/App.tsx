@@ -6,19 +6,17 @@ import { ChatInput } from './components/ChatInput'
 import { ThemeToggle } from './components/ThemeToggle'
 import { useSessions } from './hooks/useSessions'
 import * as api from './api'
-import type { Reference, SessionMessage } from './types'
+import type { Reference } from './types'
 
 const SIDEBAR_KEY = 'sidebarVisible'
 // 输入框最大宽度 800px + 侧边栏宽度 260px，低于此宽度主内容会被挤压
 const SIDEBAR_AUTO_THRESHOLD = 1060
 
-function localISOString(): string {
-  const d = new Date()
-  return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 19)
-}
+
 
 function App() {
   const {
+    sessions,
     listedSessions,
     currentSession,
     currentId,
@@ -31,8 +29,13 @@ function App() {
     updateSessionTitle,
   } = useSessions()
 
-  const [loading, setLoading] = useState(false)
-  const [thinkingLabel, setThinkingLabel] = useState('思考中')
+  // 后台生成任务按会话独立管理：切换会话/新建对话/刷新页面都不会中断生成
+  const [runningIds, setRunningIds] = useState<Set<string>>(new Set())
+  const [thinkingLabels, setThinkingLabels] = useState<Record<string, string>>({})
+  const abortRefs = useRef<Map<string, () => void>>(new Map())
+  const resumedRef = useRef<Set<string>>(new Set())
+  const sessionsRef = useRef(sessions)
+
   const [sidebarVisible, setSidebarVisible] = useState(() => {
     const saved = localStorage.getItem(SIDEBAR_KEY)
     return saved ? saved === 'true' : false
@@ -44,9 +47,13 @@ function App() {
   const [animated, setAnimated] = useState(false)
   const [mounted, setMounted] = useState(false)
   const [openBtnVisible, setOpenBtnVisible] = useState(!sidebarVisible)
-  const abortRef = useRef<(() => void) | null>(null)
+
   // 标记侧边栏是否因窗口变窄被系统自动收起，用于宽度恢复后自动展开
   const autoCollapsedRef = useRef(false)
+
+  useEffect(() => {
+    sessionsRef.current = sessions
+  }, [sessions])
 
   const applyTheme = useCallback((dark: boolean, withTransition: boolean) => {
     const apply = () => {
@@ -170,11 +177,11 @@ function App() {
     return () => window.removeEventListener('resize', handleResize)
   }, [])
 
+  // 页面卸载时中止所有在途流式订阅（后端后台任务不受影响，仍会继续生成并落库）
   useEffect(() => {
+    const refs = abortRefs.current
     return () => {
-      if (abortRef.current) {
-        abortRef.current()
-      }
+      refs.forEach((fn) => fn())
     }
   }, [])
 
@@ -183,120 +190,136 @@ function App() {
     setMounted(true)
   }, [])
 
-  // 切换会话时中止正在进行的流式回答，并关闭输入框位移动画
-  //（从新建对话切到历史会话时，输入框应直接出现在底部，不要平滑滑过文字）
+  // 切换会话时不再中止生成：仅关闭输入框位移动画。
+  // 后台生成按 sessionId 独立继续，写回对应会话，不受当前界面影响。
   useEffect(() => {
-    if (abortRef.current) {
-      abortRef.current()
-      abortRef.current = null
-      setLoading(false)
-    }
     setAnimated(false)
   }, [currentId])
+
+  // 启动一次后台流式订阅，事件驱动更新会话（无论是否为当前会话）
+  const runStream = useCallback(
+    (sessionId: string, start: (h: api.StreamHandlers) => () => void) => {
+      let answerText = ''
+      let reasoningText = ''
+      let references: Reference[] = []
+
+      const finalize = () => {
+        setRunningIds((prev) => {
+          const next = new Set(prev)
+          next.delete(sessionId)
+          return next
+        })
+        setThinkingLabels((prev) => {
+          const next = { ...prev }
+          delete next[sessionId]
+          return next
+        })
+        abortRefs.current.delete(sessionId)
+      }
+
+      const onEvent = (event: api.StreamEvent) => {
+        const data = event.data as Record<string, unknown>
+        switch (event.type) {
+          case 'references':
+            references = (data.references as Reference[]) || []
+            updateLastMessage(sessionId, (m) => ({ ...m, references }))
+            break
+          case 'progress':
+            setThinkingLabels((prev) => ({
+              ...prev,
+              [sessionId]: (data.content as string) || '思考中',
+            }))
+            break
+          case 'reasoning':
+            reasoningText += (data.content as string) || ''
+            updateLastMessage(sessionId, (m) => ({ ...m, reasoning: reasoningText }))
+            break
+          case 'delta':
+            answerText += (data.content as string) || ''
+            updateLastMessage(sessionId, (m) => ({ ...m, content: answerText }))
+            break
+        }
+      }
+
+      const onError = (err: Error) => {
+        answerText += (answerText ? '\n\n' : '') + '后端调用失败：' + err.message
+        updateLastMessage(sessionId, (m) => ({ ...m, content: answerText }))
+        finalize()
+      }
+
+      abortRefs.current.set(sessionId, start({ onEvent, onDone: finalize, onError }))
+    },
+    [updateLastMessage],
+  )
 
   const handleSend = useCallback(
     async (text: string) => {
       if (!currentSession) return
-      const userMsg: SessionMessage = { role: 'user', content: text }
+      const sessionId = currentSession.id
+      const isFirst = currentSession.title === '新对话'
+      const sessionTitle = isFirst ? text.slice(0, 18) || '新对话' : currentSession.title
+      const history = currentSession.messages
 
-      // 当前会话为空时，启用输入框平滑下移动画；动画播放一次后关闭，
-      // 避免 resize 时 transform 变化触发过渡导致输入框延迟移动
+      // 当前会话为空时，启用输入框平滑下移动画；动画播放一次后关闭
       if (currentSession.messages.length === 0) {
         setAnimated(true)
         setTimeout(() => setAnimated(false), 500)
       }
 
-      await appendMessages(currentSession.id, [userMsg])
+      await appendMessages(sessionId, [{ role: 'user', content: text }])
+      await appendMessages(sessionId, [
+        { role: 'assistant', content: '', references: [], reasoning: null },
+      ])
+      updateSessionTitle(sessionId, sessionTitle)
 
-      const assistantMsg: SessionMessage = {
-        role: 'assistant',
-        content: '',
-        references: [],
-        reasoning: null,
-      }
-      await appendMessages(currentSession.id, [assistantMsg])
-
-      setLoading(true)
-      setThinkingLabel('思考中')
-
-      let answerText = ''
-      let reasoningText = ''
-      let references: Reference[] = []
-      let hasReasoning = false
-
-      const finalize = async () => {
-        setLoading(false)
-        const isFirstMessage = currentSession.title === '新对话'
-        const finalTitle = isFirstMessage ? text.slice(0, 18) || '新对话' : currentSession.title
-        updateSessionTitle(currentSession.id, finalTitle)
-        await api.saveSession({
-          ...currentSession,
-          messages: [
-            ...currentSession.messages,
-            userMsg,
-            {
-              role: 'assistant',
-              content: answerText,
-              references,
-              reasoning: hasReasoning ? reasoningText : null,
-            },
-          ],
-          title: finalTitle,
-          updated_at: localISOString(),
-        })
-        // 首次发送消息后，会话从“新对话”变为历史会话，同步 URL hash 以便刷新可恢复
-        if (isFirstMessage) {
-          switchSession(currentSession.id)
-        }
+      // 首条消息发送即写入 URL hash：思考/回答过程中刷新，能恢复到当前生成中的会话，
+      // 而不是回到空的新对话界面
+      if (isFirst) {
+        switchSession(sessionId)
       }
 
-      abortRef.current = api.streamChat(
-        text,
-        currentSession.messages,
-        currentSession.id,
-        (event) => {
-          const data = event.data as Record<string, unknown>
-          switch (event.type) {
-            case 'references':
-              references = (data.references as Reference[]) || []
-              updateLastMessage(currentSession.id, (msg) => ({
-                ...msg,
-                references,
-              }))
-              break
-            case 'progress':
-              setThinkingLabel((data.content as string) || '思考中')
-              break
-            case 'reasoning':
-              hasReasoning = true
-              reasoningText += (data.content as string) || ''
-              updateLastMessage(currentSession.id, (msg) => ({
-                ...msg,
-                reasoning: reasoningText,
-              }))
-              break
-            case 'delta':
-              answerText += (data.content as string) || ''
-              updateLastMessage(currentSession.id, (msg) => ({
-                ...msg,
-                content: answerText,
-              }))
-              break
-          }
-        },
-        finalize,
-        (err) => {
-          answerText += `\n\n后端调用失败：${err.message}`
-          updateLastMessage(currentSession.id, (msg) => ({
-            ...msg,
-            content: answerText,
-          }))
-          finalize()
-        },
+      setRunningIds((prev) => new Set(prev).add(sessionId))
+      setThinkingLabels((prev) => ({ ...prev, [sessionId]: '思考中' }))
+
+      runStream(sessionId, (h) =>
+        api.streamChat(sessionId, text, history, sessionTitle, h.onEvent, h.onDone, h.onError),
       )
     },
-    [currentSession, appendMessages, updateLastMessage, updateSessionTitle],
+    [currentSession, appendMessages, updateSessionTitle, switchSession, runStream],
   )
+
+  // 恢复加载：刷新/关闭标签页后，重新订阅仍在生成的会话，继续展示并写回
+  useEffect(() => {
+    if (!loaded) return
+    let active = true
+    api
+      .listRunningJobs()
+      .then((running) => {
+        if (!active) return
+        running.forEach((sid) => {
+          if (resumedRef.current.has(sid)) return
+          resumedRef.current.add(sid)
+
+          const sess = sessionsRef.current.find((x) => x.id === sid)
+          if (sess) {
+            const last = sess.messages[sess.messages.length - 1]
+            if (!last || last.role === 'user') {
+              appendMessages(sid, [
+                { role: 'assistant', content: '', references: [], reasoning: null },
+              ])
+            }
+          }
+          setRunningIds((prev) => new Set(prev).add(sid))
+          setThinkingLabels((prev) => ({ ...prev, [sid]: '思考中' }))
+
+          runStream(sid, (h) => api.resumeChat(sid, h.onEvent, h.onDone, h.onError))
+        })
+      })
+      .catch(() => {})
+    return () => {
+      active = false
+    }
+  }, [loaded, appendMessages, runStream])
 
   if (!currentSession) {
     return null
@@ -305,6 +328,8 @@ function App() {
   const hashId = window.location.hash.replace(/^#/, '')
   const isRestoring = !loaded && Boolean(hashId)
   const hasMessages = currentSession.messages.length > 0 || isRestoring
+  const isCurrentLoading = currentId ? runningIds.has(currentId) : false
+  const currentThinkingLabel = currentId ? thinkingLabels[currentId] || '思考中' : '思考中'
 
   return (
     <div className={`app ${mounted ? 'mounted' : ''}`}>
@@ -338,13 +363,13 @@ function App() {
           <div className="messages-area">
             <MessageList
               messages={currentSession.messages}
-              loading={loading}
+              loading={isCurrentLoading}
               restoring={isRestoring}
-              thinkingLabel={thinkingLabel}
+              thinkingLabel={currentThinkingLabel}
             />
           </div>
           <div className="input-area">
-            <ChatInput onSend={handleSend} disabled={loading} />
+            <ChatInput onSend={handleSend} disabled={isCurrentLoading} />
           </div>
         </div>
       </main>

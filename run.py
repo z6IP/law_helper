@@ -3,7 +3,7 @@
 后端：uvicorn app.main:app（http://127.0.0.1:8000）
 前端：React + Vite 开发服务器（http://localhost:5173）
 
-前后端日志分别写入 logs/backend.log 与 logs/frontend.log，控制台互不干扰；
+前后端日志直接输出到当前控制台，不再落盘 .log 文件；
 使用 law_helper_env conda 环境的 Python 解释器。
 Ctrl+C 一次性退出两个子进程。
 """
@@ -12,17 +12,17 @@ from __future__ import annotations
 import http.client
 import io
 import json
+import logging
 import os
+import re
 import signal
 import subprocess
 import sys
 import threading
-from datetime import datetime
-from pathlib import Path
 from time import sleep, time as _time
 
 # 尝试设置 Windows 控制台代码页为 UTF-8；同时启用行缓冲避免输出延迟
-subprocess.run("chcp 65001", shell=True, check=False)
+subprocess.run("chcp 65001", shell=True, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 if hasattr(sys.stdout, 'buffer'):
     sys.stdout = io.TextIOWrapper(
         sys.stdout.buffer, encoding=sys.stdout.encoding, line_buffering=True
@@ -31,44 +31,41 @@ if hasattr(sys.stdout, 'buffer'):
 # law_helper_env conda 环境的 Python 解释器
 _PYTHON = r"D:\miniconda3\envs\law_helper_env\python.exe"
 
-
-def _log_dir() -> Path:
-    """日志目录：项目根目录下的 logs/。"""
-    base = Path(os.path.dirname(os.path.abspath(__file__)))
-    directory = base / "logs"
-    directory.mkdir(exist_ok=True)
-    return directory
-
-
-def _open_log(name: str):
-    """以追加模式打开日志文件，返回文件对象。"""
-    path = _log_dir() / name
-    return open(path, "a", encoding="utf-8", buffering=1)
+# 子进程输出仅保留报错信息；启动/就绪信息由 run.py 自身的汇总提示负责
+_ERROR_RE = re.compile(r"error|exception|traceback|critical|fatal|warning|warn", re.IGNORECASE)
+# traceback 续行（缩进的 File/line/raise/at 行）
+_TRACEBACK_RE = re.compile(r'^\s*(File "|line \d+\b|raise |at )')
+# uvicorn 自带的 INFO:/DEBUG: 框架前缀，去除以免与 logger 级别重复
+_FRAMING_RE = re.compile(r"^\s*(?:INFO|DEBUG)\s*:\s*")
 
 
-def _write_banner(fobj) -> None:
-    """每次启动在日志开头写入时间分隔线。"""
-    fobj.write(f"\n{'=' * 60}\n")
-    fobj.write(f"启动时间: {datetime.now().isoformat()}\n")
-    fobj.write(f"{'=' * 60}\n")
+def _should_emit(line: str) -> bool:
+    """判断子进程输出是否值得展示（仅报错信息），其余噪音过滤。"""
+    return bool(_ERROR_RE.search(line) or _TRACEBACK_RE.search(line))
 
 
-def _stream(prefix: str, pipe, fobj) -> None:
-    """子进程输出写入日志文件。"""
+def _setup_logging() -> None:
+    """配置控制台日志格式：时间 + 级别 + 来源，只输出到控制台，不落盘。"""
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)-7s %(name)-8s %(message)s", "%H:%M:%S")
+    )
+    for name in ("backend", "frontend"):
+        lg = logging.getLogger(name)
+        lg.setLevel(logging.DEBUG)
+        lg.handlers.clear()
+        lg.addHandler(handler)
+        lg.propagate = False
+
+
+def _stream(prefix: str, pipe) -> None:
+    """子进程输出经 logger 精简后打到控制台：仅报错信息。"""
+    logger = logging.getLogger(prefix)
     for raw in pipe:
-        line = raw.decode("utf-8", errors="replace")
-        fobj.write(line)
-        fobj.flush()
-
-
-def _log_tail(path: Path, lines: int = 15) -> str:
-    """读取日志文件最后 N 行，用于异常退出时提示用户。"""
-    try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            all_lines = f.readlines()
-            return "".join(all_lines[-lines:])
-    except Exception:
-        return ""
+        line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+        if not line.strip() or not _should_emit(line):
+            continue
+        logger.info(_FRAMING_RE.sub("", line))
 
 
 def _wait_for_backend(timeout: float = 300.0, interval: float = 1.0) -> bool:
@@ -110,10 +107,8 @@ def main() -> None:
     # 强制子进程使用 UTF-8 输出，避免 Windows 控制台 GBK 编码导致的中文乱码
     _env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
 
-    backend_log = _open_log("backend.log")
-    frontend_log = _open_log("frontend.log")
-    _write_banner(backend_log)
-    _write_banner(frontend_log)
+    # 日志仅输出到控制台，不落盘 .log 文件
+    _setup_logging()
 
     # 先声明进程句柄，使 _terminate 在任意时刻调用都能安全引用
     backend = None
@@ -135,8 +130,6 @@ def main() -> None:
                     p.kill()
                 except Exception:
                     pass
-        backend_log.close()
-        frontend_log.close()
         sys.exit(0)
 
     # 使用 law_helper_env 的 Python 启动 uvicorn
@@ -150,13 +143,12 @@ def main() -> None:
         cwd=os.path.dirname(os.path.abspath(__file__)),
         env=_env,
     )
-    threading.Thread(target=_stream, args=("backend", backend.stdout, backend_log), daemon=True).start()
+    threading.Thread(target=_stream, args=("backend", backend.stdout), daemon=True).start()
 
     # 等待后端预热完成（模型加载、索引校验）后再启动前端，避免前端代理报错
     print("[启动] 等待后端预热完成（最长 5 分钟，重启电脑后首次启动可能较慢）...")
     if not _wait_for_backend():
-        print("\n[错误] 后端预热超时，请查看 logs/backend.log")
-        print(_log_tail(_log_dir() / "backend.log"))
+        print("\n[错误] 后端预热超时，请查看上方输出的后端日志")
         _terminate()
     print("[启动] 后端预热完成，启动前端...")
 
@@ -169,13 +161,11 @@ def main() -> None:
         cwd=frontend_dir,
         env=_env,
     )
-    threading.Thread(target=_stream, args=("frontend", frontend.stdout, frontend_log), daemon=True).start()
+    threading.Thread(target=_stream, args=("frontend", frontend.stdout), daemon=True).start()
 
     print("=" * 60)
     print("后端: http://127.0.0.1:8000  (uvicorn)")
     print("前端: http://localhost:5173  (vite)")
-    print("日志: logs/backend.log")
-    print("      logs/frontend.log")
     print("按 Ctrl+C 退出两个服务")
     print("=" * 60)
 
@@ -186,13 +176,9 @@ def main() -> None:
     while True:
         if backend.poll() is not None:
             print("\n[退出] 后端进程已退出，前端随之停止。")
-            print("[退出] 后端日志尾部：")
-            print(_log_tail(_log_dir() / "backend.log"))
             _terminate()
         if frontend.poll() is not None:
             print("\n[退出] 前端进程已退出，后端随之停止。")
-            print("[退出] 前端日志尾部：")
-            print(_log_tail(_log_dir() / "frontend.log"))
             _terminate()
         sleep(1)
 

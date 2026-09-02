@@ -11,6 +11,7 @@ from app.query_expansion import expand_query
 from app.retrieval import get_retrieval_engine
 from app.rerank import get_reranker
 from app.schemas import Reference
+from app.tracing import event, span
 
 SYSTEM_PROMPT = (
     "你是「小Z」，一名熟悉道路交通安全相关法律法规（包括《中华人民共和国道路交通安全法》"
@@ -160,7 +161,7 @@ def _resolve_context(question: str, history: list[dict]) -> tuple[str, bool]:
         if not rewritten or len(rewritten) > 60:  # 超长视为解释性输出，改写失败
             return question, False
         if rewritten != question:
-            print(f"[QueryRewrite] {question!r} -> {rewritten!r}")
+            event("query_rewrite.changed", before=question, after=rewritten)
         return rewritten, True
     except LawHelperError:
         return question, False  # 降级：改写失败不影响主流程
@@ -219,16 +220,19 @@ def answer(question: str, history: list[dict] | None = None) -> tuple[str, list[
     # （防止「那扣几分？」这类追问被 trivial 拦截误杀）；
     # 改写失败（rewrite_ok=False）时跳过 trivial 拒答直接进检索，由重排阈值兜底；
     # 无历史时 resolved 即原问题，行为与单轮完全一致
-    resolved, rewrite_ok = _resolve_context(question, history)
+    with span("query_rewrite"):
+        resolved, rewrite_ok = _resolve_context(question, history)
 
     # 无意义输入（单字 / 纯数字 / 问候 / 短词无法律关键词）：不进入检索，直接拒答
     if rewrite_ok and _is_trivial_query(resolved):
+        event("trivial_reject", question=question)
         user_prompt = _OFF_TOPIC_PROMPT_TEMPLATE.format(question=question)
         llm_text = get_llm().chat(SYSTEM_PROMPT, user_prompt)
         return llm_text, []
 
     # 对话元问题（如「我刚刚的问题是什么」）：仅凭对话历史回答，不检索、不附引用
     if history and _is_conversation_meta(resolved):
+        event("conversation_meta", question=resolved)
         llm_text = get_llm().chat(_META_ANSWER_SYSTEM, _history_prompt(question, history))
         return llm_text, []
 
@@ -236,22 +240,28 @@ def answer(question: str, history: list[dict] | None = None) -> tuple[str, list[
     reranker = get_reranker()
 
     retrieval_q = expand_query(resolved)
-    candidates = engine.search(retrieval_q, top_k=settings.top_k_retrieve)
-    contexts = reranker.rerank(
-        retrieval_q,
-        candidates,
-        top_n=settings.rerank_top_n,
-        min_score=settings.rerank_min_score,
-    )
+    with span("retrieval", query=retrieval_q, top_k=settings.top_k_retrieve):
+        candidates = engine.search(retrieval_q, top_k=settings.top_k_retrieve)
+    event("retrieval.candidates", count=len(candidates))
+    with span("rerank", top_n=settings.rerank_top_n, min_score=settings.rerank_min_score):
+        contexts = reranker.rerank(
+            retrieval_q,
+            candidates,
+            top_n=settings.rerank_top_n,
+            min_score=settings.rerank_min_score,
+        )
+    event("rerank.hits", count=len(contexts))
 
     # 无相关法条：不附带任何引用，由 LLM 简短拒答
     if not contexts:
+        event("no_contexts")
         user_prompt = _OFF_TOPIC_PROMPT_TEMPLATE.format(question=question)
         llm_text = get_llm().chat(SYSTEM_PROMPT, user_prompt)
         return llm_text, []
 
     user_prompt = _build_user_prompt(resolved, contexts)
-    llm_text = get_llm().chat(SYSTEM_PROMPT, user_prompt)
+    with span("llm_generate"):
+        llm_text = get_llm().chat(SYSTEM_PROMPT, user_prompt)
 
     references = [
         Reference.model_validate({
@@ -284,6 +294,7 @@ def answer_stream(question: str, history: list[dict] | None = None):
     # 无意义输入（无历史时的单字 / 纯数字 / 问候 / 短词无法律关键词）：
     # 不发预热思考，直接走拒答分支，前端不会出现思考区域
     if not history and _is_trivial_query(question):
+        event("trivial_reject", question=question)
         yield {"type": "references", "references": []}
         user_prompt = _OFF_TOPIC_PROMPT_TEMPLATE.format(question=question)
         for kind, text in get_llm().chat_stream(SYSTEM_PROMPT, user_prompt):
@@ -303,8 +314,10 @@ def answer_stream(question: str, history: list[dict] | None = None):
     rewrite_ok = True
     if history:
         yield {"type": "progress", "content": "正在结合上下文理解问题..."}
-        resolved, rewrite_ok = _resolve_context(question, history)
+        with span("query_rewrite"):
+            resolved, rewrite_ok = _resolve_context(question, history)
         if rewrite_ok and _is_trivial_query(resolved):
+            event("trivial_reject", resolved=resolved)
             yield {"type": "references", "references": []}
             user_prompt = _OFF_TOPIC_PROMPT_TEMPLATE.format(question=question)
             for kind, text in get_llm().chat_stream(SYSTEM_PROMPT, user_prompt):
@@ -316,6 +329,7 @@ def answer_stream(question: str, history: list[dict] | None = None):
 
     # 对话元问题（如「我刚刚的问题是什么」）：仅凭对话历史回答，不检索、不附引用
     if history and _is_conversation_meta(resolved):
+        event("conversation_meta", question=resolved)
         yield {"type": "references", "references": []}
         for kind, text in get_llm().chat_stream(_META_ANSWER_SYSTEM, _history_prompt(question, history)):
             if kind == "reasoning":
@@ -328,20 +342,20 @@ def answer_stream(question: str, history: list[dict] | None = None):
     yield {"type": "progress", "content": "正在检索相关法条..."}
     engine = get_retrieval_engine()
     retrieval_q = expand_query(resolved)
-    candidates = engine.search(retrieval_q, top_k=settings.top_k_retrieve)
-    t_search = time.perf_counter()
-    print(f"[Timing] 检索耗时: {t_search - t0:.2f}s, 候选数: {len(candidates)}")
+    with span("retrieval", query=retrieval_q, top_k=settings.top_k_retrieve):
+        candidates = engine.search(retrieval_q, top_k=settings.top_k_retrieve)
+    event("retrieval.candidates", count=len(candidates))
 
     # Step 2: 重排（搜索阶段统一显示"正在搜索..."，不暴露候选数等内部细节）
     reranker = get_reranker()
-    contexts = reranker.rerank(
-        retrieval_q,
-        candidates,
-        top_n=settings.rerank_top_n,
-        min_score=settings.rerank_min_score,
-    )
-    t_rerank = time.perf_counter()
-    print(f"[Timing] 重排耗时: {t_rerank - t_search:.2f}s, 命中数: {len(contexts)}")
+    with span("rerank", top_n=settings.rerank_top_n, min_score=settings.rerank_min_score):
+        contexts = reranker.rerank(
+            retrieval_q,
+            candidates,
+            top_n=settings.rerank_top_n,
+            min_score=settings.rerank_min_score,
+        )
+    event("rerank.hits", count=len(contexts))
 
     references = [
         Reference.model_validate({
@@ -355,6 +369,7 @@ def answer_stream(question: str, history: list[dict] | None = None):
     yield {"type": "references", "references": [r.model_dump() for r in references]}
 
     if not contexts:
+        event("no_contexts")
         user_prompt = _OFF_TOPIC_PROMPT_TEMPLATE.format(question=question)
         for kind, text in get_llm().chat_stream(SYSTEM_PROMPT, user_prompt):
             if kind == "reasoning":
@@ -366,10 +381,10 @@ def answer_stream(question: str, history: list[dict] | None = None):
     # Step 3: LLM 生成（使用改写后的独立问题，与 LangChain rephrase_question=True 一致）
     yield {"type": "progress", "content": "正在思考回答..."}
     user_prompt = _build_user_prompt(resolved, contexts)
-    for kind, text in get_llm().chat_stream(SYSTEM_PROMPT, user_prompt):
-        if kind == "reasoning":
-            yield {"type": "reasoning", "content": text}
-        else:
-            yield {"type": "delta", "content": text}
-    t_done = time.perf_counter()
-    print(f"[Timing] 总耗时: {t_done - t0:.2f}s")
+    with span("llm_generate"):
+        for kind, text in get_llm().chat_stream(SYSTEM_PROMPT, user_prompt):
+            if kind == "reasoning":
+                yield {"type": "reasoning", "content": text}
+            else:
+                yield {"type": "delta", "content": text}
+    event("done", total_ms=round((time.perf_counter() - t0) * 1000, 2))

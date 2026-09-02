@@ -5,6 +5,9 @@
 _debug_*.py
 .trae/
 
+# 可视测面板
+dashboard.html
+
 # Python
 __pycache__/
 *.py[cod]
@@ -16,6 +19,7 @@ venv/
 chroma/
 models/
 data/
+logs/
 
 # IDE
 .idea/

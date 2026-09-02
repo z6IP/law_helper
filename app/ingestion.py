@@ -11,14 +11,15 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import json
 import re
+import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from app.config import get_settings
 from app.embeddings import get_embedding_model
 from app.errors import DocumentNotFoundError, IngestionError
+from app.tracing import event, span
 
 # 章 / 节 / 条 标题识别
 CHAPTER_RE = re.compile(r"^第([零一二三四五六七八九十百千]+)章\s*(.*)$")
@@ -307,7 +308,7 @@ def _ocr_pdf(pdf_path) -> list[Article]:
             b64 = base64.b64encode(pix.tobytes("png")).decode("utf-8")
             text = llm.ocr_images([b64])
             all_lines.extend(line.strip() for line in text.splitlines() if line.strip())
-            print(f"[OCR] {source} 第 {page_idx}/{total} 页识别完成")
+            event("ingest.ocr_page", source=source, page=page_idx, total=total)
 
         events = _lines_to_events(all_lines)
         articles, _ = _events_to_articles(events, source)
@@ -429,7 +430,16 @@ def parse_pdf(pdf_path) -> list[Article]:
         return articles
 
 
-MANIFEST_FILENAME = "ingestion_manifest.json"
+MANIFEST_FILENAME = "ingestion_manifest.db"
+
+
+_MANIFEST_SCHEMA = """
+CREATE TABLE IF NOT EXISTS ingestion_manifest (
+    source        TEXT PRIMARY KEY,
+    file_hash     TEXT NOT NULL UNIQUE,
+    article_count INTEGER NOT NULL DEFAULT 0
+)
+"""
 
 
 @dataclass
@@ -450,8 +460,8 @@ def _make_id(source: str, section_header: str, article_no: str) -> str:
 
 
 def _compute_file_hash(path: Path) -> str:
-    """计算文件内容的 md5，用于检测文件是否被修改。"""
-    h = hashlib.md5()
+    """计算文件内容的 sha256，用于检测文件是否被修改。"""
+    h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
@@ -462,24 +472,46 @@ def _manifest_path(chroma_dir: Path) -> Path:
     return chroma_dir / MANIFEST_FILENAME
 
 
+def _manifest_conn(chroma_dir: Path):
+    """打开（必要时创建）manifest SQLite 库并确保表结构存在。"""
+    chroma_dir.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(chroma_dir / MANIFEST_FILENAME)
+    conn.execute(_MANIFEST_SCHEMA)
+    conn.commit()
+    return conn
+
+
 def _load_manifest(chroma_dir: Path) -> dict:
-    """读取 ingestion manifest；不存在则返回空字典。"""
-    p = _manifest_path(chroma_dir)
-    if not p.exists():
-        return {}
+    """读取 manifest 为 {source: {"hash": ..., "articles": ...}}；空表返回空字典。"""
+    conn = _manifest_conn(chroma_dir)
     try:
-        with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return {}
+        rows = conn.execute(
+            "SELECT source, file_hash, article_count FROM ingestion_manifest"
+        ).fetchall()
+    finally:
+        conn.close()
+    return {
+        source: {"hash": file_hash, "articles": article_count}
+        for source, file_hash, article_count in rows
+    }
 
 
 def _save_manifest(chroma_dir: Path, manifest: dict) -> None:
-    """持久化 ingestion manifest。"""
-    p = _manifest_path(chroma_dir)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    """全量落盘 manifest：先清空再插入，等价于旧 JSON 的整体覆盖语义。"""
+    conn = _manifest_conn(chroma_dir)
+    try:
+        conn.execute("DELETE FROM ingestion_manifest")
+        conn.executemany(
+            "INSERT INTO ingestion_manifest (source, file_hash, article_count) "
+            "VALUES (?, ?, ?)",
+            [
+                (source, m["hash"], m.get("articles", 0))
+                for source, m in manifest.items()
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _ingest_single_file(
@@ -488,27 +520,28 @@ def _ingest_single_file(
     embedding_model,
 ) -> tuple[str, int]:
     """解析单个文件并 upsert 到 collection，返回 (source, article_count)。"""
-    suffix = path.suffix.lower()
-    if suffix == ".docx":
-        articles = parse_docx(path)
-    elif suffix == ".pdf":
-        articles = parse_pdf(path)
-    else:
-        raise IngestionError(f"不支持的文件类型：{path.name}")
-    if not articles:
-        raise IngestionError(f"未从文档中解析到任何内容：{path.name}")
-
     source = _clean_source_name(path)
-    documents = [a.text for a in articles]
-    metadatas = [
-        {"article_no": a.article_no, "section_header": a.section_header, "source": source}
-        for a in articles
-    ]
-    ids = [_make_id(source, a.section_header, a.article_no) for a in articles]
-    embeddings = embedding_model.embed_documents(documents)
-    collection.upsert(
-        ids=ids, documents=documents, metadatas=metadatas, embeddings=embeddings
-    )
+    with span("ingest.file", source=source, file=path.name):
+        suffix = path.suffix.lower()
+        if suffix == ".docx":
+            articles = parse_docx(path)
+        elif suffix == ".pdf":
+            articles = parse_pdf(path)
+        else:
+            raise IngestionError(f"不支持的文件类型：{path.name}")
+        if not articles:
+            raise IngestionError(f"未从文档中解析到任何内容：{path.name}")
+
+        documents = [a.text for a in articles]
+        metadatas = [
+            {"article_no": a.article_no, "section_header": a.section_header, "source": source}
+            for a in articles
+        ]
+        ids = [_make_id(source, a.section_header, a.article_no) for a in articles]
+        embeddings = embedding_model.embed_documents(documents)
+        collection.upsert(
+            ids=ids, documents=documents, metadatas=metadatas, embeddings=embeddings
+        )
     return source, len(articles)
 
 
@@ -562,17 +595,17 @@ def ingest() -> IngestResult:
         if ids_to_remove:
             collection.delete(ids=ids_to_remove)
         result.removed += len(ids_to_remove)
-        print(f"[ingest] 移除已删除文档：{source}，共 {len(ids_to_remove)} 条")
+        event("ingest.remove", source=source, count=len(ids_to_remove))
 
     for path in changed_paths:
         source, count = _ingest_single_file(path, collection, embedding_model)
         current_sources[source]["articles"] = count
         if manifest.get(source):
             result.updated += count
-            print(f"[ingest] 更新文档：{source}，共 {count} 条")
+            event("ingest.update", source=source, count=count)
         else:
             result.added += count
-            print(f"[ingest] 新增文档：{source}，共 {count} 条")
+            event("ingest.add", source=source, count=count)
 
     # 未变化的 source 计入 skipped
     for source in manifest:

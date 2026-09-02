@@ -18,6 +18,7 @@ from app.config import get_settings
 from app.embeddings import get_embedding_model
 from app.errors import RetrievalError
 from app.ingestion import COLLECTION_NAME
+from app.tracing import event
 
 
 def _tokenize(text: str) -> list[str]:
@@ -79,9 +80,10 @@ class RetrievalEngine:
             expected_dim = _get_embedding_dim()
             actual_dim = self._embeddings.shape[1]
             if actual_dim != expected_dim:
-                print(
-                    f"[Retrieval] 维度不匹配！存储: {actual_dim}维, "
-                    f"当前模型: {expected_dim}维, 需要重建索引"
+                event(
+                    "retrieval.dim_mismatch",
+                    stored_dim=actual_dim,
+                    expected_dim=expected_dim,
                 )
                 self._dim_mismatch = True
 

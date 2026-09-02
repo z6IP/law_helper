@@ -5,6 +5,7 @@ from functools import lru_cache
 
 from app.config import get_settings
 from app.errors import LLMError
+from app.tracing import event, span
 
 
 class BailianClient:
@@ -31,17 +32,27 @@ class BailianClient:
         self._ensure_loaded()
         settings = get_settings()
         try:
-            resp = self._client.chat.completions.create(
-                model=settings.llm_model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=temperature,
-                # qwen3 系列关闭思考输出（非流式调用不需要思考）；其他模型忽略该参数
-                extra_body={"enable_thinking": False},
-            )
-            return resp.choices[0].message.content or ""
+            with span("llm.chat", model=settings.llm_model, temperature=temperature):
+                resp = self._client.chat.completions.create(
+                    model=settings.llm_model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=temperature,
+                    # qwen3 系列关闭思考输出（非流式调用不需要思考）；其他模型忽略该参数
+                    extra_body={"enable_thinking": False},
+                )
+                usage = getattr(resp, "usage", None)
+                if usage is not None:
+                    event(
+                        "llm.tokens",
+                        model=settings.llm_model,
+                        prompt_tokens=usage.prompt_tokens,
+                        completion_tokens=usage.completion_tokens,
+                        total_tokens=usage.total_tokens,
+                    )
+                return resp.choices[0].message.content or ""
         except Exception as exc:  # noqa: BLE001 - 统一转为领域异常
             raise LLMError(f"大模型调用失败：{exc}") from exc
 
@@ -63,18 +74,33 @@ class BailianClient:
                 ],
                 temperature=0.2,
                 stream=True,
+                stream_options={"include_usage": True},
             )
-            for chunk in resp:
-                if not (chunk.choices and chunk.choices[0].delta):
-                    continue
-                delta = chunk.choices[0].delta
-                # 思考过程（推理模型才有，普通模型该字段为 None）
-                rc = getattr(delta, "reasoning_content", None)
-                if rc:
-                    yield ("reasoning", rc)
-                # 正文
-                if delta.content:
-                    yield ("content", delta.content)
+            usage = None
+            with span("llm.chat_stream", model=settings.llm_model):
+                for chunk in resp:
+                    # 末尾 usage chunk：choices 可能为空，需先取用量再跳过
+                    if getattr(chunk, "usage", None):
+                        usage = chunk.usage
+                        continue
+                    if not (chunk.choices and chunk.choices[0].delta):
+                        continue
+                    delta = chunk.choices[0].delta
+                    # 思考过程（推理模型才有，普通模型该字段为 None）
+                    rc = getattr(delta, "reasoning_content", None)
+                    if rc:
+                        yield ("reasoning", rc)
+                    # 正文
+                    if delta.content:
+                        yield ("content", delta.content)
+            if usage is not None:
+                event(
+                    "llm.tokens",
+                    model=settings.llm_model,
+                    prompt_tokens=usage.prompt_tokens,
+                    completion_tokens=usage.completion_tokens,
+                    total_tokens=usage.total_tokens,
+                )
         except Exception as exc:  # noqa: BLE001 - 统一转为领域异常
             raise LLMError(f"大模型调用失败：{exc}") from exc
 
@@ -103,13 +129,23 @@ class BailianClient:
                 }
             )
         try:
-            resp = self._client.chat.completions.create(
-                model=settings.ocr_model,
-                messages=[{"role": "user", "content": user_content}],
-                temperature=0.1,
-                extra_body={"enable_thinking": False},
-            )
-            return resp.choices[0].message.content or ""
+            with span("llm.ocr", model=settings.ocr_model, pages=len(base64_images)):
+                resp = self._client.chat.completions.create(
+                    model=settings.ocr_model,
+                    messages=[{"role": "user", "content": user_content}],
+                    temperature=0.1,
+                    extra_body={"enable_thinking": False},
+                )
+                usage = getattr(resp, "usage", None)
+                if usage is not None:
+                    event(
+                        "llm.tokens",
+                        model=settings.ocr_model,
+                        prompt_tokens=usage.prompt_tokens,
+                        completion_tokens=usage.completion_tokens,
+                        total_tokens=usage.total_tokens,
+                    )
+                return resp.choices[0].message.content or ""
         except Exception as exc:  # noqa: BLE001
             raise LLMError(f"OCR 模型调用失败：{exc}") from exc
 
