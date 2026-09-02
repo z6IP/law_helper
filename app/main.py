@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import uuid
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -48,76 +49,104 @@ app.add_middleware(
 )
 
 
-@app.on_event("startup")
-async def startup_preload():
-    """启动时预加载模型 + 验证索引正确性，消除首次请求冷启动延迟。"""
-    import chromadb
-    from app.ingestion import COLLECTION_NAME
+# 预热状态：startup 立即返回，预热在后台线程进行
+# - ready: 预热是否完成（完成后 chat 接口才允许调用）
+# - error: 预热异常信息（None 表示无异常）
+# - stage: 当前阶段描述，便于排障
+_PRELOAD_STATE = {"ready": False, "error": None, "stage": "pending"}
 
-    settings = get_settings()
-    chroma_path = str(settings.chroma_full_dir)
-    client = chromadb.PersistentClient(path=chroma_path)
 
-    # Step 1: 加载 Embedding 模型（local_files_only=True，跳过网络检查）
-    print("[预加载] 正在加载 Embedding 模型...")
-    from app.embeddings import get_embedding_model
+def _run_preload() -> None:
+    """后台线程：预加载模型 + 验证索引正确性，消除首次请求冷启动延迟。
 
-    emb_model = get_embedding_model()
-    # warmup: 跑一次推理，确保权重完全加载
-    _ = emb_model.embed_query("小ZAI助手启动预热")
-    print(f"[预加载] Embedding 模型就绪，输出维度: {len(_)}")
+    将原本同步阻塞 startup 的预热逻辑迁到后台线程，使 health 等接口在
+    uvicorn 监听端口后即可响应，run.py 不必等模型加载完成才检测到端口连通。
+    """
+    try:
+        import chromadb
+        from app.ingestion import COLLECTION_NAME
 
-    # Step 2: 加载 Reranker 模型（local_files_only=True，跳过网络检查）
-    print("[预加载] 正在加载 Reranker 模型...")
-    from app.rerank import get_reranker
+        settings = get_settings()
+        chroma_path = str(settings.chroma_full_dir)
+        client = chromadb.PersistentClient(path=chroma_path)
 
-    reranker = get_reranker()
-    # 触发模型加载（懒加载 → 实际加载）
-    reranker._ensure_loaded()
-    # warmup: 跑一次最小推理，确保 CrossEncoder 权重全部加载
-    import torch
-    with torch.inference_mode():
-        _ = reranker._model.predict([("预热查询", "预热文档")])
-    print("[预加载] Reranker 模型就绪")
+        # Step 1: 加载 Embedding 模型（local_files_only=True，跳过网络检查）
+        _PRELOAD_STATE["stage"] = "embedding"
+        print("[预加载] 正在加载 Embedding 模型...")
+        from app.embeddings import get_embedding_model
 
-    # Step 3: 校验索引（维度检测优先，条件重建；否则启动增量导入）
-    collection = client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        metadata={
-            "hnsw:space": "cosine",
-            "hnsw:construction_ef": 100,
-            "hnsw:search_ef": 16,
-            "hnsw:M": 16,
-        },
-    )
-    count = collection.count()
-    print(f"[预加载] 向量库当前有 {count} 条记录")
+        emb_model = get_embedding_model()
+        # warmup: 跑一次推理，确保权重完全加载
+        _ = emb_model.embed_query("小ZAI助手启动预热")
+        print(f"[预加载] Embedding 模型就绪，输出维度: {len(_)}")
 
-    from app.retrieval import get_retrieval_engine
+        # Step 2: 加载 Reranker 模型（local_files_only=True，跳过网络检查）
+        _PRELOAD_STATE["stage"] = "reranker"
+        print("[预加载] 正在加载 Reranker 模型...")
+        from app.rerank import get_reranker
 
-    engine = get_retrieval_engine()
-    if engine.needs_rebuild:
-        print("[预加载] 检测到维度不匹配，正在重建索引...")
-        import shutil
+        reranker = get_reranker()
+        # 触发模型加载（懒加载 → 实际加载）
+        reranker._ensure_loaded()
+        # warmup: 跑一次最小推理，确保 CrossEncoder 权重全部加载
+        import torch
+        with torch.inference_mode():
+            _ = reranker._model.predict([("预热查询", "预热文档")])
+        print("[预加载] Reranker 模型就绪")
 
-        if os.path.exists(chroma_path):
-            shutil.rmtree(chroma_path, ignore_errors=True)
+        # Step 3: 校验索引（维度检测优先，条件重建；否则启动增量导入）
+        _PRELOAD_STATE["stage"] = "index"
+        collection = client.get_or_create_collection(
+            name=COLLECTION_NAME,
+            metadata={
+                "hnsw:space": "cosine",
+                "hnsw:construction_ef": 100,
+                "hnsw:search_ef": 16,
+                "hnsw:M": 16,
+            },
+        )
+        count = collection.count()
+        print(f"[预加载] 向量库当前有 {count} 条记录")
+
+        from app.retrieval import get_retrieval_engine
+
+        engine = get_retrieval_engine()
+        if engine.needs_rebuild:
+            print("[预加载] 检测到维度不匹配，正在重建索引...")
+            import shutil
+
+            if os.path.exists(chroma_path):
+                shutil.rmtree(chroma_path, ignore_errors=True)
+            from app.retrieval import get_retrieval_engine as _gre
+
+            _gre.cache_clear()
+            result = ingestion.ingest()
+            print(f"[预加载] 重建索引完成，{result.message}")
+        else:
+            result = ingestion.ingest()
+            print(f"[预加载] {result.message}")
+
+        # Step 4: 加载 / 刷新检索引擎（BM25 等组件就绪）
+        _PRELOAD_STATE["stage"] = "retrieval"
+        print("[预加载] 正在加载检索引擎...")
         from app.retrieval import get_retrieval_engine as _gre
 
         _gre.cache_clear()
-        result = ingestion.ingest()
-        print(f"[预加载] 重建索引完成，{result.message}")
-    else:
-        result = ingestion.ingest()
-        print(f"[预加载] {result.message}")
+        get_retrieval_engine()
+        print("[预加载] 检索引擎就绪")
 
-    # Step 4: 加载 / 刷新检索引擎（BM25 等组件就绪）
-    print("[预加载] 正在加载检索引擎...")
-    from app.retrieval import get_retrieval_engine as _gre
+        _PRELOAD_STATE["ready"] = True
+        _PRELOAD_STATE["stage"] = "done"
+    except Exception as exc:  # noqa: BLE001
+        _PRELOAD_STATE["error"] = f"{type(exc).__name__}: {exc}"
+        _PRELOAD_STATE["stage"] = "error"
+        print(f"[预加载] 失败：{_PRELOAD_STATE['error']}")
 
-    _gre.cache_clear()
-    get_retrieval_engine()
-    print("[预加载] 检索引擎就绪")
+
+@app.on_event("startup")
+async def startup_preload():
+    """启动时在后台线程预加载模型，避免阻塞 HTTP 接口响应。"""
+    threading.Thread(target=_run_preload, name="backend-preload", daemon=True).start()
 
 
 @app.exception_handler(LawHelperError)
@@ -172,14 +201,38 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/api/v1/chat", response_model=ChatResponse, dependencies=[Depends(chat_limiter)])
+@app.get("/api/v1/ready")
+def ready():
+    """返回预热状态：ready=True 时 chat 接口才可调用。"""
+    return {
+        "ready": _PRELOAD_STATE["ready"],
+        "stage": _PRELOAD_STATE["stage"],
+        "error": _PRELOAD_STATE["error"],
+    }
+
+
+def _ensure_preload_ready() -> None:
+    """chat 接口前置检查：预热未完成或失败时返回 503，避免冷启动超时。"""
+    if _PRELOAD_STATE["error"] is not None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"预热失败，请查看后端日志：{_PRELOAD_STATE['error']}",
+        )
+    if not _PRELOAD_STATE["ready"]:
+        raise HTTPException(
+            status_code=503,
+            detail=f"模型加载中（阶段：{_PRELOAD_STATE['stage']}），请稍后再试",
+        )
+
+
+@app.post("/api/v1/chat", response_model=ChatResponse, dependencies=[Depends(_ensure_preload_ready), Depends(chat_limiter)])
 def chat(req: ChatRequest, request: Request):
     _ensure_session_access(request, req.session_id)
     text, references = answer(req.question, req.history)
     return ChatResponse(answer=text, references=references)
 
 
-@app.post("/api/v1/chat/stream", dependencies=[Depends(chat_limiter)])
+@app.post("/api/v1/chat/stream", dependencies=[Depends(_ensure_preload_ready), Depends(chat_limiter)])
 def chat_stream(req: ChatRequest, request: Request):
     """流式返回：先 references 事件，再逐段 delta 文本（NDJSON）。"""
     _ensure_session_access(request, req.session_id)
@@ -204,6 +257,7 @@ def chat_stream(req: ChatRequest, request: Request):
 
 @app.post("/api/v1/ingest", response_model=IngestResponse)
 def ingest():
+    _ensure_preload_ready()
     result = ingestion.ingest()
     from app.retrieval import get_retrieval_engine as _gre
 

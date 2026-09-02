@@ -163,6 +163,13 @@ function App() {
     return () => window.removeEventListener('resize', handleResize)
   }, [sidebarVisible, toggleSidebar])
 
+  // resize 时取消输入框位移动画，避免动画期间窗口尺寸变化导致闪屏
+  useEffect(() => {
+    const handleResize = () => setAnimated(false)
+    window.addEventListener('resize', handleResize)
+    return () => window.removeEventListener('resize', handleResize)
+  }, [])
+
   useEffect(() => {
     return () => {
       if (abortRef.current) {
@@ -192,9 +199,11 @@ function App() {
       if (!currentSession) return
       const userMsg: SessionMessage = { role: 'user', content: text }
 
-      // 当前会话为空时，启用输入框平滑下移动画；切换历史会话时动画已关闭
+      // 当前会话为空时，启用输入框平滑下移动画；动画播放一次后关闭，
+      // 避免 resize 时 transform 变化触发过渡导致输入框延迟移动
       if (currentSession.messages.length === 0) {
         setAnimated(true)
+        setTimeout(() => setAnimated(false), 500)
       }
 
       await appendMessages(currentSession.id, [userMsg])

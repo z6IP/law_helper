@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import http.client
 import io
+import json
 import os
 import signal
 import subprocess
@@ -70,18 +71,35 @@ def _log_tail(path: Path, lines: int = 15) -> str:
         return ""
 
 
-def _wait_for_backend(timeout: float = 120.0, interval: float = 0.5) -> bool:
-    """等待后端 health 接口就绪，避免前端启动后代理不到后端。"""
+def _wait_for_backend(timeout: float = 300.0, interval: float = 1.0) -> bool:
+    """等待后端预热完成（/api/v1/ready 返回 ready=True）。
+
+    原实现直接轮询 /api/v1/health，但预热在 startup 事件中同步执行，
+    FastAPI 在 startup 完成前不会响应任何 HTTP 请求，导致每次 conn.request
+    都因 2 秒 socket 超时而伪失败，循环重试到 deadline 仍未通过。
+    现在预热已迁到后台线程，startup 立即返回，health 与 ready 接口可即时响应；
+    这里改为轮询 /ready，并在等待期间打印预热阶段进度。
+    """
     deadline = _time() + timeout
+    last_stage = None
     while _time() < deadline:
         try:
-            conn = http.client.HTTPConnection("127.0.0.1", 8000, timeout=2)
-            conn.request("GET", "/api/v1/health")
+            conn = http.client.HTTPConnection("127.0.0.1", 8000, timeout=3)
+            conn.request("GET", "/api/v1/ready")
             resp = conn.getresponse()
             body = resp.read()
             conn.close()
-            if resp.status == 200 and b"ok" in body:
-                return True
+            if resp.status == 200:
+                data = json.loads(body.decode("utf-8"))
+                if data.get("ready"):
+                    return True
+                if data.get("error"):
+                    print(f"\n[错误] 后端预热失败：{data['error']}")
+                    return False
+                stage = data.get("stage") or "unknown"
+                if stage != last_stage:
+                    print(f"[启动] 后端预热中... 阶段：{stage}")
+                    last_stage = stage
         except Exception:
             pass
         sleep(interval)
@@ -134,13 +152,13 @@ def main() -> None:
     )
     threading.Thread(target=_stream, args=("backend", backend.stdout, backend_log), daemon=True).start()
 
-    # 等待后端 health 接口就绪后再启动前端，避免前端代理报错
-    print("[启动] 等待后端就绪...")
+    # 等待后端预热完成（模型加载、索引校验）后再启动前端，避免前端代理报错
+    print("[启动] 等待后端预热完成（最长 5 分钟，重启电脑后首次启动可能较慢）...")
     if not _wait_for_backend():
-        print("\n[错误] 后端启动超时，请查看 logs/backend.log")
+        print("\n[错误] 后端预热超时，请查看 logs/backend.log")
         print(_log_tail(_log_dir() / "backend.log"))
         _terminate()
-    print("[启动] 后端已就绪，启动前端...")
+    print("[启动] 后端预热完成，启动前端...")
 
     frontend_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend")
     # 直接调用 node 运行 vite.js，避免 npm/.cmd 中间层产生孤儿进程
