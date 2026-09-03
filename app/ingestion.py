@@ -5,7 +5,7 @@
 
 工程约束：
 - 每个 chunk 的 metadata 记录 section_header（章/节标题）与 article_no（条号）；
-- 向量 id 基于 md5(source + section_header + article_no) 保证幂等 upsert。
+- 向量 id 基于 sha256(source + section_header + article_no) 保证幂等 upsert。
 """
 from __future__ import annotations
 
@@ -456,7 +456,7 @@ class IngestResult:
 
 def _make_id(source: str, section_header: str, article_no: str) -> str:
     raw = f"{source}|{section_header}|{article_no}".encode("utf-8")
-    return hashlib.md5(raw).hexdigest()
+    return hashlib.sha256(raw).hexdigest()
 
 
 def _compute_file_hash(path: Path) -> str:
@@ -550,7 +550,7 @@ def ingest() -> IngestResult:
 
     - 通过文件内容 hash 检测新增/修改的文档，只重新嵌入变化的文档；
     - 通过 source 名称检测已被移除的文档，从库中删除；
-    - 向量 id 基于 md5(source + section_header + article_no) 保证幂等 upsert。
+    - 向量 id 基于 sha256(source + section_header + article_no) 保证幂等 upsert。
     """
     settings = get_settings()
     paths = settings.docx_full_paths + settings.pdf_full_paths

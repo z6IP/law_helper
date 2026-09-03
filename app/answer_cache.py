@@ -5,7 +5,7 @@
 供 Dashboard 统计缓存命中率。
 
 约束：仅对「无历史的单轮问题」启用，避免多轮追问因上下文差异误命中。
-缓存键为归一化（去首尾空白、合并连续空白、小写）后问题文本的 MD5。
+缓存键为归一化（去首尾空白、合并连续空白、小写）后问题文本的 SHA-256。
 法条语料更新（ingest）成功后清空缓存，防止回答基于过时法条。
 """
 from __future__ import annotations
@@ -28,7 +28,7 @@ def _normalize(question: str) -> str:
 
 
 def _key(question: str) -> str:
-    return hashlib.md5(_normalize(question).encode("utf-8")).hexdigest()
+    return hashlib.sha256(_normalize(question).encode("utf-8")).hexdigest()
 
 
 def _init_db() -> None:
