@@ -92,6 +92,30 @@ function runStream(
   return () => abort.abort()
 }
 
+export async function summarizeSession(sessionId: string, messages: SessionMessage[]): Promise<string> {
+  const data = await fetchJson<{ title: string }>(`/sessions/${sessionId}/summarize`, {
+    method: 'POST',
+    body: JSON.stringify({ messages }),
+  })
+  return data.title
+}
+
+export async function uploadDocument(file: File): Promise<string> {
+  const formData = new FormData()
+  formData.append('file', file)
+  const resp = await fetch(`${BASE}/chat/upload`, {
+    method: 'POST',
+    credentials: 'include',
+    body: formData,
+  })
+  if (!resp.ok) {
+    const text = await resp.text()
+    throw new Error(`HTTP ${resp.status}: ${text}`)
+  }
+  const data = (await resp.json()) as { text: string }
+  return data.text
+}
+
 export function streamChat(
   sessionId: string,
   question: string,
@@ -100,11 +124,13 @@ export function streamChat(
   onEvent: (event: StreamEvent) => void,
   onDone: () => void,
   onError: (err: Error) => void,
+  documentText?: string,
 ): () => void {
   const payload = {
     question,
     session_id: sessionId,
     title,
+    document_text: documentText,
     history: history.map((m) => ({
       role: m.role,
       content: m.content,

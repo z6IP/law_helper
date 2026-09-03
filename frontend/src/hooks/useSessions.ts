@@ -126,13 +126,20 @@ export function useSessions() {
   }, [])
 
   const createSession = useCallback(() => {
+    // 已有空会话时直接复用，避免堆积多个未使用的"新对话"
+    const emptySession = sessions.find((s) => s.messages.length === 0)
+    if (emptySession) {
+      setCurrentId(emptySession.id)
+      setHashId(null)
+      return emptySession.id
+    }
     const ns = newSession()
     setSessions((prev) => [ns, ...prev])
     setCurrentId(ns.id)
     // 主页/新建对话时 URL 保持干净，不带 hash
     setHashId(null)
     return ns.id
-  }, [])
+  }, [sessions])
 
   const removeSession = useCallback(
     async (id: string) => {

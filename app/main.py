@@ -7,7 +7,7 @@ import threading
 import uuid
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi_throttle import RateLimiter
@@ -15,7 +15,9 @@ from starsessions import CookieStore, SessionAutoloadMiddleware, SessionMiddlewa
 
 from app import answer_cache, ingestion, jobs, session_store
 from app.config import get_settings
+from app.document_parser import parse_document
 from app.errors import LawHelperError
+from app.llm import get_llm
 from app.qa import answer
 from app.tracing import event, finish_trace, query_traces, span, start_trace
 from app.schemas import (
@@ -26,6 +28,8 @@ from app.schemas import (
     RunningJobsResponse,
     SessionData,
     SessionSaveRequest,
+    SummarizeTitleRequest,
+    SummarizeTitleResponse,
     TracesResponse,
 )
 
@@ -217,6 +221,13 @@ def _register_session_id(req: Request, session_id: str) -> None:
     req.session["session_ids"] = list(allowed)
 
 
+def _effective_question(question: str, document_text: str | None) -> str:
+    """当用户只上传文件未输入问题时，使用默认提示词，避免 LLM 无问题可答。"""
+    if not question.strip() and document_text:
+        return "请结合上传的材料进行回答"
+    return question
+
+
 # 按浏览器会话限流：每个浏览器会话在 60 秒内最多请求 10 次聊天接口
 chat_limiter = RateLimiter(times=10, seconds=60, key_func=_browser_session_key)
 
@@ -250,16 +261,113 @@ def _ensure_preload_ready() -> None:
         )
 
 
+def _user_input_title(content: str, max_length: int = 18) -> str:
+    """极短或无法回答的输入，生成固定格式标题：用户输入了<内容>。"""
+    prefix = "用户输入了"
+    limit = max_length - len(prefix)
+    return f"{prefix}{content.strip()[:max(1, limit)]}"
+
+
+@app.post(
+    "/api/v1/sessions/{session_id}/summarize",
+    response_model=SummarizeTitleResponse,
+    dependencies=[Depends(_ensure_preload_ready)],
+)
+def _summarize_title_from_messages(messages: list[dict]) -> str:
+    """根据会话消息生成总结性标题。"""
+    # 只有一条用户消息且内容为空、只带了文件时，按文件类型生成固定描述
+    if len(messages) == 1:
+        msg = messages[0]
+        if msg.get("role") == "user":
+            content = (msg.get("content") or "").strip()
+            file_names = msg.get("fileNames") or msg.get("file_names") or []
+            if not content and file_names:
+                image_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+                image_count = sum(1 for f in file_names if str(f).lower().endswith(tuple(image_exts)))
+                file_count = len(file_names)
+                if image_count == file_count:
+                    return f"用户发了{file_count}张图片"
+                return f"用户发了{file_count}份文件"
+    # 若第一条用户消息极短，直接固定格式概括，避免 LLM 根据助手回复过度发挥
+    first_user = next((m for m in messages if m.get("role") == "user"), None)
+    if first_user:
+        content = (first_user.get("content") or "").strip()
+        if content and len(content) <= 2:
+            return _user_input_title(content)
+    # 否则使用 LLM 总结对话内容
+    turns: list[str] = []
+    first_user_text = ""
+    for m in messages:
+        role = m.get("role")
+        content = (m.get("content") or "").strip()
+        file_names = m.get("fileNames") or m.get("file_names") or []
+        if role == "user":
+            prefix = "用户"
+            if not first_user_text and content:
+                first_user_text = content
+        elif role == "assistant":
+            prefix = "助手"
+        else:
+            continue
+        if file_names:
+            content = (content + " " if content else "") + f"[附件：{', '.join(file_names)}]"
+        if content:
+            turns.append(f"{prefix}：{content}")
+    # 若 LLM 无法总结，使用第一条用户内容兜底，避免标题为「新对话」
+    fallback_title = _user_input_title(first_user_text) if first_user_text else "新对话"
+    prompt = "请根据以下对话内容，用不超过 10 个字生成一个会话标题。只输出标题，不要解释。\n\n" + "\n".join(turns)
+    system = "你是摘要助手，请用不超过 10 个字总结对话内容作为标题，不要加引号或解释。"
+    return get_llm().chat(system, prompt).strip()[:18] or fallback_title
+
+
+def summarize_session(session_id: str, req: SummarizeTitleRequest, request: Request):
+    """根据会话消息生成总结性标题并持久化。"""
+    _ensure_session_access(request, session_id)
+    messages = req.messages or []
+    title = _summarize_title_from_messages(messages)
+    # 将总结后的标题持久化，刷新页面后仍能保持最新标题
+    try:
+        session_store.save(session_id, title, messages)
+    except Exception:  # noqa: BLE001
+        pass
+    return SummarizeTitleResponse(title=title)
+
+
+# 上传文件解析：限制大小与类型，与前端保持一致
+_MAX_UPLOAD_SIZE = 5 * 1024 * 1024  # 5MB
+_ALLOWED_UPLOAD_EXTS = {".docx", ".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+
+
+@app.post("/api/v1/chat/upload", dependencies=[Depends(chat_limiter)])
+def chat_upload(file: UploadFile = File(...)):
+    """上传并解析文件，返回提取的文本内容（仅作为一次性上下文）。"""
+    try:
+        suffix = Path(file.filename or "unknown").suffix.lower()
+        if suffix not in _ALLOWED_UPLOAD_EXTS:
+            raise HTTPException(status_code=415, detail=f"不支持的文件类型：{suffix}")
+        # 只读取到限制大小 + 1 字节，超限立即拒绝，避免大文件占用内存
+        content = file.file.read(_MAX_UPLOAD_SIZE + 1)
+        if len(content) > _MAX_UPLOAD_SIZE:
+            raise HTTPException(status_code=413, detail="文件大小超过 5MB 限制")
+        text = parse_document(content, file.filename or "unknown")
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"text": text}
+
+
 @app.post("/api/v1/chat", response_model=ChatResponse, dependencies=[Depends(_ensure_preload_ready), Depends(chat_limiter)])
 def chat(req: ChatRequest, request: Request):
     _ensure_session_access(request, req.session_id)
+    question = _effective_question(req.question, req.document_text)
     # 单轮无历史时尝试命中答案缓存，跳过检索→重排→生成
     if not req.history:
-        cached = answer_cache.get(req.question)
+        cached = answer_cache.get(question)
         if cached:
             start_trace(
                 kind="chat",
-                question=req.question,
+                question=question,
                 session_id=req.session_id,
                 cache_hit=True,
             )
@@ -267,11 +375,11 @@ def chat(req: ChatRequest, request: Request):
             finish_trace()
             return ChatResponse(answer=cached["answer"], references=references)
 
-    start_trace(kind="chat", question=req.question, session_id=req.session_id)
-    text, references = answer(req.question, req.history)
+    start_trace(kind="chat", question=question, session_id=req.session_id)
+    text, references = answer(question, req.history, req.document_text)
     # 仅缓存有明确法条引用的回答（拒答/无关问题不缓存）
     if not req.history and references:
-        answer_cache.put(req.question, text, [r.model_dump() for r in references])
+        answer_cache.put(question, text, [r.model_dump() for r in references])
     finish_trace()
     return ChatResponse(answer=text, references=references)
 
@@ -284,11 +392,12 @@ def chat_stream(req: ChatRequest, request: Request):
     完成后自动写入会话存储。
     """
     _ensure_session_access(request, req.session_id)
+    question = _effective_question(req.question, req.document_text)
     if not req.session_id:
         raise HTTPException(status_code=400, detail="缺少会话 ID")
-    title = req.title or (req.question.strip()[:18] or "新对话")
+    title = req.title or (question.strip()[:18] or "新对话")
     try:
-        jobs.submit_chat_job(req.session_id, req.question, req.history, title)
+        jobs.submit_chat_job(req.session_id, question, req.history, title, req.document_text)
     except jobs.JobConflictError as exc:
         raise HTTPException(status_code=409, detail=exc.message)
 

@@ -14,8 +14,16 @@ class _BaseSchema(BaseModel):
     )
 
 
+class SummarizeTitleRequest(_BaseSchema):
+    messages: list[dict] = Field(..., description="会话消息列表")
+
+
+class SummarizeTitleResponse(_BaseSchema):
+    title: str = Field(..., min_length=1, description="总结后的会话标题")
+
+
 class ChatRequest(_BaseSchema):
-    question: str = Field(..., min_length=1, description="用户提问")
+    question: str = Field(..., description="用户提问")
     session_id: str | None = Field(
         None,
         description="当前会话 ID，用于权限校验与按会话限流",
@@ -29,6 +37,10 @@ class ChatRequest(_BaseSchema):
         None,
         max_length=200,
         description="会话标题；后端后台落库时使用（缺省时按问题前 18 字生成）",
+    )
+    document_text: str | None = Field(
+        None,
+        description="用户上传文件解析后的文本，仅作为本次问答的一次性上下文",
     )
 
 
@@ -63,7 +75,7 @@ class IngestResponse(_BaseSchema):
 
 class SessionMessage(_BaseSchema):
     role: Literal["user", "assistant"] = Field(..., description="消息角色：user / assistant")
-    content: str = Field(..., min_length=1, description="消息文本")
+    content: str = Field(..., description="消息文本；允许空字符串，以支持仅上传文件的消息")
     references: list[Reference] = Field(default_factory=list, description="引用法条")
     reasoning: str | None = Field(None, description="思考过程文本")
 

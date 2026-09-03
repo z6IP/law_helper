@@ -12,6 +12,7 @@ from app.retrieval import get_retrieval_engine
 from app.rerank import get_reranker
 from app.schemas import Reference
 from app.tracing import event, span
+from app.upload_retrieval import select_relevant_chunks
 
 SYSTEM_PROMPT = (
     "你是「小Z」，一名熟悉道路交通安全相关法律法规（包括《中华人民共和国道路交通安全法》"
@@ -194,8 +195,18 @@ def _history_prompt(question: str, history: list[dict]) -> str:
     return "对话历史：\n" + "\n".join(turns) + f"\n\n用户的问题：{question}\n\n回答："
 
 
-def _build_user_prompt(question: str, contexts: list[dict]) -> str:
+def _build_user_prompt(
+    question: str,
+    contexts: list[dict],
+    document_text: str | None = None,
+    document_chunks: list[str] | None = None,
+) -> str:
     blocks = []
+    if document_chunks is not None:
+        for idx, chunk in enumerate(document_chunks, 1):
+            blocks.append(f"【用户上传材料·片段{idx}】\n{chunk}")
+    elif document_text:
+        blocks.append(f"用户上传的材料内容如下：\n{document_text}")
     for c in contexts:
         meta = c.get("metadata", {})
         source = meta.get("source", "")
@@ -208,11 +219,12 @@ def _build_user_prompt(question: str, contexts: list[dict]) -> str:
         f"以下是系统根据用户问题检索到的相关法律法规条文原文：\n\n"
         f"{context_text}\n\n"
         f"用户问题：{question}\n\n"
-        f"请严格依据上述检索到的法条原文回答，回答中不要提及法条的来源（不要说「用户提供」「你提供」等）。"
+        f"请严格依据上述检索到的法条原文，结合用户上传的材料回答，"
+        f"回答中不要提及法条的来源（不要说「用户提供」「你提供」等）。"
     )
 
 
-def answer(question: str, history: list[dict] | None = None) -> tuple[str, list[Reference]]:
+def answer(question: str, history: list[dict] | None = None, document_text: str | None = None) -> tuple[str, list[Reference]]:
     settings = get_settings()
     history = history or []
 
@@ -224,7 +236,8 @@ def answer(question: str, history: list[dict] | None = None) -> tuple[str, list[
         resolved, rewrite_ok = _resolve_context(question, history)
 
     # 无意义输入（单字 / 纯数字 / 问候 / 短词无法律关键词）：不进入检索，直接拒答
-    if rewrite_ok and _is_trivial_query(resolved):
+    # 若有上传文件内容，则跳过 trivial 拦截，允许对短问题结合材料作答
+    if rewrite_ok and _is_trivial_query(resolved) and not document_text:
         event("trivial_reject", question=question)
         user_prompt = _OFF_TOPIC_PROMPT_TEMPLATE.format(question=question)
         llm_text = get_llm().chat(SYSTEM_PROMPT, user_prompt)
@@ -235,6 +248,12 @@ def answer(question: str, history: list[dict] | None = None) -> tuple[str, list[
         event("conversation_meta", question=resolved)
         llm_text = get_llm().chat(_META_ANSWER_SYSTEM, _history_prompt(question, history))
         return llm_text, []
+
+    # 材料检索：长材料切块取 top3，短材料返回 None 以全文注入
+    document_chunks: list[str] | None = None
+    if document_text:
+        with span("upload_retrieval.select"):
+            document_chunks = select_relevant_chunks(resolved, document_text)
 
     engine = get_retrieval_engine()
     reranker = get_reranker()
@@ -255,11 +274,14 @@ def answer(question: str, history: list[dict] | None = None) -> tuple[str, list[
     # 无相关法条：不附带任何引用，由 LLM 简短拒答
     if not contexts:
         event("no_contexts")
-        user_prompt = _OFF_TOPIC_PROMPT_TEMPLATE.format(question=question)
+        if document_text:
+            user_prompt = _build_user_prompt(resolved, [], document_text, document_chunks)
+        else:
+            user_prompt = _OFF_TOPIC_PROMPT_TEMPLATE.format(question=question)
         llm_text = get_llm().chat(SYSTEM_PROMPT, user_prompt)
         return llm_text, []
 
-    user_prompt = _build_user_prompt(resolved, contexts)
+    user_prompt = _build_user_prompt(resolved, contexts, document_text, document_chunks)
     with span("llm_generate"):
         llm_text = get_llm().chat(SYSTEM_PROMPT, user_prompt)
 
@@ -275,7 +297,7 @@ def answer(question: str, history: list[dict] | None = None) -> tuple[str, list[
     return llm_text, references
 
 
-def answer_stream(question: str, history: list[dict] | None = None):
+def answer_stream(question: str, history: list[dict] | None = None, document_text: str | None = None):
     """流式问答：先产出引用法条事件，再逐段产出回答文本增量。
 
     每个产出为 dict：
@@ -293,7 +315,8 @@ def answer_stream(question: str, history: list[dict] | None = None):
 
     # 无意义输入（无历史时的单字 / 纯数字 / 问候 / 短词无法律关键词）：
     # 不发预热思考，直接走拒答分支，前端不会出现思考区域
-    if not history and _is_trivial_query(question):
+    # 若有上传文件内容，跳过 trivial 拦截，允许结合材料作答
+    if not history and _is_trivial_query(question) and not document_text:
         event("trivial_reject", question=question)
         yield {"type": "references", "references": []}
         user_prompt = _OFF_TOPIC_PROMPT_TEMPLATE.format(question=question)
@@ -316,7 +339,7 @@ def answer_stream(question: str, history: list[dict] | None = None):
         yield {"type": "progress", "content": "正在结合上下文理解问题..."}
         with span("query_rewrite"):
             resolved, rewrite_ok = _resolve_context(question, history)
-        if rewrite_ok and _is_trivial_query(resolved):
+        if rewrite_ok and _is_trivial_query(resolved) and not document_text:
             event("trivial_reject", resolved=resolved)
             yield {"type": "references", "references": []}
             user_prompt = _OFF_TOPIC_PROMPT_TEMPLATE.format(question=question)
@@ -338,7 +361,14 @@ def answer_stream(question: str, history: list[dict] | None = None):
                 yield {"type": "delta", "content": text}
         return
 
-    # Step 1: 检索
+    # Step 1: 材料检索（长材料切块取 top3，短材料返回 None 以全文注入）
+    document_chunks: list[str] | None = None
+    if document_text:
+        yield {"type": "progress", "content": "正在定位材料相关内容..."}
+        with span("upload_retrieval.select"):
+            document_chunks = select_relevant_chunks(resolved, document_text)
+
+    # Step 2: 法条检索
     yield {"type": "progress", "content": "正在检索相关法条..."}
     engine = get_retrieval_engine()
     retrieval_q = expand_query(resolved)
@@ -370,7 +400,10 @@ def answer_stream(question: str, history: list[dict] | None = None):
 
     if not contexts:
         event("no_contexts")
-        user_prompt = _OFF_TOPIC_PROMPT_TEMPLATE.format(question=question)
+        if document_text:
+            user_prompt = _build_user_prompt(resolved, [], document_text, document_chunks)
+        else:
+            user_prompt = _OFF_TOPIC_PROMPT_TEMPLATE.format(question=question)
         for kind, text in get_llm().chat_stream(SYSTEM_PROMPT, user_prompt):
             if kind == "reasoning":
                 yield {"type": "reasoning", "content": text}
@@ -380,7 +413,7 @@ def answer_stream(question: str, history: list[dict] | None = None):
 
     # Step 3: LLM 生成（使用改写后的独立问题，与 LangChain rephrase_question=True 一致）
     yield {"type": "progress", "content": "正在思考回答..."}
-    user_prompt = _build_user_prompt(resolved, contexts)
+    user_prompt = _build_user_prompt(resolved, contexts, document_text, document_chunks)
     with span("llm_generate"):
         for kind, text in get_llm().chat_stream(SYSTEM_PROMPT, user_prompt):
             if kind == "reasoning":

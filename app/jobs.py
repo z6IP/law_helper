@@ -28,11 +28,12 @@ class JobConflictError(LawHelperError):
 class Job:
     """单次后台问答任务，按 session_id 唯一。"""
 
-    def __init__(self, session_id: str, question: str, history: list[dict], title: str):
+    def __init__(self, session_id: str, question: str, history: list[dict], title: str, document_text: str | None = None):
         self.session_id = session_id
         self.question = question
         self.history = history
         self.title = title
+        self.document_text = document_text
 
         self.status = "running"  # running / done / error
         self.error: str | None = None
@@ -71,7 +72,7 @@ class Job:
             self._cond.notify_all()
 
     def _run(self) -> None:
-        cached = answer_cache.get(self.question) if not self.history else None
+        cached = answer_cache.get(self.question) if not self.history and not self.document_text else None
         start_trace(
             kind="chat_stream",
             question=self.question,
@@ -85,7 +86,7 @@ class Job:
                 self.append_event({"type": "references", "references": self.references})
                 self.append_event({"type": "delta", "content": self.answer_text})
             else:
-                for payload in answer_stream(self.question, self.history):
+                for payload in answer_stream(self.question, self.history, self.document_text):
                     self.append_event(payload)
                     t = payload.get("type")
                     if t == "references":
@@ -96,7 +97,7 @@ class Job:
                         self.answer_text += payload.get("content") or ""
 
             # 答案缓存仅对「无历史的单轮问题且带引用」启用（与同步 /chat 一致）
-            if not self.history and self.references:
+            if not self.history and self.references and not self.document_text:
                 answer_cache.put(self.question, self.answer_text, self.references)
 
             self.answer_text = self.answer_text or "（未生成有效回答）"
@@ -135,13 +136,13 @@ _JOBS: dict[str, Job] = {}
 _JOBS_LOCK = threading.Lock()
 
 
-def submit_chat_job(session_id: str, question: str, history: list[dict], title: str) -> Job:
+def submit_chat_job(session_id: str, question: str, history: list[dict], title: str, document_text: str | None = None) -> Job:
     """创建并启动一个后台问答任务；同会话已有任务在跑时抛出 JobConflictError。"""
     with _JOBS_LOCK:
         existing = _JOBS.get(session_id)
         if existing is not None and existing.status == "running":
             raise JobConflictError()
-        job = Job(session_id, question, history, title)
+        job = Job(session_id, question, history, title, document_text)
         _JOBS[session_id] = job
 
     _persist(job, with_answer=False)  # 立即落盘标题 + 用户消息

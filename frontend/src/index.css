@@ -420,9 +420,10 @@ body {
 
 .input-area {
   flex-shrink: 0;
-  height: 100px;
+  height: auto;
+  min-height: 100px;
   padding: 0;
-  overflow: hidden;
+  overflow: visible;
   background: var(--bg);
 }
 
@@ -647,7 +648,7 @@ body {
 
 /* ===== 输入框 ===== */
 .chat-input-bar {
-  height: 100%;
+  height: auto;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -657,10 +658,11 @@ body {
 
 .chat-input-wrap {
   display: flex;
-  align-items: flex-end;
-  gap: 8px;
-  width: 700px;
-  height: 100%;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+  width: 100%;
+  max-width: 800px;
   min-width: 0;
   margin: 0 auto;
   padding: 8px 12px;
@@ -688,8 +690,152 @@ body {
   color: var(--text);
 }
 
+.chat-input-row {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  width: 100%;
+  height: 84px;
+  min-width: 0;
+}
+
+.chat-input-row .attach-btn,
+.chat-input-row .send-btn {
+  align-self: flex-end;
+  flex-shrink: 0;
+}
+
 .chat-input-wrap textarea::placeholder {
   color: var(--text-muted);
+}
+
+.attach-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.attach-btn:hover {
+  background: var(--hover-bg);
+  color: var(--text);
+}
+
+.attach-btn:disabled {
+  color: var(--button-disabled);
+  cursor: not-allowed;
+}
+
+.file-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  width: 100%;
+  margin: 0 0 8px 0;
+}
+
+.file-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 13px;
+  position: relative;
+  overflow: hidden;
+}
+
+.file-chip.image-chip {
+  width: 64px;
+  height: 64px;
+  padding: 0;
+  border-radius: 8px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+}
+
+.file-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-thumb {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 8px;
+}
+
+.file-remove-btn {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.45);
+  color: #ffffff;
+  cursor: pointer;
+  padding: 0;
+  z-index: 1;
+}
+
+.file-remove-btn:hover {
+  background: rgba(0, 0, 0, 0.65);
+  color: #ffffff;
+}
+
+.file-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.file-attachment-box {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 13px;
+  word-break: break-all;
+}
+
+.file-attachment-box.image {
+  border-color: var(--accent);
+  background: var(--accent-bg, var(--bg-tertiary));
+}
+
+.file-attachment-box.file {
+  border-color: var(--border-strong);
+  background: var(--bg-tertiary);
+}
+
+.file-attachment-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 220px;
 }
 
 .send-btn {
@@ -901,4 +1047,60 @@ body {
   to {
     opacity: 1;
   }
+}
+
+/* ===== 全局文件拖拽上传遮罩 ===== */
+.drag-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  animation: drag-overlay-fade-in 0.2s ease;
+  pointer-events: all;
+}
+
+@keyframes drag-overlay-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.drag-overlay-card {
+  padding: 48px 64px;
+  border-radius: 16px;
+  background: var(--bg);
+  border: 2px dashed var(--border-strong);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.2);
+  text-align: center;
+  animation: drag-overlay-card-scale 0.2s ease;
+}
+
+@keyframes drag-overlay-card-scale {
+  from {
+    transform: scale(0.95);
+  }
+  to {
+    transform: scale(1);
+  }
+}
+
+.drag-overlay-title {
+  margin: 0 0 8px;
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.drag-overlay-subtitle {
+  margin: 0;
+  font-size: 14px;
+  color: var(--text-muted);
 }

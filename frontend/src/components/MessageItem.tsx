@@ -1,13 +1,33 @@
 import { useMemo, useState } from 'react'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
-import { ChevronDown } from 'lucide-react'
+import { ChevronDown, FileText, Image } from 'lucide-react'
 import { References } from './References'
 import type { SessionMessage } from '../types'
 
 function renderMarkdown(src: string): string {
   const raw = marked.parse(src, { async: false }) as string
   return DOMPurify.sanitize(raw)
+}
+
+const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif'])
+
+function getFileExt(name: string): string {
+  const idx = name.lastIndexOf('.')
+  return idx === -1 ? '' : name.slice(idx).toLowerCase()
+}
+
+function FileAttachment({ name }: { name: string }) {
+  const ext = getFileExt(name)
+  const isImage = IMAGE_EXTS.has(ext)
+  return (
+    <div className={`file-attachment-box ${isImage ? 'image' : 'file'}`}>
+      {isImage ? <Image size={18} /> : <FileText size={18} />}
+      <span className="file-attachment-name" title={name}>
+        {name}
+      </span>
+    </div>
+  )
 }
 
 interface MessageItemProps {
@@ -28,7 +48,16 @@ export function MessageItem({ message, isCurrentLoading, thinkingLabel }: Messag
   if (isUser) {
     return (
       <div className="message message-user">
-        <div className="message-user-bubble">{message.content}</div>
+        <div className="message-user-bubble">
+          {message.content}
+          {message.fileNames && message.fileNames.length > 0 && (
+            <div className="file-attachments">
+              {message.fileNames.map((name, index) => (
+                <FileAttachment key={`${name}-${index}`} name={name} />
+              ))}
+            </div>
+          )}
+        </div>
       </div>
     )
   }

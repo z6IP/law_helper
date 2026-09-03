@@ -10,6 +10,7 @@ export interface SessionMessage {
   content: string
   references?: Reference[]
   reasoning?: string | null
+  fileNames?: string[]
 }
 
 export interface Session {
