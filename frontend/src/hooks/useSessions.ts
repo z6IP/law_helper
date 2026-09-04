@@ -200,6 +200,21 @@ export function useSessions() {
     [],
   )
 
+  const updateMessageAt = useCallback(
+    (sessionId: string, index: number, updater: (msg: SessionMessage) => SessionMessage) => {
+      setSessions((prev) =>
+        prev.map((s) => {
+          if (s.id !== sessionId || s.messages.length === 0) return s
+          if (index < 0 || index >= s.messages.length) return s
+          const msgs = [...s.messages]
+          msgs[index] = updater(msgs[index])
+          return { ...s, messages: msgs }
+        }),
+      )
+    },
+    [],
+  )
+
   const updateSessionTitle = useCallback((sessionId: string, title: string) => {
     setSessions((prev) =>
       prev.map((s) => (s.id === sessionId ? { ...s, title } : s)),
@@ -217,6 +232,7 @@ export function useSessions() {
     removeSession,
     appendMessages,
     updateLastMessage,
+    updateMessageAt,
     updateSessionTitle,
   }
 }

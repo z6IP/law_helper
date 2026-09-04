@@ -6,7 +6,7 @@ import { ChatInput } from './components/ChatInput'
 import { ThemeToggle } from './components/ThemeToggle'
 import { useSessions } from './hooks/useSessions'
 import * as api from './api'
-import type { Reference } from './types'
+import type { Attachment, Reference } from './types'
 
 const SIDEBAR_KEY = 'sidebarVisible'
 // 输入框最大宽度 800px + 侧边栏宽度 260px，低于此宽度主内容会被挤压
@@ -30,6 +30,7 @@ function App() {
     removeSession,
     appendMessages,
     updateLastMessage,
+    updateMessageAt,
     updateSessionTitle,
   } = useSessions()
 
@@ -346,9 +347,23 @@ function App() {
         setTimeout(() => setAnimated(false), 500)
       }
 
-      // 1. 立即显示用户消息和助手占位，避免等待文件解析/生成时界面无反馈
+      // 1. 先生成本地预览 attachments，立即显示用户消息
+      const localObjectUrls: string[] = []
+      const localAttachments: Attachment[] = hasFiles
+        ? files.map((file) => {
+            const url = URL.createObjectURL(file)
+            localObjectUrls.push(url)
+            return {
+              name: file.name,
+              url,
+              type: /\.(png|jpg|jpeg|webp|bmp|gif)$/i.test(file.name) ? 'image' : 'document',
+            }
+          })
+        : []
+
+      // 2. 显示用户消息（含本地预览）和助手占位
       await appendMessages(sessionId, [
-        { role: 'user', content: text, fileNames: files?.map((f) => f.name) },
+        { role: 'user', content: text, fileNames: files?.map((f) => f.name), attachments: localAttachments },
       ])
       await appendMessages(sessionId, [
         { role: 'assistant', content: hasFiles ? '文件解析中...' : '', references: [], reasoning: null },
@@ -364,16 +379,29 @@ function App() {
       clearPendingFiles(sessionId)
       clearPendingText(sessionId)
 
-      // 2. 在后台异步解析文件并启动问答，不阻塞界面渲染
+      // 3. 在后台异步上传文件并启动问答
       ;(async () => {
         let documentText: string | undefined
+        let uploadedAttachments: Attachment[] = []
         if (hasFiles) {
           try {
-            const texts = await Promise.all(files.map((file) => api.uploadDocument(file)))
-            documentText = texts.join('\n\n---\n\n')
+            const results = await Promise.all(files.map((file) => api.uploadDocument(file)))
+            documentText = results.map((r) => r.text).join('\n\n---\n\n')
+            uploadedAttachments = results.map((r) => ({
+              name: r.name,
+              url: r.url,
+              type: /\.(png|jpg|jpeg|webp|bmp|gif)$/i.test(r.url) ? 'image' : 'document',
+            }))
             docTextsRef.current.set(sessionId, { anchorIdx: history.length, text: documentText })
+            // 更新用户消息，把本地预览 URL 替换为持久化 URL，并释放本地 blob URL
+            updateMessageAt(sessionId, history.length, (m) => {
+              localObjectUrls.forEach((url) => URL.revokeObjectURL(url))
+              return { ...m, attachments: uploadedAttachments }
+            })
           } catch (err) {
             const message = err instanceof Error ? err.message : '文件上传失败'
+            // 上传失败也要释放本地预览占用的 blob URL
+            localObjectUrls.forEach((url) => URL.revokeObjectURL(url))
             updateLastMessage(sessionId, (m) => ({
               ...m,
               content: `文件解析失败：${message}`,
@@ -395,13 +423,25 @@ function App() {
         setThinkingLabels((prev) => ({ ...prev, [sessionId]: '思考中' }))
 
         runStream(sessionId, (h) =>
-          api.streamChat(sessionId, text, history, sessionTitle, h.onEvent, h.onDone, h.onError, documentText),
+          api.streamChat(
+            sessionId,
+            text,
+            history,
+            sessionTitle,
+            h.onEvent,
+            h.onDone,
+            h.onError,
+            documentText,
+            files?.map((f) => f.name),
+            uploadedAttachments,
+          ),
         )
       })()
     },
     [
       currentSession,
       appendMessages,
+      updateMessageAt,
       updateSessionTitle,
       switchSession,
       runStream,

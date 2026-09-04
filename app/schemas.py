@@ -22,11 +22,17 @@ class SummarizeTitleResponse(_BaseSchema):
     title: str = Field(..., min_length=1, description="总结后的会话标题")
 
 
+class Attachment(_BaseSchema):
+    name: str = Field(..., description="原始文件名")
+    type: Literal["image", "document"] = Field("document", description="附件类型")
+    url: str = Field(..., description="可访问 URL")
+
+
 class ChatRequest(_BaseSchema):
     question: str = Field(..., description="用户提问")
     session_id: str | None = Field(
         None,
-        description="当前会话 ID，用于权限校验与按会话限流",
+        description="当前会话 ID，用于权限校验和按会话限流",
     )
     history: list[dict] = Field(
         default_factory=list,
@@ -41,6 +47,14 @@ class ChatRequest(_BaseSchema):
     document_text: str | None = Field(
         None,
         description="用户上传文件解析后的文本，仅作为本次问答的一次性上下文",
+    )
+    file_names: list[str] | None = Field(
+        default=None,
+        description="当前用户消息携带的附件文件名列表（兼容字段）",
+    )
+    attachments: list[Attachment] | None = Field(
+        default=None,
+        description="当前用户消息携带的附件元信息列表",
     )
 
 
@@ -78,6 +92,8 @@ class SessionMessage(_BaseSchema):
     content: str = Field(..., description="消息文本；允许空字符串，以支持仅上传文件的消息")
     references: list[Reference] = Field(default_factory=list, description="引用法条")
     reasoning: str | None = Field(None, description="思考过程文本")
+    fileNames: list[str] = Field(default_factory=list, description="附件文件名列表（兼容字段）")
+    attachments: list[Attachment] = Field(default_factory=list, description="附件元信息列表")
 
 
 class SessionSaveRequest(_BaseSchema):

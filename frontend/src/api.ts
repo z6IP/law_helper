@@ -1,4 +1,4 @@
-import type { Reference, Session, SessionMessage } from './types'
+import type { Attachment, Reference, Session, SessionMessage } from './types'
 
 const BASE = '/api/v1'
 
@@ -100,7 +100,13 @@ export async function summarizeSession(sessionId: string, messages: SessionMessa
   return data.title
 }
 
-export async function uploadDocument(file: File): Promise<string> {
+export interface UploadResult {
+  text: string
+  url: string
+  name: string
+}
+
+export async function uploadDocument(file: File): Promise<UploadResult> {
   const formData = new FormData()
   formData.append('file', file)
   const resp = await fetch(`${BASE}/chat/upload`, {
@@ -112,8 +118,8 @@ export async function uploadDocument(file: File): Promise<string> {
     const text = await resp.text()
     throw new Error(`HTTP ${resp.status}: ${text}`)
   }
-  const data = (await resp.json()) as { text: string }
-  return data.text
+  const data = (await resp.json()) as UploadResult
+  return data
 }
 
 export function streamChat(
@@ -125,17 +131,23 @@ export function streamChat(
   onDone: () => void,
   onError: (err: Error) => void,
   documentText?: string,
+  fileNames?: string[],
+  attachments?: Attachment[],
 ): () => void {
   const payload = {
     question,
     session_id: sessionId,
     title,
     document_text: documentText,
+    file_names: fileNames,
+    attachments,
     history: history.map((m) => ({
       role: m.role,
       content: m.content,
       references: m.references || [],
       reasoning: m.reasoning ?? null,
+      fileNames: m.fileNames || [],
+      attachments: m.attachments || [],
     })),
   }
   return runStream(

@@ -28,12 +28,23 @@ class JobConflictError(LawHelperError):
 class Job:
     """单次后台问答任务，按 session_id 唯一。"""
 
-    def __init__(self, session_id: str, question: str, history: list[dict], title: str, document_text: str | None = None):
+    def __init__(
+        self,
+        session_id: str,
+        question: str,
+        history: list[dict],
+        title: str,
+        document_text: str | None = None,
+        file_names: list[str] | None = None,
+        attachments: list[dict] | None = None,
+    ):
         self.session_id = session_id
         self.question = question
         self.history = history
         self.title = title
         self.document_text = document_text
+        self.file_names = file_names or []
+        self.attachments = attachments or []
 
         self.status = "running"  # running / done / error
         self.error: str | None = None
@@ -119,7 +130,12 @@ class Job:
 
 def _persist(job: Job, with_answer: bool) -> None:
     """按会话落库；with_answer=False 时仅写入用户消息（生成前），True 时写入完整助手回复。"""
-    messages: list[dict] = list(job.history) + [{"role": "user", "content": job.question}]
+    user_msg: dict = {"role": "user", "content": job.question}
+    if job.file_names:
+        user_msg["fileNames"] = job.file_names
+    if job.attachments:
+        user_msg["attachments"] = job.attachments
+    messages: list[dict] = list(job.history) + [user_msg]
     if with_answer:
         messages.append(
             {
@@ -136,13 +152,21 @@ _JOBS: dict[str, Job] = {}
 _JOBS_LOCK = threading.Lock()
 
 
-def submit_chat_job(session_id: str, question: str, history: list[dict], title: str, document_text: str | None = None) -> Job:
+def submit_chat_job(
+    session_id: str,
+    question: str,
+    history: list[dict],
+    title: str,
+    document_text: str | None = None,
+    file_names: list[str] | None = None,
+    attachments: list[dict] | None = None,
+) -> Job:
     """创建并启动一个后台问答任务；同会话已有任务在跑时抛出 JobConflictError。"""
     with _JOBS_LOCK:
         existing = _JOBS.get(session_id)
         if existing is not None and existing.status == "running":
             raise JobConflictError()
-        job = Job(session_id, question, history, title, document_text)
+        job = Job(session_id, question, history, title, document_text, file_names, attachments)
         _JOBS[session_id] = job
 
     _persist(job, with_answer=False)  # 立即落盘标题 + 用户消息

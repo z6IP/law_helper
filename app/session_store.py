@@ -1,79 +1,47 @@
-"""本地文件会话存储：data/sessions/{id}.json，原子写入 + 线程锁。
+"""会话存储兼容层：底层使用 SQLite（app/session_db.py），删除时级联清理附件。
 
-工程约定：单用户本地工具，无用户隔离与鉴权；
-损坏的会话文件在 list_all 时静默跳过，不影响其他会话。
+工程约定：单用户本地工具，无用户隔离与鉴权。
 """
 from __future__ import annotations
 
-import json
-import os
-import threading
-from datetime import datetime
+from pathlib import Path
 
-from pydantic import ValidationError
-
-from app.config import get_settings
-from app.errors import SessionError
-from app.schemas import SessionData
-
-_LOCK = threading.Lock()
+from app import session_db, upload_store
 
 
-def _session_path(session_id: str) -> str:
-    """会话文件路径；只允许字母数字与连字符，防路径穿越。"""
-    safe = "".join(ch for ch in session_id if ch.isalnum() or ch == "-")
-    if not safe:
-        raise SessionError("非法的会话 ID")
-    settings = get_settings()
-    os.makedirs(settings.sessions_full_dir, exist_ok=True)
-    return str(settings.sessions_full_dir / f"{safe}.json")
+def _ensure_db() -> None:
+    """确保 SQLite 数据库已初始化。"""
+    session_db.init_db()
 
 
 def save(session_id: str, title: str, messages: list[dict]) -> str:
-    """upsert 会话（tmp + os.replace 原子写），返回 updated_at（ISO 时间）。"""
-    path = _session_path(session_id)
-    updated_at = datetime.now().isoformat(timespec="seconds")
-    data = {
-        "id": session_id,
-        "title": title,
-        "updated_at": updated_at,
-        "messages": messages,
-    }
-    with _LOCK:
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-        os.replace(tmp, path)
-    return updated_at
+    """保存/更新会话，返回 updated_at（ISO 时间）。"""
+    _ensure_db()
+    return session_db.save(session_id, title, messages)
 
 
 def list_all() -> list[dict]:
-    """全部会话，按 updated_at 降序；损坏文件静默跳过。"""
-    settings = get_settings()
-    directory = settings.sessions_full_dir
-    if not os.path.isdir(directory):
-        return []
-    out: list[dict] = []
-    with _LOCK:
-        for name in os.listdir(directory):
-            if not name.endswith(".json"):
-                continue
-            path = os.path.join(directory, name)
-            try:
-                with open(path, encoding="utf-8") as f:
-                    data = SessionData.model_validate(json.load(f))
-                out.append(data.model_dump())
-            except (OSError, json.JSONDecodeError, ValidationError):
-                continue
-    out.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
-    return out
+    """全部会话，按 updated_at 降序。"""
+    _ensure_db()
+    return session_db.list_all()
 
 
 def delete(session_id: str) -> bool:
-    """删除会话文件，返回是否存在。"""
-    path = _session_path(session_id)
-    with _LOCK:
-        if os.path.exists(path):
-            os.remove(path)
-            return True
-    return False
+    """删除会话及其附件；返回是否删除成功。"""
+    _ensure_db()
+    ok, stored_names = session_db.delete(session_id)
+    if ok and stored_names:
+        upload_store.delete_attachments(stored_names)
+    return ok
+
+
+def exists(session_id: str) -> bool:
+    """判断会话是否已持久化。"""
+    _ensure_db()
+    return session_db.load(session_id) is not None
+
+
+def migrate_from_json(json_dir: Path | None = None) -> int:
+    """将历史 JSON 文件一次性导入 SQLite，返回导入会话数。"""
+    _ensure_db()
+    return session_db.migrate_from_json(json_dir)

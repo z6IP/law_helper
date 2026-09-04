@@ -5,12 +5,19 @@ export interface Reference {
   text: string
 }
 
+export interface Attachment {
+  name: string
+  type: 'image' | 'document'
+  url: string
+}
+
 export interface SessionMessage {
   role: 'user' | 'assistant'
   content: string
   references?: Reference[]
   reasoning?: string | null
   fileNames?: string[]
+  attachments?: Attachment[]
 }
 
 export interface Session {

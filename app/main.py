@@ -9,11 +9,11 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi_throttle import RateLimiter
 from starsessions import CookieStore, SessionAutoloadMiddleware, SessionMiddleware
 
-from app import answer_cache, ingestion, jobs, session_store
+from app import answer_cache, ingestion, jobs, session_db, session_store
 from app.config import get_settings
 from app.document_parser import parse_document
 from app.errors import LawHelperError
@@ -37,6 +37,7 @@ settings = get_settings()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DASHBOARD_HTML_PATH = BASE_DIR / "dashboard.html"
+UPLOADS_DIR = BASE_DIR / "data" / "uploads"
 
 
 def _local_only(request: Request) -> None:
@@ -174,7 +175,18 @@ def _run_preload() -> None:
 
 @app.on_event("startup")
 async def startup_preload():
-    """启动时在后台线程预加载模型，避免阻塞 HTTP 接口响应。"""
+    """启动时在后台线程预加载模型，避免阻塞 HTTP 接口响应。
+
+    启动前先把历史 JSON 会话文件迁移到 SQLite，保证历史数据不丢失。
+    """
+    try:
+        migrated = session_store.migrate_from_json()
+        if migrated:
+            logger = logging.getLogger(__name__)
+            logger.info("已从 JSON 迁移 %d 条历史会话到 SQLite", migrated)
+    except Exception:  # noqa: BLE001
+        # 迁移失败不应阻塞启动
+        logging.getLogger(__name__).exception("历史会话迁移失败")
     threading.Thread(target=_run_preload, name="backend-preload", daemon=True).start()
 
 
@@ -204,11 +216,10 @@ def _ensure_session_access(req: Request, session_id: str | None) -> None:
     allowed = set(req.session.get("session_ids", []))
     if session_id in allowed:
         return
-    try:
-        path = session_store._session_path(session_id)
-    except Exception:
+    if not session_id or not all(ch.isalnum() or ch == "-" for ch in session_id):
         raise HTTPException(status_code=400, detail="非法的会话 ID")
-    if not os.path.exists(path):
+    # 数据库中不存在该会话视为新会话，自动注册；否则必须已被当前浏览器允许
+    if not session_store.exists(session_id):
         _register_session_id(req, session_id)
         return
     raise HTTPException(status_code=403, detail="无权访问该会话")
@@ -268,11 +279,6 @@ def _user_input_title(content: str, max_length: int = 18) -> str:
     return f"{prefix}{content.strip()[:max(1, limit)]}"
 
 
-@app.post(
-    "/api/v1/sessions/{session_id}/summarize",
-    response_model=SummarizeTitleResponse,
-    dependencies=[Depends(_ensure_preload_ready)],
-)
 def _summarize_title_from_messages(messages: list[dict]) -> str:
     """根据会话消息生成总结性标题。"""
     # 只有一条用户消息且内容为空、只带了文件时，按文件类型生成固定描述
@@ -320,6 +326,11 @@ def _summarize_title_from_messages(messages: list[dict]) -> str:
     return get_llm().chat(system, prompt).strip()[:18] or fallback_title
 
 
+@app.post(
+    "/api/v1/sessions/{session_id}/summarize",
+    response_model=SummarizeTitleResponse,
+    dependencies=[Depends(_ensure_preload_ready)],
+)
 def summarize_session(session_id: str, req: SummarizeTitleRequest, request: Request):
     """根据会话消息生成总结性标题并持久化。"""
     _ensure_session_access(request, session_id)
@@ -336,11 +347,23 @@ def summarize_session(session_id: str, req: SummarizeTitleRequest, request: Requ
 # 上传文件解析：限制大小与类型，与前端保持一致
 _MAX_UPLOAD_SIZE = 5 * 1024 * 1024  # 5MB
 _ALLOWED_UPLOAD_EXTS = {".docx", ".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
+
+
+def _save_upload(content: bytes, filename: str | None) -> tuple[str, str]:
+    """保存上传文件到本地，返回 (url, saved_name)。"""
+    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    suffix = Path(filename or "unknown").suffix.lower()
+    saved_name = f"{uuid.uuid4().hex}{suffix}"
+    dest = UPLOADS_DIR / saved_name
+    with open(dest, "wb") as f:
+        f.write(content)
+    return f"/api/v1/uploads/{saved_name}", saved_name
 
 
 @app.post("/api/v1/chat/upload", dependencies=[Depends(chat_limiter)])
-def chat_upload(file: UploadFile = File(...)):
-    """上传并解析文件，返回提取的文本内容（仅作为一次性上下文）。"""
+def chat_upload(request: Request, file: UploadFile = File(...)):
+    """上传并解析文件，返回提取的文本内容（仅作为一次性上下文）以及文件 URL。"""
     try:
         suffix = Path(file.filename or "unknown").suffix.lower()
         if suffix not in _ALLOWED_UPLOAD_EXTS:
@@ -354,7 +377,32 @@ def chat_upload(file: UploadFile = File(...)):
         raise
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"text": text}
+
+    url, _ = _save_upload(content, file.filename)
+
+    return {"text": text, "url": url, "name": file.filename}
+
+
+@app.get("/api/v1/uploads/{filename}")
+def get_upload(filename: str, request: Request):
+    """获取上传的文件，仅限当前浏览器会话中可访问的会话附件。"""
+    # 会话鉴权：文件必须属于当前浏览器已授权会话的附件
+    allowed = set(request.session.get("session_ids", []))
+    if not session_db.is_attachment_accessible(filename, allowed):
+        raise HTTPException(status_code=403, detail="无权访问该文件")
+
+    # 简单安全校验：防止目录穿越
+    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        dest = (UPLOADS_DIR / filename).resolve()
+        dest.relative_to(UPLOADS_DIR.resolve())
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=403, detail="非法路径") from exc
+
+    if not dest.exists() or not dest.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    return FileResponse(dest)
 
 
 @app.post("/api/v1/chat", response_model=ChatResponse, dependencies=[Depends(_ensure_preload_ready), Depends(chat_limiter)])
@@ -397,7 +445,15 @@ def chat_stream(req: ChatRequest, request: Request):
         raise HTTPException(status_code=400, detail="缺少会话 ID")
     title = req.title or (question.strip()[:18] or "新对话")
     try:
-        jobs.submit_chat_job(req.session_id, question, req.history, title, req.document_text)
+        jobs.submit_chat_job(
+            req.session_id,
+            question,
+            req.history,
+            title,
+            req.document_text,
+            file_names=req.file_names,
+            attachments=[a.model_dump() for a in (req.attachments or [])],
+        )
     except jobs.JobConflictError as exc:
         raise HTTPException(status_code=409, detail=exc.message)
 

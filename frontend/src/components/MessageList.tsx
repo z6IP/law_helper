@@ -33,7 +33,7 @@ export function MessageList({ messages, loading, restoring = false, thinkingLabe
     <div className="message-list">
       {messages.map((msg, idx) => (
         <MessageItem
-          key={idx}
+          key={`msg-${idx}`}
           message={msg}
           isCurrentLoading={loading && idx === messages.length - 1 && msg.role === 'assistant'}
           thinkingLabel={thinkingLabel}

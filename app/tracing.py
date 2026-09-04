@@ -112,9 +112,8 @@ def _emit(record: dict) -> None:
     """追加一行 JSON 到 trace 文件；default=str 兜底 numpy/torch 等非 JSON 类型。"""
     TRACE_FILE.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(record, ensure_ascii=False, default=str)
-    with _LOCK:
-        with open(TRACE_FILE, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+    with _LOCK, open(TRACE_FILE, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
 
 
 def _add_tokens(trace_id: str, prompt: int | None, completion: int | None, total: int | None) -> None:
