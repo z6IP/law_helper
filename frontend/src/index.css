@@ -22,6 +22,7 @@
 }
 
 [data-theme='dark'] {
+  color-scheme: dark;
   --bg: #1a1a1a;
   --bg-secondary: #242424;
   --bg-tertiary: #2a2a2a;
@@ -57,7 +58,7 @@ body {
 
 /* ===== 主题切换动效 =====
    优先使用 View Transitions API 实现圆形扩散/收缩（支持时生效），
-   不支持的浏览器降级为全局元素颜色过渡（见下方 .theme-transition） */
+   不支持的浏览器降级为单个圆形 overlay 的 transform 缩放（见下方 .theme-fallback-overlay） */
 
 ::view-transition-old(root),
 ::view-transition-new(root) {
@@ -104,30 +105,57 @@ body {
   }
 }
 
-/* 降级方案：不支持的浏览器走全局元素过渡，覆盖所有使用主题变量的元素 */
-.theme-transition,
-.theme-transition *,
-.theme-transition *::before,
-.theme-transition *::after {
-  transition: background-color 0.25s ease,
-              color 0.25s ease,
-              border-color 0.25s ease,
-              box-shadow 0.25s ease,
-              fill 0.25s ease;
+/* 通用主题切换动画：用 mask 径向渐变挖出透明圆，圆内露出新主题真实页面，
+   圆外保持旧主题色 overlay。圆半径 --reveal-r 由 JS（requestAnimationFrame）
+   驱动插值，不依赖 @property / CSS transition，兼容性好且不捕获位图。 */
+.theme-reveal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 999;
+  pointer-events: none;
+  --reveal-x: 50%;
+  --reveal-y: 50%;
+  --reveal-r: 0px;
+  will-change: mask;
 }
 
-/* 无障碍：用户系统设置减少动效时禁用切换动画 */
+/* 扩散模式（切亮色）：圆内透明露出亮色页面，圆外显示暗色 overlay */
+.theme-reveal-overlay.reveal-expand {
+  -webkit-mask: radial-gradient(
+    circle at var(--reveal-x) var(--reveal-y),
+    transparent 0,
+    transparent var(--reveal-r),
+    #000 calc(var(--reveal-r) + 1px)
+  );
+  mask: radial-gradient(
+    circle at var(--reveal-x) var(--reveal-y),
+    transparent 0,
+    transparent var(--reveal-r),
+    #000 calc(var(--reveal-r) + 1px)
+  );
+}
+
+/* 聚拢模式（切暗色）：圆内显示白色 overlay，圆外透明露出暗色页面 */
+.theme-reveal-overlay.reveal-collapse {
+  -webkit-mask: radial-gradient(
+    circle at var(--reveal-x) var(--reveal-y),
+    #000 0,
+    #000 var(--reveal-r),
+    transparent calc(var(--reveal-r) + 1px)
+  );
+  mask: radial-gradient(
+    circle at var(--reveal-x) var(--reveal-y),
+    #000 0,
+    #000 var(--reveal-r),
+    transparent calc(var(--reveal-r) + 1px)
+  );
+}
+
+/* 无障碍：用户系统设置减少动效时禁用切换动画（JS 侧同时直接瞬时切换） */
 @media (prefers-reduced-motion: reduce) {
   ::view-transition-old(root),
   ::view-transition-new(root) {
     animation: none !important;
-  }
-
-  .theme-transition,
-  .theme-transition *,
-  .theme-transition *::before,
-  .theme-transition *::after {
-    transition: none !important;
   }
 }
 
@@ -482,21 +510,21 @@ body {
 }
 
 .message-user-bubble {
-  max-width: 80%;
+  width: fit-content;
+  max-width: 100%;
   min-width: 40px;
-  width: 100%;
   padding: 8px 14px;
   border-radius: 4px;
   background: var(--bubble-bg);
   color: var(--text);
-  text-align: center;
-  word-break: break-word;
+  text-align: left;
+  overflow-wrap: break-word;
 }
 
 .message-user-content {
   display: flex;
   flex-direction: column;
-  align-items: stretch;
+  align-items: flex-end;
   gap: 8px;
   max-width: 80%;
 }
@@ -691,11 +719,11 @@ body {
 
 /* ===== 输入框 ===== */
 .chat-input-bar {
-  height: auto;
+  min-height: 170px;
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 10px 16px;
+  padding: 10px 0;
   background: transparent;
 }
 
@@ -703,9 +731,10 @@ body {
   display: flex;
   flex-direction: column;
   align-items: stretch;
+  justify-content: flex-start;
   gap: 0;
   width: 100%;
-  max-width: 800px;
+  max-width: 830px;
   min-width: 0;
   margin: 0 auto;
   padding: 8px 12px;
@@ -719,37 +748,60 @@ body {
 }
 
 .chat-input-wrap textarea {
-  flex: 1;
+  flex: 0 0 auto;
   resize: none;
   border: none;
   outline: none;
   background: transparent;
   font-size: 15px;
   line-height: 1.5;
-  height: 100%;
-  max-height: none;
+  min-height: 53px;
+  max-height: 98px;
   font-family: inherit;
   padding: 4px 0;
   color: var(--text);
+  transition: height 0.2s ease;
 }
 
-.chat-input-row {
+.chat-input-actions {
   display: flex;
-  align-items: stretch;
+  align-items: center;
+  justify-content: flex-end;
   gap: 8px;
   width: 100%;
-  height: 84px;
-  min-width: 0;
-}
-
-.chat-input-row .attach-btn,
-.chat-input-row .send-btn {
-  align-self: flex-end;
   flex-shrink: 0;
+  padding-top: 12px;
 }
 
 .chat-input-wrap textarea::placeholder {
   color: var(--text-muted);
+}
+
+/* 输入框 textarea 滚动条：随主题颜色变化，默认透明，hover 显示 */
+.chat-input-wrap textarea {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+
+.chat-input-wrap textarea:hover {
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+.chat-input-wrap textarea::-webkit-scrollbar {
+  width: 6px;
+}
+
+.chat-input-wrap textarea::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.chat-input-wrap textarea::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 3px;
+}
+
+.chat-input-wrap textarea:hover::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
 }
 
 .attach-btn {

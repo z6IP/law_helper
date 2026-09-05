@@ -47,10 +47,8 @@ function App() {
     const saved = localStorage.getItem(SIDEBAR_KEY)
     return saved ? saved === 'true' : false
   })
-  // 初始主题与 index.html 中内联脚本设置保持一致，避免首屏闪烁
-  const [isDark, setIsDark] = useState(() => {
-    return document.documentElement.getAttribute('data-theme') === 'dark'
-  })
+  // 主题状态以 DOM（<html data-theme>）为唯一事实来源，不在 App 中订阅，
+  // 避免切换主题时整棵 React 树重渲染（2K 全屏下卡顿的主因）。
   const [animated, setAnimated] = useState(false)
   const [mounted, setMounted] = useState(false)
   const [openBtnVisible, setOpenBtnVisible] = useState(!sidebarVisible)
@@ -121,60 +119,136 @@ function App() {
     sessionsRef.current = sessions
   }, [sessions])
 
-  const applyTheme = useCallback((dark: boolean, withTransition: boolean) => {
-    const apply = () => {
-      document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light')
-      // 同步覆盖 index.html 内联脚本注入的 body 背景 !important 样式
-      // 否则切换后 body 背景会被锁定为初始主题色，视觉上看不到切换
-      document.body.style.setProperty('background-color', dark ? '#1a1a1a' : '#ffffff', 'important')
-      setIsDark(dark)
-    }
+  // 纯 DOM 主题变更：设置属性 + 同步 body 背景 + 通知 ThemeToggle 更新图标。
+  // 注意：主题状态只允许存在于 DOM 与 ThemeToggle 内，切勿在此触发 App 树 setState。
+  const applyThemeDOM = useCallback((dark: boolean) => {
+    document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light')
+    // 同步覆盖 index.html 内联脚本注入的 body 背景 !important 样式，
+    // 颜色从 CSS 变量 --bg 读取，避免与 index.css 中的主题色重复定义。
+    const bg = getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()
+    document.body.style.setProperty('background-color', bg || (dark ? '#1a1a1a' : '#ffffff'), 'important')
+    window.dispatchEvent(new CustomEvent('theme-change', { detail: { dark } }))
+  }, [])
 
-    if (!withTransition) {
-      apply()
+  // 主题动画连点锁：动画进行中忽略后续切换，避免多个全屏快照/overlay 叠加
+  const themeAnimatingRef = useRef(false)
+
+  const applyTheme = useCallback((dark: boolean, withTransition: boolean) => {
+    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+
+    if (!withTransition || reduceMotion) {
+      applyThemeDOM(dark)
       return
     }
 
-    // 优先使用 View Transitions API + 圆形扩散（从主题按钮位置开始）
-    if (document.startViewTransition) {
+    if (themeAnimatingRef.current) return
+    themeAnimatingRef.current = true
+    const unlock = () => {
+      themeAnimatingRef.current = false
+    }
+
+    const btn = document.querySelector('.theme-toggle') as HTMLElement | null
+    let x = window.innerWidth - 40
+    let y = 40
+    if (btn) {
+      const rect = btn.getBoundingClientRect()
+      x = rect.left + rect.width / 2
+      y = rect.top + rect.height / 2
+    }
+    const endRadius =
+      Math.hypot(
+        Math.max(x, window.innerWidth - x),
+        Math.max(y, window.innerHeight - y)
+      ) + 2
+
+    // View Transitions API 需捕获两张全屏位图快照，开销与视口面积×devicePixelRatio 成正比。
+    // 2560×1440 及以上/高分屏缩放（等效物理像素≈4K）下，捕获阶段可阻塞 50–80ms，
+    // 表现为点击后明显延迟才开始动画。因此高分辨率下跳过 VT，统一走 overlay 方案。
+    const physicalWidth = window.innerWidth * window.devicePixelRatio
+    const supportsVT = typeof (document as Document & { startViewTransition?: unknown }).startViewTransition === 'function'
+    const useVT = supportsVT && physicalWidth <= 2000
+
+    if (useVT) {
       // 标记切换方向：dark=true（亮→暗）走收缩动画，dark=false（暗→亮）走扩散动画
       if (dark) {
         document.documentElement.classList.add('theme-collapsing')
       } else {
         document.documentElement.classList.remove('theme-collapsing')
       }
-      const btn = document.querySelector('.theme-toggle') as HTMLElement | null
-      if (btn) {
-        const rect = btn.getBoundingClientRect()
-        const x = rect.left + rect.width / 2
-        const y = rect.top + rect.height / 2
-        const endRadius = Math.hypot(
-          Math.max(x, window.innerWidth - x),
-          Math.max(y, window.innerHeight - y)
-        )
-        document.documentElement.style.setProperty('--vt-x', `${x}px`)
-        document.documentElement.style.setProperty('--vt-y', `${y}px`)
-        document.documentElement.style.setProperty('--vt-r', `${endRadius}px`)
-      }
-      document.startViewTransition(apply)
+      document.documentElement.style.setProperty('--vt-x', `${x}px`)
+      document.documentElement.style.setProperty('--vt-y', `${y}px`)
+      document.documentElement.style.setProperty('--vt-r', `${endRadius}px`)
+      // 回调内只做最轻量的 DOM 变更，快照捕获不被 React 渲染阻塞
+      const transition = document.startViewTransition(() => {
+        applyThemeDOM(dark)
+      })
+      transition.finished.then(unlock, unlock)
       return
     }
 
-    // 降级：全局元素过渡（覆盖所有使用主题变量的元素）
-    document.documentElement.classList.add('theme-transition')
-    apply()
-    setTimeout(() => {
-      document.documentElement.classList.remove('theme-transition')
-    }, 260)
-  }, [])
+    // 通用方案（高分辨率优先 / 无 VT 浏览器降级）：用 mask 径向渐变揭露新主题页面。
+    // overlay 为旧主题色全屏层，mask 挖出透明圆——圆内露出新主题真实页面，圆外保持旧主题色。
+    // 圆半径 --reveal-r 由 JS requestAnimationFrame 插值驱动（不依赖 @property / CSS transition），
+    // 兼容性好、不捕获位图，翻转主题在动画开始时执行（被 overlay 遮挡），重绘与动画并行。
+    // - 切亮色（dark=false）：r 从 0→max，亮色页面从按钮位置扩散揭露。
+    // - 切暗色（dark=true）：r 从 max→0，亮色区域向按钮位置聚拢，露出暗色页面。
+    const isExpand = !dark // 亮色=扩散(r:0→max)，暗色=聚拢(r:max→0)
+    const overlay = document.createElement('div')
+    overlay.className = 'theme-reveal-overlay ' + (isExpand ? 'reveal-expand' : 'reveal-collapse')
+    overlay.style.setProperty('--reveal-x', `${x}px`)
+    overlay.style.setProperty('--reveal-y', `${y}px`)
+    overlay.style.setProperty('--reveal-r', isExpand ? '0px' : `${endRadius}px`)
+    // overlay 背景为旧主题色：切暗色时旧=亮(白)，切亮色时旧=暗
+    overlay.style.background = dark ? '#ffffff' : '#1a1a1a'
+    document.body.appendChild(overlay)
 
-  // 初始化主题：index.html 已设置 data-theme，这里仅同步按钮状态并兜底读取 localStorage
+    let done = false
+    const finish = () => {
+      if (done) return
+      done = true
+      overlay.remove()
+      unlock()
+    }
+
+    // 翻转到新主题（此时 overlay 圆外区域仍为旧主题色，翻转不可见）
+    applyThemeDOM(dark)
+
+    // JS 驱动的半径插值动画（ease-out，250ms），不依赖 @property
+    const startR = isExpand ? 0 : endRadius
+    const endR = isExpand ? endRadius : 0
+    const duration = 250
+    const startTime = performance.now()
+    let rafId = 0
+    const step = (now: number) => {
+      if (done) return
+      const progress = Math.min((now - startTime) / duration, 1)
+      const eased = 1 - Math.pow(1 - progress, 3) // ease-out cubic
+      const r = startR + (endR - startR) * eased
+      overlay.style.setProperty('--reveal-r', `${r}px`)
+      if (progress < 1) {
+        rafId = requestAnimationFrame(step)
+      } else {
+        finish()
+      }
+    }
+    rafId = requestAnimationFrame(step)
+
+    // 兜底：动画异常未完成时强制收尾并取消 rAF
+    setTimeout(() => {
+      if (!done) {
+        cancelAnimationFrame(rafId)
+        finish()
+      }
+    }, 320)
+  }, [applyThemeDOM])
+
+  // 初始化主题：index.html 已设置 data-theme，这里兜底读取 localStorage 并统一走 DOM 应用
   useEffect(() => {
     const saved = localStorage.getItem('theme')
     const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches
     const initialDark = saved ? saved === 'dark' : prefersDark
-    setIsDark(initialDark)
-    document.documentElement.setAttribute('data-theme', initialDark ? 'dark' : 'light')
+    applyThemeDOM(initialDark)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // 监听系统主题变化
@@ -191,7 +265,7 @@ function App() {
   }, [applyTheme])
 
   const toggleTheme = useCallback(() => {
-    // 从 DOM 读取当前主题，避免在 setIsDark updater 内嵌套调用 applyTheme（内含 setState）
+    // 从 DOM 读取当前主题（DOM 是主题的唯一事实来源）
     const current = document.documentElement.getAttribute('data-theme') === 'dark'
     const next = !current
     applyTheme(next, true)
@@ -601,7 +675,7 @@ function App() {
             <PanelLeftOpen size={20} />
           </button>
         )}
-        <ThemeToggle isDark={isDark} onToggle={toggleTheme} />
+        <ThemeToggle onToggle={toggleTheme} />
         <div className={`chat-layout ${hasMessages ? 'with-messages' : 'empty'} ${animated ? 'animated' : ''}`}>
           <div className="messages-area">
             <MessageList

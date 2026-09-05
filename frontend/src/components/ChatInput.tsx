@@ -34,6 +34,19 @@ export function ChatInput({
   const isControlled = externalFiles !== undefined
   const files = isControlled ? externalFiles : internalFiles
 
+  // 根据内容自动调整 textarea 高度（不超过 max-height: 100px，超出显示滚动条）
+  const resizeTextarea = () => {
+    const el = textareaRef.current
+    if (!el) return
+    el.style.height = 'auto'
+    el.style.height = `${el.scrollHeight}px`
+  }
+
+  // 内容变化（含受控外部文本，如恢复会话）时重新计算高度
+  useEffect(() => {
+    resizeTextarea()
+  }, [text])
+
   // 图片预览 URL 管理：文件从列表移除时立即释放，组件卸载时释放全部
   useEffect(() => {
     const currentFiles = new Set(files)
@@ -169,22 +182,23 @@ export function ChatInput({
             ))}
           </div>
         )}
-        <div className="chat-input-row">
-          <textarea
-            ref={textareaRef}
-            rows={1}
-            value={text}
-            onChange={(e) => {
+        <textarea
+          ref={textareaRef}
+          rows={2}
+          value={text}
+          onChange={(e) => {
               if (isTextControlled) {
                 onTextChange?.(e.target.value)
               } else {
                 setInternalText(e.target.value)
               }
+              resizeTextarea()
             }}
-            onKeyDown={handleKeyDown}
-            placeholder={placeholder}
-            disabled={disabled}
-          />
+          onKeyDown={handleKeyDown}
+          placeholder={placeholder}
+          disabled={disabled}
+        />
+        <div className="chat-input-actions">
           <button
             type="button"
             className="attach-btn"
