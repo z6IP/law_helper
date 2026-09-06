@@ -27,6 +27,8 @@ cd ..
 echo ""
 echo "===== 4. 设置前端文件权限 ====="
 chmod -R a+rX frontend/dist
+# 重启 nginx 让权限立即生效（避免 403）
+docker compose restart nginx 2>/dev/null || true
 
 echo ""
 echo "===== 5. 重启服务 ====="
