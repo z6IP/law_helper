@@ -59,7 +59,7 @@ class Settings(BaseSettings):
     top_k_retrieve: int = Field(10, ge=1, le=50)
     bm25_weight: float = Field(0.5, ge=0.0, le=1.0)
     rrf_lambda: int = Field(60, ge=1)
-    rerank_top_n: int = Field(3, ge=1, le=10)
+    rerank_top_n: int = Field(4, ge=1, le=10)
     # 重排相关性阈值：低于该分的候选视为不相关并丢弃，
     # 全部丢弃时由 LLM 简短拒答，不引用任何法条
     # 注意：此阈值基于 bge-reranker-v2-m3 标定，切换为 qwen3.7-text-rerank 后
@@ -96,6 +96,18 @@ class Settings(BaseSettings):
     def pdf_full_paths(self) -> list[Path]:
         """statute/ 目录下所有 .pdf 文档（语料数据源，自动纳入新标准）。"""
         return sorted((BASE_DIR / "statute").glob("*.pdf"))
+
+    @property
+    def law_sources(self) -> list[str]:
+        """statute/ 目录下所有 docx/pdf 的干净法规名列表，
+        作为 SYSTEM_PROMPT 中助手可回答的法规清单，避免在提示词中硬编码法规名。
+        复用 ingestion._clean_source_name 保证与向量库 source 字段一致。
+        """
+        # 延迟导入避免 config ↔ ingestion 循环依赖（ingestion 在 module level 导入 config）
+        from app.ingestion import _clean_source_name
+
+        paths = self.docx_full_paths + self.pdf_full_paths
+        return [_clean_source_name(p) for p in paths]
 
     @property
     def chroma_full_dir(self) -> Path:

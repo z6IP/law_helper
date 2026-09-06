@@ -24,7 +24,9 @@ from app.tracing import event, span
 # 章 / 节 / 条 标题识别
 CHAPTER_RE = re.compile(r"^第([零一二三四五六七八九十百千]+)章\s*(.*)$")
 SECTION_RE = re.compile(r"^第([零一二三四五六七八九十百千]+)节\s*(.*)$")
-ARTICLE_RE = re.compile(r"^第([零一二三四五六七八九十百千]+)条")
+# ARTICLE_RE 同时识别「第X条」与「第X条之Y」修正案条款（如刑法第一百二十条之一）
+# group(1): 条号主体，group(2): 之Y 后缀（可空）
+ARTICLE_RE = re.compile(r"^第([零一二三四五六七八九十百千]+)条(之[零一二三四五六七八九十百千]+)?")
 
 COLLECTION_NAME = "road_traffic_law"
 
@@ -131,7 +133,8 @@ def parse_docx(docx_path) -> list[Article]:
         if m_art:
             # 进入正文后终止目录识别
             in_toc = False
-            article_no = f"第{m_art.group(1)}条"
+            # 包含修正案后缀（如「第一百二十条之一」），避免同一条号被识别为多条
+            article_no = f"第{m_art.group(1)}条{m_art.group(2) or ''}"
             state.start_article(article_no)
             # 条号后可能紧跟正文（如「第一条 为了维护...」）
             rest = text[m_art.end():].strip()

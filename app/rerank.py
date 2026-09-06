@@ -48,6 +48,11 @@ class Reranker:
 
         若指定 min_score，则丢弃 rerank 得分低于该阈值的候选；
         当所有候选均不达标时返回空列表，由调用方决定如何回应。
+
+        同 source 限流 + 同 section 去重：让 API 返回全部排序结果，客户端做两层过滤：
+        1. 同 source + 同 section_header 只保留 top1（避免 4.1 与表1 内容重复）；
+        2. 同 source 最多保留 2 条（避免单一法规挤占 top_n 位置），
+        同时保留立法法第五章等多条款场景的覆盖能力。
         """
         if not candidates:
             return []
@@ -56,6 +61,9 @@ class Reranker:
         settings = get_settings()
         documents = [c["text"] for c in candidates]
 
+        # 让 API 返回全部候选的排序结果，便于客户端做同 source 去重
+        # （API 按 document 数计费，不按返回数；返回更多不增加费用）
+        api_top_n = len(documents)
         payload = {
             "model": settings.rerank_model_id,
             "input": {
@@ -63,7 +71,7 @@ class Reranker:
                 "documents": documents,
             },
             "parameters": {
-                "top_n": top_n,
+                "top_n": api_top_n,
                 "instruct": _DEFAULT_INSTRUCT,
             },
         }
@@ -107,12 +115,31 @@ class Reranker:
             )
 
         # results 已按 relevance_score 降序排列
+        # 同 source 限流 + 同 section 去重：
+        # - 同 source + 同 section_header 只保留 top1（避免 4.1 与表1 内容重复）
+        # - 同 source 最多保留 2 条（避免单一法规挤占 top_n 位置）
+        MAX_PER_SOURCE = 2
+        source_counts: dict[str, int] = {}
+        seen_sections: set[tuple[str, str]] = set()
         scored: list[dict] = []
         for r in results:
             idx = r["index"]
             score = float(r["relevance_score"])
-            if min_score is None or score >= min_score:
-                scored.append({**candidates[idx], "rerank_score": score})
+            if min_score is not None and score < min_score:
+                continue
+            meta = candidates[idx].get("metadata", {})
+            source = meta.get("source", "")
+            section = meta.get("section_header", "")
+            section_key = (source, section)
+            # 同 source + 同 section 已有更高分的条款，跳过
+            if section_key in seen_sections:
+                continue
+            # 同 source 已达上限
+            if source_counts.get(source, 0) >= MAX_PER_SOURCE:
+                continue
+            seen_sections.add(section_key)
+            source_counts[source] = source_counts.get(source, 0) + 1
+            scored.append({**candidates[idx], "rerank_score": score})
 
         return scored[:top_n]
 

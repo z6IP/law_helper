@@ -26,6 +26,12 @@ def list_all() -> list[dict]:
     return session_db.list_all()
 
 
+def update_title(session_id: str, title: str) -> bool:
+    """仅更新会话标题，不触碰 messages 和 attachments。"""
+    _ensure_db()
+    return session_db.update_title(session_id, title)
+
+
 def delete(session_id: str) -> bool:
     """删除会话及其附件；返回是否删除成功。"""
     _ensure_db()

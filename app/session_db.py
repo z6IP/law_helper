@@ -163,6 +163,22 @@ def _extract_stored_name(url: str) -> str | None:
     return url or None
 
 
+def update_title(session_id: str, title: str) -> bool:
+    """仅更新会话标题，不触碰 messages 和 attachments。
+
+    避免 summarize_session 中 save 的 DELETE+INSERT 风险：
+    若 load 和 save 之间有并发写入（如 jobs._persist），save 可能用旧 messages 覆盖最新数据。
+    """
+    updated_at = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
+    with _LOCK, _connect() as conn:
+        cur = conn.execute(
+            "UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?",
+            (title, updated_at, session_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
 def list_all() -> list[dict]:
     """返回所有会话（按 updated_at 降序），包含完整消息。"""
     with _LOCK, _connect() as conn:

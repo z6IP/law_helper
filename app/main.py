@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import uuid
 from pathlib import Path
@@ -33,6 +34,7 @@ from app.schemas import (
 )
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DASHBOARD_HTML_PATH = BASE_DIR / "dashboard.html"
@@ -329,7 +331,10 @@ def _summarize_title_from_messages(messages: list[dict]) -> str:
     fallback_title = _user_input_title(first_user_text) if first_user_text else "新对话"
     prompt = "请根据以下对话内容，用不超过 10 个字生成一个会话标题。只输出标题，不要解释。\n\n" + "\n".join(turns)
     system = "你是摘要助手，请用不超过 10 个字总结对话内容作为标题，不要加引号或解释。"
-    return get_llm().chat(system, prompt).strip()[:18] or fallback_title
+    try:
+        return get_llm().chat(system, prompt).strip()[:18] or fallback_title
+    except Exception:  # noqa: BLE001 - LLM 调用失败时用 fallback 兜底，避免标题卡在「新对话」
+        return fallback_title
 
 
 @app.post(
@@ -342,17 +347,12 @@ def summarize_session(session_id: str, req: SummarizeTitleRequest, request: Requ
     _ensure_session_access(request, session_id)
     messages = req.messages or []
     title = _summarize_title_from_messages(messages)
-    # 仅更新标题，从数据库加载现有 messages 回写，避免前端 attachments 状态
-    # （可能还是 blob URL 或尚未同步）覆盖 jobs._persist 已保存的正确附件记录，
-    # 导致刷新后 stored_name 不匹配、图片 403 无法显示。
+    # 仅更新标题，不重新保存 messages，避免 load+save 之间的并发写入风险
+    # （jobs._persist 可能在另一线程同时 save，用旧 messages 覆盖最新数据）
     try:
-        existing = session_store.load(session_id)
-        if existing:
-            session_store.save(session_id, title, existing["messages"])
-        else:
-            session_store.save(session_id, title, messages)
+        session_store.update_title(session_id, title)
     except Exception:  # noqa: BLE001
-        pass
+        logger.exception("summarize_session 更新标题失败: session_id=%s", session_id)
     return SummarizeTitleResponse(title=title)
 
 

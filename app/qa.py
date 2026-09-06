@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import time
+from functools import lru_cache
 
 from app.config import get_settings
 from app.errors import LawHelperError
@@ -14,44 +15,46 @@ from app.schemas import Reference
 from app.tracing import event, span
 from app.upload_retrieval import select_relevant_chunks
 
-SYSTEM_PROMPT = (
-    "你是「小Z」，一名熟悉道路交通安全相关法律法规（包括《中华人民共和国道路交通安全法》"
-    "《中华人民共和国道路交通安全法实施条例》《道路交通事故处理程序规定》"
-    "《道路交通安全违法行为记分管理办法》《车辆驾驶人员血液、呼气酒精含量阈值与检验》"
-    "（GB 19522-2024）的智能法律助手。"
-    "系统会为你检索并提供与用户问题相关的法条原文供你参考，"
-    "这些法条并非用户提供，而是系统根据问题自动检索得到的。"
-    "请严格依据提供给你的法条原文回答问题，不要编造法条内容。"
-    "回答需简洁、准确，并在涉及具体条款时指出条号。"
-    "如果提供的法条不足以回答，请明确说明依据不足。"
-    "如果用户问题明显与道路交通安全法律法规无关，请直接说明你只能回答道路交通安全相关法律法规的问题，"
-    "不要引用任何法条原文，也不要编造法条。"
-    "【表述规范】回答中涉及法条来源时，"
-    "请统一使用「系统检索到的法条」「根据检索到的法条」，"
-    "或根据检索到的法条来源直接说「根据《中华人民共和国道路交通安全法》」"
-    "「根据《中华人民共和国道路交通安全法实施条例》」"
-    "「根据《道路交通事故处理程序规定》」"
-    "「根据《道路交通安全违法行为记分管理办法》」"
-    "「根据 GB 19522-2024」，"
-    "绝对不要出现「你提供的法条」「用户提供的法条」等表述。"
-    "回答中用「你」指代提问的用户即可。"
-    "【处罚回答规范】回答处罚类问题时请注意：罚款处罚依据《道路交通安全法》"
-    "及其实施条例的相应条款，记分处罚依据《道路交通安全违法行为记分管理办法》的相应条款。"
-    "机动车驾驶人的违法行为通常同时涉及罚款与记分，若两类依据都已检索到，"
-    "应同时给出罚款金额与记分分值，完整回答；"
-    "行人、乘车人、非机动车驾驶人不适用记分制度，仅说明罚款处罚；"
-    "若某行为仅检索到罚款依据而未见记分依据（或反之），"
-    "只依据已检索到的部分回答，不要编造未检索到的处罚内容。"
-)
+
+@lru_cache(maxsize=1)
+def _system_prompt() -> str:
+    """构建 system prompt，动态注入 statute/ 下所有法规名作为可回答范围。
+
+    应用启动后 statute/ 内容固定，lru_cache 缓存结果避免重复扫描目录。
+    """
+    laws = get_settings().law_sources
+    law_list = "".join(f"《{name}》" for name in laws)
+    return (
+        "你是「小Z」，一名熟悉中国法律法规的智能法律助手。"
+        f"你能就以下法律法规回答问题：{law_list}。"
+        "系统会为你检索并提供与用户问题相关的法条原文供你参考，"
+        "这些法条并非用户提供，而是系统根据问题自动检索得到的。"
+        "请严格依据提供给你的法条原文回答问题，不要编造法条内容。\n"
+        "【回答结构】遵循「结论先行 + 法条支撑 + 实操建议」结构：\n"
+        "1. 先用 1-2 句话直接给出结论或实质性回答（不要先堆砌法条）；\n"
+        "2. 在结论中或结论后引用必要法条作为依据（指出条号），但不要整段照抄原文；\n"
+        "3. 针对用户实际场景给出可操作的建议、注意事项或后续步骤（如该怎么办、需准备什么、"
+        "可能的法律后果、如何维权、如何避免风险等）。\n"
+        "禁止只罗列法条原文而不给结论和建议。法条原文是支撑，不是回答本身。"
+        "如果提供的法条不足以回答，请明确说明依据不足，并给出合理的指引。"
+        "如果用户问题明显与上述法律法规无关，请直接说明你只能回答上述法律法规相关的问题，"
+        "不要引用任何法条原文，也不要编造法条。"
+        "【表述规范】回答中涉及法条来源时，"
+        "请统一使用「系统检索到的法条」「根据检索到的法条」，"
+        f"或根据检索到的法条来源直接说「根据《xxx》」等（如「根据{law_list}」），"
+        "绝对不要出现「你提供的法条」「用户提供的法条」等表述。"
+        "回答中用「你」指代提问的用户即可。"
+    )
 
 
-# 检索未命中相关法条时的 user prompt：不附带任何法条 context，
-# 引导 LLM 简短说明职责范围，避免引用不相关法条
-_OFF_TOPIC_PROMPT_TEMPLATE = (
-    "用户问题：{question}\n\n"
-    "系统未检索到与该问题相关的道路交通安全法律法规条文。"
-    "请简短说明我只能回答与道路交通安全相关法律法规相关的问题，不要引用或编造任何法条。"
-)
+@lru_cache(maxsize=1)
+def _off_topic_prompt_template() -> str:
+    """构建无相关法条时的拒答模板，泛化领域描述。"""
+    return (
+        "用户问题：{question}\n\n"
+        "系统未检索到与该问题相关的法律法规条文。"
+        "请简短说明你只能回答与所支持法律法规相关的问题，不要引用或编造任何法条。"
+    )
 
 
 # 无意义输入黑名单：问候、应答、寒暄等，命中即走拒答分支，不进入检索
@@ -65,13 +68,19 @@ _TRIVIAL_TOKENS = {
 }
 
 # 法律相关关键词：短 query 命中任一关键词才进入 RAG，否则视为无意义输入
+# 道路交通安全 + 立法法/通用法律语境关键词，确保不同法规的短问句都能进入检索
 _LAW_KEYWORDS = (
+    # 道路交通安全相关
     "法", "交通", "驾驶", "车辆", "机动车", "酒驾", "酒", "事故", "违章",
     "违法", "罚款", "扣分", "驾照", "驾驶证", "行驶证", "行人", "道路",
     "高速", "红绿灯", "信号灯", "限速", "停车", "超速", "逆行", "闯",
     "追尾", "醉驾", "肇事",
     "保险", "责任", "行人", "非机动车", "电动车", "摩托", "头盔", "安全带",
     "调解", "复核", "管辖", "鉴定", "逃逸", "协商", "认定", "赔偿",
+    # 立法法 / 通用法律语境
+    "立法", "制定", "法规", "规章", "备案", "解释", "效力", "修改", "废止",
+    "授权", "条例", "行政法规", "地方性法规", "自治条例", "单行条例",
+    "规范性文件", "公布", "施行", "法律案",
 )
 
 
@@ -104,15 +113,18 @@ def _is_trivial_query(query: str) -> bool:
 
 # 多轮历史感知改写（condense question）：把追问 + 最近历史改写成独立完整的问题，
 # 再进入检索与生成；与 GitHub 高星实践（LangChain create_history_aware_retriever）等价
-_CONTEXT_RESOLVE_SYSTEM = (
-    "你是一个查询改写助手。请结合对话历史，把用户最新问题改写成一个完整、独立、"
-    "无需上下文也能理解的问题。\n规则：\n"
-    "1. 把「它」「这个」「那个」等指代词替换为历史中的具体对象\n"
-    "2. 补全省略的主语/宾语（如「怎么修」→「XX怎么维修」）\n"
-    "3. 领域为道路交通安全法律法规，补全时保留法律语境\n"
-    "4. 若当前问题已完整独立，原样输出\n"
-    "5. 只输出改写后的问题，不要任何解释"
-)
+@lru_cache(maxsize=1)
+def _context_resolve_system() -> str:
+    """历史改写 system prompt，领域泛化为「中国法律法规」。"""
+    return (
+        "你是一个查询改写助手。请结合对话历史，把用户最新问题改写成一个完整、独立、"
+        "无需上下文也能理解的问题。\n规则：\n"
+        "1. 把「它」「这个」「那个」等指代词替换为历史中的具体对象\n"
+        "2. 补全省略的主语/宾语（如「怎么修」→「XX怎么维修」）\n"
+        "3. 领域为中国法律法规，补全时保留法律语境\n"
+        "4. 若当前问题已完整独立，原样输出\n"
+        "5. 只输出改写后的问题，不要任何解释"
+    )
 
 
 _SANITIZE_RE_THINK = re.compile(r"<think>.*?</think>", re.DOTALL)
@@ -157,7 +169,7 @@ def _resolve_context(question: str, history: list[dict]) -> tuple[str, bool]:
         + f"\n\n用户最新问题：{question}\n\n改写后的独立问题："
     )
     try:
-        rewritten = get_llm().chat(_CONTEXT_RESOLVE_SYSTEM, user_prompt, temperature=0.0)
+        rewritten = get_llm().chat(_context_resolve_system(), user_prompt, temperature=0.0)
         rewritten = _sanitize_rewrite(rewritten)
         if not rewritten or len(rewritten) > 60:  # 超长视为解释性输出，改写失败
             return question, False
@@ -239,8 +251,8 @@ def answer(question: str, history: list[dict] | None = None, document_text: str 
     # 若有上传文件内容，则跳过 trivial 拦截，允许对短问题结合材料作答
     if rewrite_ok and _is_trivial_query(resolved) and not document_text:
         event("trivial_reject", question=question)
-        user_prompt = _OFF_TOPIC_PROMPT_TEMPLATE.format(question=question)
-        llm_text = get_llm().chat(SYSTEM_PROMPT, user_prompt)
+        user_prompt = _off_topic_prompt_template().format(question=question)
+        llm_text = get_llm().chat(_system_prompt(), user_prompt)
         return llm_text, []
 
     # 对话元问题（如「我刚刚的问题是什么」）：仅凭对话历史回答，不检索、不附引用
@@ -277,13 +289,13 @@ def answer(question: str, history: list[dict] | None = None, document_text: str 
         if document_text:
             user_prompt = _build_user_prompt(resolved, [], document_text, document_chunks)
         else:
-            user_prompt = _OFF_TOPIC_PROMPT_TEMPLATE.format(question=question)
-        llm_text = get_llm().chat(SYSTEM_PROMPT, user_prompt)
+            user_prompt = _off_topic_prompt_template().format(question=question)
+        llm_text = get_llm().chat(_system_prompt(), user_prompt)
         return llm_text, []
 
     user_prompt = _build_user_prompt(resolved, contexts, document_text, document_chunks)
     with span("llm_generate"):
-        llm_text = get_llm().chat(SYSTEM_PROMPT, user_prompt)
+        llm_text = get_llm().chat(_system_prompt(), user_prompt)
 
     references = [
         Reference.model_validate({
@@ -319,8 +331,8 @@ def answer_stream(question: str, history: list[dict] | None = None, document_tex
     if not history and _is_trivial_query(question) and not document_text:
         event("trivial_reject", question=question)
         yield {"type": "references", "references": []}
-        user_prompt = _OFF_TOPIC_PROMPT_TEMPLATE.format(question=question)
-        for kind, text in get_llm().chat_stream(SYSTEM_PROMPT, user_prompt):
+        user_prompt = _off_topic_prompt_template().format(question=question)
+        for kind, text in get_llm().chat_stream(_system_prompt(), user_prompt):
             if kind == "reasoning":
                 yield {"type": "reasoning", "content": text}
             else:
@@ -342,8 +354,8 @@ def answer_stream(question: str, history: list[dict] | None = None, document_tex
         if rewrite_ok and _is_trivial_query(resolved) and not document_text:
             event("trivial_reject", resolved=resolved)
             yield {"type": "references", "references": []}
-            user_prompt = _OFF_TOPIC_PROMPT_TEMPLATE.format(question=question)
-            for kind, text in get_llm().chat_stream(SYSTEM_PROMPT, user_prompt):
+            user_prompt = _off_topic_prompt_template().format(question=question)
+            for kind, text in get_llm().chat_stream(_system_prompt(), user_prompt):
                 if kind == "reasoning":
                     yield {"type": "reasoning", "content": text}
                 else:
@@ -403,8 +415,8 @@ def answer_stream(question: str, history: list[dict] | None = None, document_tex
         if document_text:
             user_prompt = _build_user_prompt(resolved, [], document_text, document_chunks)
         else:
-            user_prompt = _OFF_TOPIC_PROMPT_TEMPLATE.format(question=question)
-        for kind, text in get_llm().chat_stream(SYSTEM_PROMPT, user_prompt):
+            user_prompt = _off_topic_prompt_template().format(question=question)
+        for kind, text in get_llm().chat_stream(_system_prompt(), user_prompt):
             if kind == "reasoning":
                 yield {"type": "reasoning", "content": text}
             else:
@@ -415,7 +427,7 @@ def answer_stream(question: str, history: list[dict] | None = None, document_tex
     yield {"type": "progress", "content": "正在思考回答..."}
     user_prompt = _build_user_prompt(resolved, contexts, document_text, document_chunks)
     with span("llm_generate"):
-        for kind, text in get_llm().chat_stream(SYSTEM_PROMPT, user_prompt):
+        for kind, text in get_llm().chat_stream(_system_prompt(), user_prompt):
             if kind == "reasoning":
                 yield {"type": "reasoning", "content": text}
             else:
