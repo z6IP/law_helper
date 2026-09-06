@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import os
 import threading
 import uuid
 from pathlib import Path
@@ -92,30 +91,28 @@ def _run_preload() -> None:
         chroma_path = str(settings.chroma_full_dir)
         client = chromadb.PersistentClient(path=chroma_path)
 
-        # Step 1: 加载 Embedding 模型（local_files_only=True，跳过网络检查）
+        # Step 1: 加载 Embedding 模型（API 调用，首次请求建立连接）
         _PRELOAD_STATE["stage"] = "embedding"
         event("preload.stage", stage="embedding")
         from app.embeddings import get_embedding_model
 
         with span("preload.embedding"):
             emb_model = get_embedding_model()
-            # warmup: 跑一次推理，确保权重完全加载
+            # warmup: 跑一次推理，确保 API 连接正常
             _ = emb_model.embed_query("小ZAI助手启动预热")
             event("preload.embedding.done", dim=len(_))
 
-        # Step 2: 加载 Reranker 模型（local_files_only=True，跳过网络检查）
+        # Step 2: 加载 Reranker 模型（API 调用，首次请求建立连接）
         _PRELOAD_STATE["stage"] = "reranker"
         event("preload.stage", stage="reranker")
         from app.rerank import get_reranker
 
         with span("preload.reranker"):
             reranker = get_reranker()
-            # 触发模型加载（懒加载 → 实际加载）
-            reranker._ensure_loaded()
-            # warmup: 跑一次最小推理，确保 CrossEncoder 权重全部加载
-            import torch
-            with torch.inference_mode():
-                _ = reranker._model.predict([("预热查询", "预热文档")])
+            # warmup: 跑一次最小推理，确保 API 连接正常
+            _ = reranker.rerank(
+                "预热查询", [{"text": "预热文档"}], top_n=1, min_score=None
+            )
 
         # Step 3: 校验索引（维度检测优先，条件重建；否则启动增量导入）
         _PRELOAD_STATE["stage"] = "index"
@@ -137,10 +134,14 @@ def _run_preload() -> None:
         engine = get_retrieval_engine()
         if engine.needs_rebuild:
             event("preload.rebuild", reason="维度不匹配")
-            import shutil
-
-            if os.path.exists(chroma_path):
-                shutil.rmtree(chroma_path, ignore_errors=True)
+            # 删除旧集合（维度不匹配），让 ingest() 重新创建并写入新维度向量。
+            # 用 delete_collection 而非 shutil.rmtree，避免 Windows 下
+            # chromadb 持有文件句柄导致目录删除失败的问题。
+            try:
+                client.delete_collection(name=COLLECTION_NAME)
+            except Exception:
+                # 集合不存在时忽略
+                pass
             from app.retrieval import get_retrieval_engine as _gre
 
             _gre.cache_clear()

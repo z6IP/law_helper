@@ -44,10 +44,13 @@ class Settings(BaseSettings):
     # 若部署到多用户/网络环境，应设为 False，启用 session_ids 严格隔离。
     single_user_mode: bool = True
 
-    # Embedding / Rerank 模型（轻量版，CPU 友好）
-    embedding_model_id: str = "BAAI/bge-small-zh-v1.5"
-    rerank_model_id: str = "BAAI/bge-reranker-v2-m3"
-    modelscope_cache_dir: str = "models"
+    # Embedding / Rerank 模型（阿里云百炼 API）
+    embedding_model_id: str = "qwen3.7-text-embedding"
+    rerank_model_id: str = "qwen3.7-text-rerank"
+    # Embedding 向量维度（qwen3.7-text-embedding 支持 2560/2048/1536/1024/768/512/256，默认 1024）
+    embedding_dimensions: int = 1024
+    # DashScope API base（rerank 接口使用，区别于 OpenAI 兼容接口）
+    dashscope_api_base: str = "https://dashscope.aliyuncs.com/api/v1"
 
     # 多轮对话：参与历史改写的最大消息条数（3 轮 = 6 条）
     history_max_messages: int = Field(6, ge=0, le=20)
@@ -59,11 +62,8 @@ class Settings(BaseSettings):
     rerank_top_n: int = Field(3, ge=1, le=10)
     # 重排相关性阈值：低于该分的候选视为不相关并丢弃，
     # 全部丢弃时由 LLM 简短拒答，不引用任何法条
-    # 实测（bge-reranker-v2-m3 + 查询改写，8 场景端到端标定）：
-    #   相关条文 top1 ≈ 0.49~0.99（转弯让直行 0.91 / 酒驾 0.99 / 追尾 0.49 / 闯红灯 0.83 等）
-    #   无关 query / 弱相关候选普遍 <0.11
-    #   0.2 落在两侧之间；注意：相关条文分数依赖查询改写弥合口语→法条术语的鸿沟，
-    #   新增改写规则后需回归此阈值
+    # 注意：此阈值基于 bge-reranker-v2-m3 标定，切换为 qwen3.7-text-rerank 后
+    # 需根据实际得分分布重新标定（qwen3.7-text-rerank 的 relevance_score 范围为 0~1）
     rerank_min_score: float = Field(0.2, ge=0.0, le=1.0)
 
     # 服务
@@ -110,13 +110,6 @@ class Settings(BaseSettings):
         if not p.is_absolute():
             p = USER_DATA_DIR / p
         p.mkdir(parents=True, exist_ok=True)
-        return p
-
-    @property
-    def modelscope_full_dir(self) -> Path:
-        p = Path(self.modelscope_cache_dir)
-        if not p.is_absolute():
-            p = BASE_DIR / p
         return p
 
 

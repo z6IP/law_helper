@@ -110,7 +110,7 @@ def select_relevant_chunks(question: str, document_text: str) -> list[str] | Non
         coarse_indices = np.argsort(-coarse_scores)[:_COARSE_K]
         coarse_candidates = [chunks[i] for i in coarse_indices]
 
-        # 2) CrossEncoder 精排，不设 min_score
+        # 2) Reranker 精排，不设 min_score
         candidates = [{"text": c} for c in coarse_candidates]
         ranked = get_reranker().rerank(
             question, candidates, top_n=DOC_TOP_N, min_score=None

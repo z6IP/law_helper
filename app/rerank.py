@@ -1,35 +1,41 @@
-"""CrossEncoder 重排序（bge-reranker-v2-m3，CPU 友好）。
+"""qwen3.7-text-rerank 重排序（阿里云百炼 DashScope API）。
 
-CPU 推理优化：torch.inference_mode() + model.eval() + batch 预测。
+通过 DashScope 专用接口调用，对候选文档按相关性打分排序。
 """
 from __future__ import annotations
 
 from functools import lru_cache
 
+import requests
+
 from app.config import get_settings
-from app.embeddings import _download_model
 from app.errors import RetrievalError
-from app.tracing import span
+from app.tracing import event, span
+
+
+# 默认排序任务指令（问答检索场景）
+_DEFAULT_INSTRUCT = "Given a web search query, retrieve relevant passages that answer the query."
 
 
 class Reranker:
-    """bge-reranker-v2-m3 CrossEncoder 封装（懒加载单例）。"""
+    """qwen3.7-text-rerank 重排序封装（懒加载单例，API 调用）。"""
 
     def __init__(self) -> None:
-        self._model = None
+        self._endpoint: str | None = None
+        self._api_key: str | None = None
 
     def _ensure_loaded(self) -> None:
-        if self._model is not None:
+        if self._endpoint is not None:
             return
-        from sentence_transformers import CrossEncoder
-
         settings = get_settings()
-        model_dir = _download_model(settings.rerank_model_id)
-        # local_files_only=True: 直接从本地加载，跳过网络检查
-        self._model = CrossEncoder(model_dir, local_files_only=True)
-        # 确保 eval 模式
-        if hasattr(self._model, "eval"):
-            self._model.eval()
+        if not settings.openai_api_key or settings.openai_api_key.startswith("your_"):
+            raise RetrievalError("请在 .env 中配置有效的 OPENAI_API_KEY")
+        # DashScope rerank 专用接口
+        self._endpoint = (
+            settings.dashscope_api_base.rstrip("/")
+            + "/services/rerank/text-rerank/text-rerank"
+        )
+        self._api_key = settings.openai_api_key
 
     def rerank(
         self,
@@ -47,27 +53,68 @@ class Reranker:
             return []
         self._ensure_loaded()
 
-        pairs = [(query, c["text"]) for c in candidates]
-        # 使用 torch.inference_mode() 加速推理（比 no_grad() 更快）
-        import torch
+        settings = get_settings()
+        documents = [c["text"] for c in candidates]
 
-        with torch.inference_mode():
-            with span("rerank.predict", candidates=len(candidates)):
-                scores = self._model.predict(pairs)
-        if hasattr(scores, "tolist"):
-            scores = scores.tolist()
-        if isinstance(scores, (int, float)):
-            scores = [scores]
+        payload = {
+            "model": settings.rerank_model_id,
+            "input": {
+                "query": query,
+                "documents": documents,
+            },
+            "parameters": {
+                "top_n": top_n,
+                "instruct": _DEFAULT_INSTRUCT,
+            },
+        }
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
 
-        ranked = sorted(
-            zip(candidates, scores), key=lambda x: x[1], reverse=True
-        )
-        result = [
-            {**c, "rerank_score": float(s)}
-            for c, s in ranked
-            if min_score is None or float(s) >= min_score
-        ]
-        return result[:top_n]
+        with span(
+            "rerank.predict",
+            model=settings.rerank_model_id,
+            candidates=len(candidates),
+        ):
+            try:
+                resp = requests.post(
+                    self._endpoint,
+                    json=payload,
+                    headers=headers,
+                    timeout=60,
+                )
+                resp.raise_for_status()
+            except requests.RequestException as exc:
+                raise RetrievalError(f"重排序 API 调用失败：{exc}") from exc
+
+            data = resp.json()
+
+        # 错误响应：{"code": "...", "message": "..."}
+        if "code" in data and data["code"]:
+            raise RetrievalError(
+                f"重排序 API 返回错误：{data.get('message', data['code'])}"
+            )
+
+        results = data.get("output", {}).get("results", [])
+        usage = data.get("usage")
+        if usage:
+            event(
+                "rerank.tokens",
+                model=settings.rerank_model_id,
+                prompt_tokens=usage.get("prompt_tokens", 0),
+                total_tokens=usage.get("total_tokens", 0),
+            )
+
+        # results 已按 relevance_score 降序排列
+        scored: list[dict] = []
+        for r in results:
+            idx = r["index"]
+            score = float(r["relevance_score"])
+            if min_score is None or score >= min_score:
+                scored.append({**candidates[idx], "rerank_score": score})
+
+        return scored[:top_n]
 
 
 @lru_cache
