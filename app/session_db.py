@@ -13,7 +13,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from app.config import get_settings
+from app.config import USER_DATA_DIR, get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -22,12 +22,12 @@ _LOCK = threading.Lock()
 
 
 def _db_path() -> Path:
-    """返回 SQLite 数据库路径；默认放在 data/sessions 同级目录。"""
+    """返回 SQLite 数据库路径：~/.law_helper/session_history/law_helper.db。"""
     global _DB_PATH
     if _DB_PATH is None:
-        settings = get_settings()
-        _DB_PATH = settings.sessions_full_dir.parent / "law_helper.db"
-        _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        db_dir = USER_DATA_DIR / "session_history"
+        db_dir.mkdir(parents=True, exist_ok=True)
+        _DB_PATH = db_dir / "law_helper.db"
     return _DB_PATH
 
 

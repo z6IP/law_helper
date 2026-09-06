@@ -33,17 +33,25 @@ function FileAttachment({ name }: { name: string }) {
 function AttachmentItem({ attachment, onPreview }: { attachment: Attachment; onPreview?: (url: string, rect: DOMRect) => void }) {
   const [error, setError] = useState(false)
   const [loaded, setLoaded] = useState(false)
+  const imgRef = useRef<HTMLImageElement>(null)
 
   // 切换会话复用组件时，重置加载状态，避免上一会话的失败/加载状态影响当前图片
   useEffect(() => {
     setError(false)
     setLoaded(false)
+    // 刷新后图片可能已在浏览器缓存中，onLoad 会在 React 挂载 img 前触发，
+    // 导致 loaded 永远为 false、opacity 保持 0 显示黑屏。
+    // 此处主动检查 img.complete，已加载则立即标记。
+    if (imgRef.current?.complete) {
+      setLoaded(true)
+    }
   }, [attachment.url])
 
   if (attachment.type === 'image' && !error) {
     return (
       <div className="image-attachment">
         <img
+          ref={imgRef}
           src={attachment.url}
           alt={attachment.name}
           crossOrigin="use-credentials"
@@ -74,6 +82,8 @@ function ImagePreview({ url, sourceRect, onClose }: ImagePreviewProps) {
   useEffect(() => {
     const img = imgRef.current
     if (!img) return
+    // 预览打开时标记全局状态，暂停消息列表自动滚动，避免流式输出干扰用户查看
+    document.body.setAttribute('data-preview-open', 'true')
     const target = computeTargetRect(sourceRect)
     const start = {
       x: sourceRect.left - target.left,
@@ -100,6 +110,10 @@ function ImagePreview({ url, sourceRect, onClose }: ImagePreviewProps) {
         overlay.style.opacity = '1'
       }
     })
+
+    return () => {
+      document.body.removeAttribute('data-preview-open')
+    }
   }, [sourceRect])
 
   const handleClose = () => {
@@ -181,10 +195,6 @@ export function MessageItem({ message, isCurrentLoading, thinkingLabel }: Messag
   
   const [preview, setPreview] = useState<PreviewInfo | null>(null)
   const isUser = message.role === 'user'
-
-  useEffect(() => {
-    setPreview(null)
-  }, [message])
 
   const html = useMemo(() => {
     if (isUser) return ''

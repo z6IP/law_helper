@@ -106,10 +106,11 @@ export interface UploadResult {
   name: string
 }
 
-export async function uploadDocument(file: File): Promise<UploadResult> {
+export async function uploadDocument(file: File, sessionId?: string): Promise<UploadResult> {
   const formData = new FormData()
   formData.append('file', file)
-  const resp = await fetch(`${BASE}/chat/upload`, {
+  const url = sessionId ? `${BASE}/chat/upload?session_id=${encodeURIComponent(sessionId)}` : `${BASE}/chat/upload`
+  const resp = await fetch(url, {
     method: 'POST',
     credentials: 'include',
     body: formData,

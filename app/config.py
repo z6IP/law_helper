@@ -12,6 +12,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # 项目根目录（app/ 的上一级）
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+# 用户数据根目录：~/.law_helper（首次使用时自动创建）。
+# 所有运行时数据（会话、附件、SQLite 数据库等）默认存储在此，
+# 与项目代码分离，便于升级与备份。
+USER_DATA_DIR = Path.home() / ".law_helper"
+USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -31,8 +37,12 @@ class Settings(BaseSettings):
 
     # 数据与存储
     chroma_dir: str = "chroma"
-    # 会话持久化目录（本地文件存储，每会话一个 JSON）
-    sessions_dir: str = "data/sessions"
+    # 会话持久化目录（默认 ~/.law_helper/session_history，存放历史 JSON 迁移源）
+    sessions_dir: str = "session_history"
+
+    # 单用户模式：默认开启，所有会话自动归属当前浏览器，无需严格鉴权。
+    # 若部署到多用户/网络环境，应设为 False，启用 session_ids 严格隔离。
+    single_user_mode: bool = True
 
     # Embedding / Rerank 模型（轻量版，CPU 友好）
     embedding_model_id: str = "BAAI/bge-small-zh-v1.5"
@@ -98,7 +108,8 @@ class Settings(BaseSettings):
     def sessions_full_dir(self) -> Path:
         p = Path(self.sessions_dir)
         if not p.is_absolute():
-            p = BASE_DIR / p
+            p = USER_DATA_DIR / p
+        p.mkdir(parents=True, exist_ok=True)
         return p
 
     @property

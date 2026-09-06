@@ -4,11 +4,11 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from app.config import BASE_DIR
+from app.config import USER_DATA_DIR
 
 logger = logging.getLogger(__name__)
 
-UPLOADS_DIR = BASE_DIR / "data" / "uploads"
+UPLOADS_DIR = USER_DATA_DIR / "file_history"
 
 
 def _resolve_path(stored_name: str) -> Path:

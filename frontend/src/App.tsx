@@ -459,7 +459,7 @@ function App() {
         let uploadedAttachments: Attachment[] = []
         if (hasFiles) {
           try {
-            const results = await Promise.all(files.map((file) => api.uploadDocument(file)))
+            const results = await Promise.all(files.map((file) => api.uploadDocument(file, sessionId)))
             documentText = results.map((r) => r.text).join('\n\n---\n\n')
             uploadedAttachments = results.map((r) => ({
               name: r.name,

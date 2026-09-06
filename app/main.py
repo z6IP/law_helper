@@ -14,7 +14,7 @@ from fastapi_throttle import RateLimiter
 from starsessions import CookieStore, SessionAutoloadMiddleware, SessionMiddleware
 
 from app import answer_cache, ingestion, jobs, session_db, session_store
-from app.config import get_settings
+from app.config import get_settings, USER_DATA_DIR
 from app.document_parser import parse_document
 from app.errors import LawHelperError
 from app.llm import get_llm
@@ -37,7 +37,7 @@ settings = get_settings()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DASHBOARD_HTML_PATH = BASE_DIR / "dashboard.html"
-UPLOADS_DIR = BASE_DIR / "data" / "uploads"
+UPLOADS_DIR = USER_DATA_DIR / "file_history"
 
 
 def _local_only(request: Request) -> None:
@@ -209,7 +209,9 @@ def _browser_session_key(req: Request) -> str:
 def _ensure_session_access(req: Request, session_id: str | None) -> None:
     """校验当前浏览器会话有权访问指定的 conversation session_id。
 
-    对于尚未持久化的新会话，自动注册到当前浏览器会话，避免新建空会话无法发送第一条消息。
+    single_user_mode=True（默认）：本工具为单用户本地运行，所有会话均属于当前用户，
+    只要 session_id 格式合法就自动注册，避免 session cookie 丢失后无法访问已有会话。
+    single_user_mode=False：严格鉴权，已存在的会话必须在当前浏览器 session_ids 中。
     """
     if session_id is None:
         return
@@ -218,7 +220,10 @@ def _ensure_session_access(req: Request, session_id: str | None) -> None:
         return
     if not session_id or not all(ch.isalnum() or ch == "-" for ch in session_id):
         raise HTTPException(status_code=400, detail="非法的会话 ID")
-    # 数据库中不存在该会话视为新会话，自动注册；否则必须已被当前浏览器允许
+    if settings.single_user_mode:
+        _register_session_id(req, session_id)
+        return
+    # 严格模式：数据库中不存在该会话视为新会话，自动注册；否则必须已被当前浏览器允许
     if not session_store.exists(session_id):
         _register_session_id(req, session_id)
         return
@@ -336,9 +341,15 @@ def summarize_session(session_id: str, req: SummarizeTitleRequest, request: Requ
     _ensure_session_access(request, session_id)
     messages = req.messages or []
     title = _summarize_title_from_messages(messages)
-    # 将总结后的标题持久化，刷新页面后仍能保持最新标题
+    # 仅更新标题，从数据库加载现有 messages 回写，避免前端 attachments 状态
+    # （可能还是 blob URL 或尚未同步）覆盖 jobs._persist 已保存的正确附件记录，
+    # 导致刷新后 stored_name 不匹配、图片 403 无法显示。
     try:
-        session_store.save(session_id, title, messages)
+        existing = session_store.load(session_id)
+        if existing:
+            session_store.save(session_id, title, existing["messages"])
+        else:
+            session_store.save(session_id, title, messages)
     except Exception:  # noqa: BLE001
         pass
     return SummarizeTitleResponse(title=title)
@@ -362,8 +373,12 @@ def _save_upload(content: bytes, filename: str | None) -> tuple[str, str]:
 
 
 @app.post("/api/v1/chat/upload", dependencies=[Depends(chat_limiter)])
-def chat_upload(request: Request, file: UploadFile = File(...)):
-    """上传并解析文件，返回提取的文本内容（仅作为一次性上下文）以及文件 URL。"""
+def chat_upload(request: Request, file: UploadFile = File(...), session_id: str | None = None):
+    """上传并解析文件，返回提取的文本内容（仅作为一次性上下文）以及文件 URL。
+
+    session_id 可选：传入时将上传文件标记为该会话的待持久化附件，
+    使图片在会话保存到数据库前即可被前端预览（避免 403 导致图片降级为文件名）。
+    """
     try:
         suffix = Path(file.filename or "unknown").suffix.lower()
         if suffix not in _ALLOWED_UPLOAD_EXTS:
@@ -378,7 +393,15 @@ def chat_upload(request: Request, file: UploadFile = File(...)):
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    url, _ = _save_upload(content, file.filename)
+    url, saved_name = _save_upload(content, file.filename)
+
+    # 标记为待持久化附件，允许在会话保存到 attachments 表前访问
+    if session_id:
+        pending = request.session.get("pending_uploads", {})
+        names = pending.setdefault(session_id, [])
+        if saved_name not in names:
+            names.append(saved_name)
+        request.session["pending_uploads"] = pending
 
     return {"text": text, "url": url, "name": file.filename}
 
@@ -386,10 +409,25 @@ def chat_upload(request: Request, file: UploadFile = File(...)):
 @app.get("/api/v1/uploads/{filename}")
 def get_upload(filename: str, request: Request):
     """获取上传的文件，仅限当前浏览器会话中可访问的会话附件。"""
-    # 会话鉴权：文件必须属于当前浏览器已授权会话的附件
     allowed = set(request.session.get("session_ids", []))
-    if not session_db.is_attachment_accessible(filename, allowed):
+    pending_uploads = request.session.get("pending_uploads", {})
+    pending_names = {name for names in pending_uploads.values() for name in names}
+    in_db = session_db.is_attachment_accessible(filename, allowed)
+    if filename not in pending_names and not in_db:
         raise HTTPException(status_code=403, detail="无权访问该文件")
+
+    # 若文件已持久化到 attachments 表，从 pending_uploads 中清理，
+    # 避免 session cookie 中累积过多待持久化记录（cookie 有约 4KB 上限）。
+    if in_db and pending_uploads:
+        changed = False
+        for sid, names in pending_uploads.items():
+            if filename in names:
+                names.remove(filename)
+                changed = True
+        # 清理空列表
+        if changed:
+            pending_uploads = {k: v for k, v in pending_uploads.items() if v}
+            request.session["pending_uploads"] = pending_uploads
 
     # 简单安全校验：防止目录穿越
     UPLOADS_DIR.mkdir(parents=True, exist_ok=True)

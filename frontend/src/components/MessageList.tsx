@@ -14,6 +14,8 @@ export function MessageList({ messages, loading, restoring = false, thinkingLabe
   const bottomRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
+    // 图片预览打开时暂停自动滚动，避免流式输出干扰用户查看/关闭图片
+    if (document.body.getAttribute('data-preview-open') === 'true') return
     bottomRef.current?.scrollIntoView({ behavior: 'auto' })
   }, [messages, loading])
 
