@@ -4,15 +4,18 @@ FROM python:3.11-slim AS builder
 WORKDIR /app
 
 # 系统依赖：编译工具 + OpenMP（pymupdf/chromadb 可能需要）
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# 使用阿里云镜像源加速国内构建
+RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources && \
+    sed -i 's|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources && \
+    apt-get update && apt-get install -y --no-install-recommends \
     build-essential libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 # 先复制 requirements 加速缓存
 COPY requirements.txt .
 RUN python -m venv /opt/venv && \
-    /opt/venv/bin/pip install --upgrade pip && \
-    /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
+    /opt/venv/bin/pip install --upgrade pip -i https://mirrors.aliyun.com/pypi/simple/ && \
+    /opt/venv/bin/pip install --no-cache-dir -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
 
 # ===== Stage 2: runner（运行时镜像）=====
 FROM python:3.11-slim AS runner
@@ -20,7 +23,10 @@ FROM python:3.11-slim AS runner
 WORKDIR /app
 
 # 运行时系统依赖（仅保留 libgomp1）
-RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
+# 使用阿里云镜像源加速国内构建
+RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources && \
+    sed -i 's|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources && \
+    apt-get update && apt-get install -y --no-install-recommends libgomp1 \
     && rm -rf /var/lib/apt/lists/* && apt-get clean
 
 # 从 builder 复制 venv
