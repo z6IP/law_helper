@@ -1,5 +1,6 @@
 # 环境与密钥
 .env
+.env.*
 
 # 调试脚本
 _debug_*.py
@@ -8,6 +9,9 @@ _debug_*.py
 # 可视测面板
 dashboard.html
 
+# AI 助手本地权限配置
+settings.json
+
 # Python
 __pycache__/
 *.py[cod]
@@ -15,15 +19,24 @@ __pycache__/
 .venv/
 venv/
 .ruff_cache/
+.pytest_cache/
 
 # 运行时数据
 chroma/
 models/
 data/
 logs/
+*.log
+
+# 前端
+node_modules/
+dist/
+frontend/node_modules/
+frontend/dist/
 
 # IDE
 .idea/
+.vscode/
 
 # 系统
 .DS_Store

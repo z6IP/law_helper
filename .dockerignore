@@ -1,0 +1,34 @@
+# 环境与密钥（绝不入镜像）
+.env
+.env.*
+
+# Python 缓存与虚拟环境
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ruff_cache/
+
+# 运行时数据（由 volume 挂载，不入镜像）
+chroma/
+models/
+data/
+logs/
+
+# 前端构建产物与依赖（前端由 nginx 容器单独托管）
+frontend/node_modules/
+frontend/dist/
+
+# IDE 与系统
+.idea/
+.vscode/
+.git/
+.trae/
+.pytest_cache/
+tests/
+_debug_*.py
+dashboard.html
+*.log
+.DS_Store
+Thumbs.db

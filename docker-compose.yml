@@ -1,0 +1,65 @@
+# /opt/law_helper/docker-compose.yml
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: law-helper-backend:latest
+    container_name: law-helper-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # 容器内 HOME 已在 Dockerfile 设为 /root，USER_DATA_DIR 会落到 /root/.law_helper
+      # 显式声明运行环境，便于排查
+      - PYTHONUNBUFFERED=1
+    volumes:
+      # 向量库持久化（chroma/ 目录）
+      - ./chroma:/app/chroma
+      # 用户数据持久化（SQLite + 上传附件）
+      - law_helper_data:/root/.law_helper
+    dns:
+      - 223.6.6.6      # 阿里云公共 DNS，确保能解析 dashscope.aliyuncs.com
+      - 8.8.8.8
+    networks:
+      - law-helper-net
+    # 资源限制（适配 2G 内存：留 ~500MB 给系统与 nginx）
+    mem_limit: 1500m
+    cpus: 1.5
+    # 不暴露 8000 到宿主机公网，仅容器内网可达
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health', timeout=5)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s   # 后端预热（embedding/rerank warmup + 索引校验）较慢，给 2 分钟
+
+  nginx:
+    image: nginx:alpine
+    container_name: law-helper-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      # 前端静态文件（构建产物，只读挂载）
+      - ./frontend/dist:/usr/share/nginx/html:ro
+      # nginx 配置
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - law-helper-net
+    depends_on:
+      backend:
+        condition: service_healthy
+    mem_limit: 64m
+    cpus: 0.5
+
+networks:
+  law-helper-net:
+    driver: bridge
+
+volumes:
+  law_helper_data:
+    # 命名卷，数据持久化到 Docker 默认路径 /var/lib/docker/volumes
+    # 可用 docker volume inspect law_helper_data 查看实际位置
