@@ -6,7 +6,10 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 echo "===== 1. 拉取最新代码 ====="
-git pull origin main
+# 服务器代码应完全镜像 GitHub，用 fetch + reset --hard 避免合并冲突/凭证提示
+git fetch origin main
+git reset --hard origin/main
+git clean -fd  # 清理未跟踪的文件（如构建产物）
 
 echo ""
 echo "===== 2. 重建后端 Docker 镜像 ====="
