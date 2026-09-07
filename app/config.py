@@ -89,13 +89,20 @@ class Settings(BaseSettings):
 
     @property
     def docx_full_paths(self) -> list[Path]:
-        """statute/ 目录下所有 .docx 法规文档（语料数据源，自动纳入新法规）。"""
-        return sorted((BASE_DIR / "statute").glob("*.docx"))
+        """statute/ 子文件夹下所有 .docx 法规文档（语料数据源，自动纳入新法规）。
+
+        递归扫描子文件夹（基础法律依据 / 事故处理赔偿 / 行政处罚程序），
+        子文件夹名作为分类写入向量库 metadata。
+        """
+        return sorted((BASE_DIR / "statute").rglob("*.docx"))
 
     @property
     def pdf_full_paths(self) -> list[Path]:
-        """statute/ 目录下所有 .pdf 文档（语料数据源，自动纳入新标准）。"""
-        return sorted((BASE_DIR / "statute").glob("*.pdf"))
+        """statute/ 子文件夹下所有 .pdf 文档（语料数据源，自动纳入新标准）。
+
+        递归扫描子文件夹，子文件夹名作为分类写入向量库 metadata。
+        """
+        return sorted((BASE_DIR / "statute").rglob("*.pdf"))
 
     @property
     def law_sources(self) -> list[str]:

@@ -44,6 +44,41 @@ def _clean_source_name(path) -> str:
     return name
 
 
+def _category_from_path(path: Path) -> str:
+    """从文档路径取所在子文件夹名作为分类（statute/基础法律依据/xxx.docx → 基础法律依据）。
+
+    statute/ 根目录下的旧文件（无子文件夹）返回空字符串。
+    """
+    parent = path.parent
+    # statute/子文件夹/文件.docx → parent.name 即子文件夹名
+    # 兼容 statute/根目录/文件.docx 的情况，返回空字符串
+    if parent.name in ("基础法律依据", "事故处理赔偿", "行政处罚程序"):
+        return parent.name
+    return ""
+
+
+# 上位法 / 下位法 / 补充 规则
+_HIERARCHY_RULES = {
+    "基础法律依据": "上位法",
+    "事故处理赔偿": "下位法",
+    "行政处罚程序": "下位法",
+}
+_SUPPLEMENT_SOURCE = "中华人民共和国道路交通安全法实施条例"
+
+
+def _hierarchy_from_path(path: Path, source: str) -> str:
+    """按子文件夹 + 文件名规则判定层级。
+
+    - 基础法律依据 → 上位法
+    - 事故处理赔偿 / 行政处罚程序 → 下位法
+    - 中华人民共和国道路交通安全法实施条例 → 补充（即便位于基础法律依据中也作为补充）
+    """
+    if source == _SUPPLEMENT_SOURCE:
+        return "补充"
+    category = _category_from_path(path)
+    return _HIERARCHY_RULES.get(category, "")
+
+
 @dataclass
 class Article:
     article_no: str
@@ -435,12 +470,18 @@ def parse_pdf(pdf_path) -> list[Article]:
 
 MANIFEST_FILENAME = "ingestion_manifest.db"
 
+# metadata schema 版本：每次扩展 ChromaDB metadata 字段时 bump 此值，
+# _manifest_conn 检测到旧表 schema 不一致时会清空 manifest，强制全量重新导入，
+# 保证旧记录也能更新到新的 metadata 字段（基于 idempotent upsert，不会产生重复向量）。
+METADATA_SCHEMA_VERSION = 2
+
 
 _MANIFEST_SCHEMA = """
 CREATE TABLE IF NOT EXISTS ingestion_manifest (
-    source        TEXT PRIMARY KEY,
-    file_hash     TEXT NOT NULL UNIQUE,
-    article_count INTEGER NOT NULL DEFAULT 0
+    source                  TEXT PRIMARY KEY,
+    file_hash               TEXT NOT NULL UNIQUE,
+    article_count           INTEGER NOT NULL DEFAULT 0,
+    metadata_schema_version INTEGER NOT NULL DEFAULT 1
 )
 """
 
@@ -476,26 +517,44 @@ def _manifest_path(chroma_dir: Path) -> Path:
 
 
 def _manifest_conn(chroma_dir: Path):
-    """打开（必要时创建）manifest SQLite 库并确保表结构存在。"""
+    """打开（必要时创建）manifest SQLite 库并确保表结构存在。
+
+    若检测到旧表缺少 metadata_schema_version 列，则 DROP 整张表并重建，
+    令 manifest 清空、所有 source 下次被识别为「新增」并重新 upsert，
+    从而把新的 metadata 字段（category / 层级 等）刷写到已有向量上。
+    幂等 upsert 保证不会产生重复向量。
+    """
     chroma_dir.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(chroma_dir / MANIFEST_FILENAME)
+    try:
+        cols = conn.execute("PRAGMA table_info(ingestion_manifest)").fetchall()
+        col_names = {row[1] for row in cols}
+        if col_names and "metadata_schema_version" not in col_names:
+            conn.execute("DROP TABLE ingestion_manifest")
+    except sqlite3.OperationalError:
+        pass
     conn.execute(_MANIFEST_SCHEMA)
     conn.commit()
     return conn
 
 
 def _load_manifest(chroma_dir: Path) -> dict:
-    """读取 manifest 为 {source: {"hash": ..., "articles": ...}}；空表返回空字典。"""
+    """读取 manifest 为 {source: {"hash": ..., "articles": ..., "schema": ...}}；空表返回空字典。"""
     conn = _manifest_conn(chroma_dir)
     try:
         rows = conn.execute(
-            "SELECT source, file_hash, article_count FROM ingestion_manifest"
+            "SELECT source, file_hash, article_count, metadata_schema_version "
+            "FROM ingestion_manifest"
         ).fetchall()
     finally:
         conn.close()
     return {
-        source: {"hash": file_hash, "articles": article_count}
-        for source, file_hash, article_count in rows
+        source: {
+            "hash": file_hash,
+            "articles": article_count,
+            "schema": schema_version,
+        }
+        for source, file_hash, article_count, schema_version in rows
     }
 
 
@@ -505,10 +564,11 @@ def _save_manifest(chroma_dir: Path, manifest: dict) -> None:
     try:
         conn.execute("DELETE FROM ingestion_manifest")
         conn.executemany(
-            "INSERT INTO ingestion_manifest (source, file_hash, article_count) "
-            "VALUES (?, ?, ?)",
+            "INSERT INTO ingestion_manifest "
+            "(source, file_hash, article_count, metadata_schema_version) "
+            "VALUES (?, ?, ?, ?)",
             [
-                (source, m["hash"], m.get("articles", 0))
+                (source, m["hash"], m.get("articles", 0), METADATA_SCHEMA_VERSION)
                 for source, m in manifest.items()
             ],
         )
@@ -524,7 +584,9 @@ def _ingest_single_file(
 ) -> tuple[str, int]:
     """解析单个文件并 upsert 到 collection，返回 (source, article_count)。"""
     source = _clean_source_name(path)
-    with span("ingest.file", source=source, file=path.name):
+    category = _category_from_path(path)
+    hierarchy = _hierarchy_from_path(path, source)
+    with span("ingest.file", source=source, file=path.name, category=category, hierarchy=hierarchy):
         suffix = path.suffix.lower()
         if suffix == ".docx":
             articles = parse_docx(path)
@@ -537,7 +599,13 @@ def _ingest_single_file(
 
         documents = [a.text for a in articles]
         metadatas = [
-            {"article_no": a.article_no, "section_header": a.section_header, "source": source}
+            {
+                "article_no": a.article_no,
+                "section_header": a.section_header,
+                "source": source,
+                "category": category,
+                "层级": hierarchy,
+            }
             for a in articles
         ]
         ids = [_make_id(source, a.section_header, a.article_no) for a in articles]
@@ -582,7 +650,13 @@ def ingest() -> IngestResult:
         file_hash = _compute_file_hash(path)
         current_sources[source] = {"hash": file_hash, "path": str(path.name)}
         old = manifest.get(source)
-        if old is None or old.get("hash") != file_hash:
+        # 内容变化、新增、或 metadata schema 版本不一致（如新增了 category/层级字段）
+        # 都触发重新 upsert，把新 metadata 刷到已有向量上（幂等，不会重复）
+        if (
+            old is None
+            or old.get("hash") != file_hash
+            or old.get("schema") != METADATA_SCHEMA_VERSION
+        ):
             changed_paths.append(path)
 
     # 检测已删除的 source：manifest 中有记录但当前 statute/ 中不存在
