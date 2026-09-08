@@ -1,18 +1,34 @@
 """查询改写：把口语化问题扩展为更贴近法条表述的检索查询。
 
-采用「规则词典 + 关键词增强」，零延迟（纯字符串规则，不调用 LLM）。
-命中规则时把法条原文术语片段拼接到原问题后，生成用于「检索 + 重排」的
-扩展查询；生成回答仍使用用户原始问题，保证对 LLM 语义完整。
+历史：曾采用「规则词典 + 关键词增强」实现硬编码扩展，针对转弯让直行、
+追尾、逃逸、酒驾、闯红灯、酒精换算、地方规定冲突等场景注入法条术语。
 
-设计约束：仅替换 qa.py 中 `engine.search` 与 `reranker.rerank` 的 query 入参，
-其余（prompt 构造、引用法条）一律保持原始问题。
+现状：多路检索（retrieval.py 按 source 分路并行检索）已从根本上解决
+跨法规召回覆盖问题，每个法规都有候选进入重排阶段，重排模型基于语义
+相关性打分，不再需要人工注入术语来「拉」特定法规的召回分。
+
+因此 expand_query 现直接返回原问题，保留函数签名兼容历史调用。
+原 _RULES 数据结构与规则定义保留备查，未来若多路检索效果不足仍可回退。
+
+新增 multi_query_rewrite：LLM 多查询改写（Multi-Query Retrieval），
+针对用户口语化提问与法条术语不匹配的问题。LLM 只做语言层改写，
+不判断法律对错，不提供法律结论，不编造法条编号。
+
+新增 hyde_embed：HyDE 假设性文档嵌入（Hypothetical Document Embedding），
+LLM 生成假设性法律回答 → 用 qwen3.7-text-embedding 编码 → 返回向量。
+合规约束：假设性文档文本绝不进入最终 context，仅用于生成检索向量；
+LLM 失败或 embedding 失败时返回 None，调用方跳过 HyDE 路径。
 """
 from __future__ import annotations
 
+import re
+
+from app.errors import LawHelperError
+from app.llm import get_llm
+from app.tracing import event
+
+# 历史规则定义（保留备查，当前未启用）
 # 每条规则：(触发词, 必需词, 增强片段)
-#   - 触发词：问题命中任一触发词才可能匹配该规则
-#   - 必需词：问题需同时命中任一必需词，确认是在问「让行/责任」而非其它场景
-#   - 增强片段：贴近法条原文的关键术语，追加到检索查询后，提升相关条文召回
 _RULES: list[tuple[tuple[str, ...], tuple[str, ...], str]] = [
     # 转弯 vs 直行：责任划分类问题 → 实施条例第51/52条「转弯让直行」
     (
@@ -20,48 +36,37 @@ _RULES: list[tuple[tuple[str, ...], tuple[str, ...], str]] = [
         ("直行", "相撞", "碰撞", "撞车", "撞", "责任", "让行", "先行", "谁让", "让不让"),
         "转弯的机动车让直行的车辆先行",
     ),
-    # 追尾 → 法第43条「保持安全距离」（口语「追尾」与条文表述鸿沟极大，实测 0.002，
-    # 需补充「未保持安全距离」事故描述式术语；条文原文「应当保持…」规范式无效，实测仅 0.027）
+    # 追尾 → 法第43条「保持安全距离」
     (
         ("追尾",),
         (),
         "后车未与前车保持安全距离 责任认定",
     ),
-    # 肇事逃逸 → 法第99条第(三)项（逃逸在8项列举中被稀释，实测 0.15 <0.2）
+    # 肇事逃逸 → 法第99条第(三)项
     (
         ("逃逸", "逃跑", "跑了", "逃走"),
         ("撞", "事故", "伤", "人", "死"),
         "造成交通事故后逃逸",
     ),
-    # 酒驾 / 醉驾 → 法第91条（处罚）+ 记分办法第八条(一)（饮酒后驾驶记12分）+ GB 19522-2024 第4.1/4.2条（认定标准与换算）
-    # 口语「酒驾/醉驾」与条文「饮酒后驾驶/醉酒驾驶」词汇鸿沟，实测第91条进不了 top5 召回；
-    # 同时用户问「醉驾怎么判」时也需要给出血液酒精含量阈值（≥80mg/100mL），故把认定标准术语一并增强；
-    # 另需补充记分办法第八条(一)原文「饮酒后驾驶机动车 一次记12分」，否则记分办法进召回但不进 top3（被 GB 19522-2024 多条款挤出）
+    # 酒驾 / 醉驾 → 法第91条 + 记分办法第八条(一) + GB 19522-2024
     (
         ("酒驾", "酒后开车", "喝酒开车", "喝完酒开车", "醉驾", "醉酒驾驶", "醉酒开车"),
         (),
         "饮酒后驾驶机动车 醉酒驾驶机动车 处罚 记分 一次记12分 饮酒后驾驶机动车 车辆驾驶人员血液酒精含量阈值 饮酒后驾车 ≥20,<80mg/100mL 醉酒驾车 ≥80mg/100mL 血液与呼气酒精含量换算 1:2200",
     ),
-    # 闯红灯 → 法第90条（罚款）+ 记分办法第10条(八)（记6分）+ 条例第38条（认定）：
-    # 「不按交通信号灯指示通行」「一次记6分」为记分办法第10条原文，
-    # 缺「记分」信号时记分条款进不了召回（实测只命中记1分的第12条，会答错分值）
+    # 闯红灯 → 法第90条 + 记分办法第10条(八) + 条例第38条
     (
         ("闯红灯", "闯红灯了", "红灯闯"),
         (),
         "不按交通信号灯指示通行 一次记6分 机动车驾驶人违反道路交通安全法律、法规关于道路通行规定 处警告或者罚款",
     ),
-    # GB 19522-2024 血液/呼气酒精含量阈值与换算：
-    # 口语「吹气」「抽血」「1:2200」与标准文本「呼气酒精含量按 1:2200 换算成血液酒精含量」差距大，
-    # 需增强标准术语，确保血液/呼气阈值及换算关系稳定召回
+    # GB 19522-2024 血液/呼气酒精含量阈值与换算
     (
         ("血液", "呼气", "吹气", "抽血", "酒精", "酒驾", "醉驾", "饮酒驾驶", "醉酒驾驶"),
         ("换算", "转换", "对应", "相当", "等于", "阈值", "标准", "mg", "2200"),
         "车辆驾驶人员血液、呼气酒精含量阈值 血液酒精含量 呼气酒精含量 1:2200 换算",
     ),
-    # 地方性规定 / 地方与上位法冲突 → 道交法第67条（高速公路准入）+ 立法法第五章「适用与备案审查」第 98-100、107 条
-    # 口语「地方不让摩托上高速」与立法法术语「地方性法规 效力 上位法 下位法」差距大，
-    # 同时道交法第67条原文「设计最高时速低于七十公里的机动车 不得进入高速公路」与「摩托」「高速」词汇不直接匹配，
-    # 需同时增强道交法（高速公路准入）和立法法（地方性法规效力）两组术语，确保两类条文都能召回
+    # 地方性规定 / 地方与上位法冲突 → 道交法第67条 + 立法法第五章
     (
         ("地方", "地方政府", "地方规定", "本地", "各地", "省市", "省份", "当地"),
         ("不让", "禁止", "限制", "不能", "不许", "不准", "允许", "可以", "规定",
@@ -72,19 +77,153 @@ _RULES: list[tuple[tuple[str, ...], tuple[str, ...], str]] = [
 
 
 def expand_query(question: str) -> str:
-    """返回用于检索/重排的扩展查询；未命中任何规则时原样返回。
+    """返回用于检索/重排的扩展查询。
 
-    未命中时返回原问题，调用方可直接用于检索，无需特判。
+    多路检索启用后，本函数直接返回原问题，不再做硬编码术语增强。
+    保留函数签名兼容历史调用，避免破坏调用方。
+    """
+    return (question or "").strip()
+
+
+# Multi-Query 改写 system prompt
+# 合规约束（对应研究报告 0.1 / 5.1）：
+#   - 只做语言层改写，不判断法律对错
+#   - 不得添加法律结论（如「该行为违法」）
+#   - 不得编造具体法条编号
+#   - 只是把口语化表述改写为更接近法条术语的检索查询
+_MULTI_QUERY_SYSTEM = (
+    "你是检索查询改写助手。请把用户问题改写为 3 个不同视角的查询，"
+    "用于在法律法规条文库中检索。\n"
+    "【严格约束】\n"
+    "1. 只做语言层改写，不判断法律对错\n"
+    "2. 不得添加法律结论（如「该行为违法」「该行为合法」）\n"
+    "3. 不得使用「违法」「合法」「犯罪」「无罪」等法律判断词，"
+    "改用中性描述如「违反」「行为」「处罚」「责任」\n"
+    "4. 不得编造具体法条编号\n"
+    "5. 只是把用户口语化表述改写为更接近法条术语的检索查询\n"
+    "6. 每行一条改写，不要编号、不要解释、不要引号\n"
+    "改写示例：\n"
+    "- 原：「东莞摩托车上高速拘留」→\n"
+    "  摩托车 高速公路 行驶 拘留\n"
+    "  两轮摩托车 高速公路 载人 处罚\n"
+    "  摩托车 拘留 处罚种类 定义\n"
+    "- 原：「离婚房产怎么分」→\n"
+    "  离婚 夫妻共同财产 分割\n"
+    "  离婚 婚姻关系存续期间 财产\n"
+    "  离婚 房产 分割 法律规定"
+)
+
+
+def multi_query_rewrite(question: str, n: int = 3) -> list[str]:
+    """LLM 多查询改写：返回 n 条不同视角的检索查询（不含原问题）。
+
+    合规性：LLM 只做语言层改写，不判断法律对错，不进入最终回答。
+    失败时返回空列表，调用方使用原问题单路检索兜底。
+
+    Args:
+        question: 用户原始问题（已做多轮历史改写后的独立问题）
+        n: 期望的改写条数，默认 3
+
+    Returns:
+        改写后的查询列表，长度 0~n；失败时为空列表
     """
     q = (question or "").strip()
     if not q:
-        return q
+        return []
 
-    boosts: list[str] = []
-    for triggers, required, boost in _RULES:
-        if any(t in q for t in triggers) and (not required or any(r in q for r in required)):
-            boosts.append(boost)
+    user_prompt = f"用户问题：{q}\n\n请输出 {n} 条改写查询，每行一条："
+    try:
+        raw = get_llm().chat(_MULTI_QUERY_SYSTEM, user_prompt, temperature=0.0)
+    except LawHelperError:
+        event("multi_query_rewrite.failed", reason="llm_error")
+        return []
 
-    if not boosts:
-        return q
-    return f"{q} {' '.join(boosts)}"
+    # 清洗：去空行、去编号前缀、去引号包裹、去首尾空白
+    rewrites: list[str] = []
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # 去除「1.」「1、」「-」「*」等列表前缀
+        line = re.sub(r"^[\d]+[.、)\]]\s*", "", line)
+        line = re.sub(r"^[-*•]\s*", "", line)
+        # 去引号包裹
+        line = line.strip("「」“”\"‘’'").strip()
+        if not line:
+            continue
+        if line in rewrites:
+            continue  # 去重
+        rewrites.append(line)
+        if len(rewrites) >= n:
+            break
+
+    event(
+        "multi_query_rewrite.done",
+        original=question,
+        rewrites=rewrites,
+        count=len(rewrites),
+    )
+    return rewrites
+
+
+# HyDE system prompt
+# 合规约束（对应研究报告 0.2 / 5.1.2）：
+#   - LLM 生成的假设性文档仅用于生成检索向量，不进入最终 context
+#   - 最终回答完全不参考假设性文档内容
+#   - 假设性文档可能法律错误，但 HyDE 论文证明在线 Embedding 模型会过滤错误细节
+_HYDE_SYSTEM = (
+    "请针对用户提出的法律问题，生成一段假设性的法律回答文档。"
+    "这段文档将仅用于生成检索向量以查找真实法条，不会出现在最终回答中，"
+    "因此即使你对法律细节不确定也可以输出，但请尽量贴近法律条文的表述方式。\n"
+    "【约束】\n"
+    "1. 输出 100-200 字的连贯文字，不要分条编号\n"
+    "2. 描述与该问题可能相关的法律概念、行为类型、处罚种类，"
+    "并提及相关定义性概念（如「拘留的定义」「处罚的种类」）\n"
+    "3. 不要引用具体法条编号（你不确定编号是否正确）\n"
+    "4. 不要使用「违法」「合法」「犯罪」等法律判断词\n"
+    "5. 不要输出「该行为违法/合法」等最终法律结论\n"
+    "6. 只输出假设性文档正文，不要任何前缀或解释"
+)
+
+
+def hyde_embed(question: str) -> list[float] | None:
+    """HyDE 假设性文档嵌入：返回假设性回答的向量（不返回文本）。
+
+    合规约束（极重要）：
+    - LLM 生成的假设性文档文本绝不进入最终 context
+    - 仅返回归一化后的向量供 retrieval 做向量检索
+    - 失败时返回 None，调用方跳过 HyDE 路径，行为退化为 P0
+
+    Args:
+        question: 用户原始问题（已做多轮历史改写后的独立问题）
+
+    Returns:
+        归一化向量 list[float]；LLM 或 embedding 失败时为 None
+    """
+    q = (question or "").strip()
+    if not q:
+        return None
+
+    try:
+        # 延迟导入避免 query_expansion ↔ retrieval ↔ embeddings 循环依赖
+        from app.embeddings import get_embedding_model
+
+        hyde_text = get_llm().chat(_HYDE_SYSTEM, q, temperature=0.0)
+    except LawHelperError:
+        event("hyde.failed", reason="llm_error")
+        return None
+
+    hyde_text = (hyde_text or "").strip()
+    if not hyde_text:
+        event("hyde.failed", reason="empty_output")
+        return None
+
+    try:
+        vec = get_embedding_model().embed_query(hyde_text)
+    except Exception:  # noqa: BLE001 - embedding API 异常统一降级
+        event("hyde.failed", reason="embedding_error")
+        return None
+
+    # 不记录 hyde_text 本身，避免 LLM 知识泄露到日志
+    event("hyde.done", vector_dim=len(vec))
+    return vec

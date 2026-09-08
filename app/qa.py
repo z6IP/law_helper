@@ -8,9 +8,9 @@ from functools import lru_cache
 from app.config import get_settings
 from app.errors import LawHelperError
 from app.llm import get_llm
-from app.query_expansion import expand_query
+from app.query_expansion import hyde_embed, multi_query_rewrite
 from app.retrieval import get_retrieval_engine
-from app.rerank import get_reranker
+from app.rerank import apply_role_adjustment, get_reranker
 from app.schemas import Reference
 from app.tracing import event, span
 from app.upload_retrieval import select_relevant_chunks
@@ -39,6 +39,12 @@ def _system_prompt() -> str:
         "如果提供的法条不足以回答，请明确说明依据不足，并给出合理的指引。"
         "如果用户问题明显与上述法律法规无关，请直接说明你只能回答上述法律法规相关的问题，"
         "不要引用任何法条原文，也不要编造法条。"
+        "【定义性条款运用】当检索结果中包含定义性/种类性条款"
+        "（如《治安管理处罚法》第十条明确将行政拘留列为法定处罚种类之一）时，"
+        "应在分析处罚性质、拘留依据等问题时主动引用，"
+        "用以说明该处罚属于法定种类的哪一类、是否需有具体法律授权等关键判断。"
+        "不要因为定义性条款不直接描述行为就忽略它——"
+        "它往往是判断处罚合法性、程序正当性的根本依据。\n"
         "【表述规范】回答中涉及法条来源时，"
         "请统一使用「系统检索到的法条」「根据检索到的法条」，"
         f"或根据检索到的法条来源直接说「根据《xxx》」等（如「根据{law_list}」），"
@@ -54,7 +60,26 @@ def _system_prompt() -> str:
         "判断时必须先分清讨论对象是私权利还是公权力，再适用对应原则，严禁倒置——"
         "不得对私权利要求「须有授权方可为」，亦不得对公权力放任「未禁止即可为」。\n"
         "据此，当检索到的法条未明文禁止某行为时，不得以「地方规定可能禁止」「现场可能有禁令」"
-        "等模糊表述稀释公民权利；要禁止某行为或限制某权利，必须能指出明确的上位法依据。"
+        "等模糊表述稀释公民权利；要禁止某行为或限制某权利，必须能指出明确的上位法依据。\n"
+        "【法律分析方法论】当用户询问「某行为是否合法」「处罚是否正确」「法律依据是否错位」"
+        "等定性问题时，必须按以下三步框架分析，严禁跳步或发散：\n"
+        "第一步【行为定性】：先判断用户描述的行为本身在法律上是什么性质——是合法行为、"
+        "违法行为还是禁止行为？依据哪部法律的哪一条？该条是明文禁止、"
+        "有条件允许、还是完全未提及？如果法律完全未提及该行为，"
+        "或反向承认该行为可做（如限速条款实质承认可通行），则行为本身不违法。\n"
+        "第二步【处罚依据】：处罚决定援引的是哪部法律的哪一条？"
+        "该条规定的处罚种类是什么（罚款、拘留、吊销等）？该条是否明确针对用户描述的行为？"
+        "如果处罚条款针对的行为与用户描述的行为不匹配，则存在法律依据错位。\n"
+        "第三步【错位分析】：行为定性与处罚依据是否匹配？"
+        "是否出现「把A法范畴的行为用B法处罚」「把合法行为当违法行为处罚」"
+        "「把此违法当彼违法处罚」等错位？错位即违法——公权力必须严格依法，"
+        "法无授权即禁止，法律依据错位等于没有法律依据。\n"
+        "严禁发散到用户未提及的场景。如果用户问的是「上高速被拘留」，"
+        "不要发散到「事故处理」「赔偿调解」「责任认定」等用户未提及的事项；"
+        "只聚焦于「上高速这个行为是否违法」和「拘留依据是否匹配」两个核心问题。\n"
+        "【思考语言】你的内部思考/推理过程（reasoning）必须全程使用中文，"
+        "包括语义解析、知识激活、逻辑拆解、因果推演、候选对比、安全校验等所有环节，"
+        "不要使用英文，确保用户展开思考时看到的是完整中文。"
     )
 
 
@@ -133,8 +158,11 @@ def _context_resolve_system() -> str:
         "1. 把「它」「这个」「那个」等指代词替换为历史中的具体对象\n"
         "2. 补全省略的主语/宾语（如「怎么修」→「XX怎么维修」）\n"
         "3. 领域为中国法律法规，补全时保留法律语境\n"
-        "4. 若当前问题已完整独立，原样输出\n"
-        "5. 只输出改写后的问题，不要任何解释"
+        "4. 【关键】必须从历史中提取具体场景词（如车辆类型「摩托车」、"
+        "地点「高速公路」、处罚「拘留」、地名「东莞」等）补全到改写后的问题中，"
+        "确保改写后的问题即使脱离上下文也包含完整场景信息\n"
+        "5. 若当前问题已完整独立且包含具体场景，原样输出\n"
+        "6. 只输出改写后的问题，不要任何解释，不要思考过程"
     )
 
 
@@ -182,7 +210,7 @@ def _resolve_context(question: str, history: list[dict]) -> tuple[str, bool]:
     try:
         rewritten = get_llm().chat(_context_resolve_system(), user_prompt, temperature=0.0)
         rewritten = _sanitize_rewrite(rewritten)
-        if not rewritten or len(rewritten) > 60:  # 超长视为解释性输出，改写失败
+        if not rewritten or len(rewritten) > 200:  # 超长视为解释性输出，改写失败
             return question, False
         if rewritten != question:
             event("query_rewrite.changed", before=question, after=rewritten)
@@ -281,9 +309,22 @@ def answer(question: str, history: list[dict] | None = None, document_text: str 
     engine = get_retrieval_engine()
     reranker = get_reranker()
 
-    retrieval_q = expand_query(resolved)
-    with span("retrieval", query=retrieval_q, top_k=settings.top_k_retrieve):
-        candidates = engine.search(retrieval_q, top_k=settings.top_k_retrieve)
+    # Multi-Query 改写：LLM 把口语化问题改写为多视角检索查询（仅语言层操作）。
+    # 改写查询仅用于检索，不进入最终 context；失败时回退到原问题单路检索。
+    with span("multi_query_rewrite"):
+        rewrites = multi_query_rewrite(resolved)
+    retrieval_queries = [resolved] + rewrites
+    # HyDE：LLM 生成假设性法律回答 → 嵌入向量 → 参与向量检索融合。
+    # 合规：假设性文档文本绝不进入最终 context，仅用其向量做检索；
+    # 失败时返回 None，跳过 HyDE 路径，行为退化为 P0。
+    with span("hyde"):
+        hyde_vec = hyde_embed(resolved)
+    # rerank 阶段仍使用用户原始独立问题，保持与用户意图对齐
+    retrieval_q = resolved
+    with span("retrieval", query_count=len(retrieval_queries), top_k=settings.top_k_retrieve, hyde=hyde_vec is not None):
+        candidates = engine.multi_query_search(
+            retrieval_queries, top_k=settings.top_k_retrieve, hyde_vector=hyde_vec,
+        )
     event("retrieval.candidates", count=len(candidates))
     with span("rerank", top_n=settings.rerank_top_n, min_score=settings.rerank_min_score):
         contexts = reranker.rerank(
@@ -293,6 +334,10 @@ def answer(question: str, history: list[dict] | None = None, document_text: str 
             min_score=settings.rerank_min_score,
         )
     event("rerank.hits", count=len(contexts))
+    # 角色优先级调整：定义性 > 实体性 > 程序性
+    # 规则法（基于 section_header），不调 LLM；只调整排序，不删除任何法条
+    with span("role_adjustment"):
+        contexts = apply_role_adjustment(contexts)
 
     # 无相关法条：不附带任何引用，由 LLM 简短拒答
     if not contexts:
@@ -394,9 +439,22 @@ def answer_stream(question: str, history: list[dict] | None = None, document_tex
     # Step 2: 法条检索
     yield {"type": "progress", "content": "正在检索相关法条..."}
     engine = get_retrieval_engine()
-    retrieval_q = expand_query(resolved)
-    with span("retrieval", query=retrieval_q, top_k=settings.top_k_retrieve):
-        candidates = engine.search(retrieval_q, top_k=settings.top_k_retrieve)
+    # Multi-Query 改写：LLM 把口语化问题改写为多视角检索查询（仅语言层操作）。
+    # 改写查询仅用于检索，不进入最终 context；失败时回退到原问题单路检索。
+    with span("multi_query_rewrite"):
+        rewrites = multi_query_rewrite(resolved)
+    retrieval_queries = [resolved] + rewrites
+    # HyDE：LLM 生成假设性法律回答 → 嵌入向量 → 参与向量检索融合。
+    # 合规：假设性文档文本绝不进入最终 context，仅用其向量做检索；
+    # 失败时返回 None，跳过 HyDE 路径，行为退化为 P0。
+    with span("hyde"):
+        hyde_vec = hyde_embed(resolved)
+    # rerank 阶段仍使用用户原始独立问题，保持与用户意图对齐
+    retrieval_q = resolved
+    with span("retrieval", query_count=len(retrieval_queries), top_k=settings.top_k_retrieve, hyde=hyde_vec is not None):
+        candidates = engine.multi_query_search(
+            retrieval_queries, top_k=settings.top_k_retrieve, hyde_vector=hyde_vec,
+        )
     event("retrieval.candidates", count=len(candidates))
 
     # Step 2: 重排（搜索阶段统一显示"正在搜索..."，不暴露候选数等内部细节）
@@ -409,6 +467,10 @@ def answer_stream(question: str, history: list[dict] | None = None, document_tex
             min_score=settings.rerank_min_score,
         )
     event("rerank.hits", count=len(contexts))
+    # 角色优先级调整：定义性 > 实体性 > 程序性
+    # 规则法（基于 section_header），不调 LLM；只调整排序，不删除任何法条
+    with span("role_adjustment"):
+        contexts = apply_role_adjustment(contexts)
 
     references = [
         Reference.model_validate({

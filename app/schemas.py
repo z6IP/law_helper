@@ -132,6 +132,9 @@ class TraceItem(_BaseSchema):
     prompt_tokens: int = Field(0, description="累计输入 token")
     completion_tokens: int = Field(0, description="累计输出 token")
     total_tokens: int = Field(0, description="累计总 token")
+    llm_tokens: int = Field(0, description="主模型 token（llm.chat/chat_stream/ocr）")
+    embedding_tokens: int = Field(0, description="嵌入模型 token")
+    rerank_tokens: int = Field(0, description="重排模型 token")
 
 
 class TracesResponse(_BaseSchema):

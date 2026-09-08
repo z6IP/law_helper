@@ -100,9 +100,6 @@ def _run_preload() -> None:
 
         with span("preload.embedding"):
             emb_model = get_embedding_model()
-            # warmup: 跑一次推理，确保 API 连接正常
-            _ = emb_model.embed_query("小ZAI助手启动预热")
-            event("preload.embedding.done", dim=len(_))
 
         # Step 2: 加载 Reranker 模型（API 调用，首次请求建立连接）
         _PRELOAD_STATE["stage"] = "reranker"
@@ -111,10 +108,6 @@ def _run_preload() -> None:
 
         with span("preload.reranker"):
             reranker = get_reranker()
-            # warmup: 跑一次最小推理，确保 API 连接正常
-            _ = reranker.rerank(
-                "预热查询", [{"text": "预热文档"}], top_n=1, min_score=None
-            )
 
         # Step 3: 校验索引（维度检测优先，条件重建；否则启动增量导入）
         _PRELOAD_STATE["stage"] = "index"
@@ -448,7 +441,7 @@ def get_upload(filename: str, request: Request):
 def chat(req: ChatRequest, request: Request):
     _ensure_session_access(request, req.session_id)
     question = _effective_question(req.question, req.document_text)
-    # 单轮无历史时尝试命中答案缓存，跳过检索→重排→生成
+    # 单轮无历史时尝试命中答案缓存（answer_cache 已禁用，get() 永远返回 None）
     if not req.history:
         cached = answer_cache.get(question)
         if cached:
@@ -542,7 +535,7 @@ def ingest():
     from app.retrieval import get_retrieval_engine as _gre
 
     _gre.cache_clear()
-    answer_cache.clear()  # 法条语料更新后，旧答案缓存全部失效
+    answer_cache.clear()  # no-op：answer_cache 已永久禁用，调用保留但无效果
     finish_trace()
     return IngestResponse(status="ok", articles=result.total, message=result.message)
 
@@ -563,7 +556,10 @@ def traces(limit: int = 200, offset: int = 0):
 @app.get("/dashboard", include_in_schema=False, dependencies=[Depends(_local_only)])
 def dashboard_page():
     """本地运维可观测面板（单文件 HTML，仅回环地址可访问）。"""
-    return HTMLResponse(content=_read_dashboard_html())
+    return HTMLResponse(
+        content=_read_dashboard_html(),
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
 
 
 def _read_dashboard_html() -> str:

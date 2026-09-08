@@ -17,11 +17,31 @@ docker compose build backend
 
 echo ""
 echo "===== 3. 构建前端 ====="
+# 小内存机器（<=2G）构建会卡死，自动加 swap 兜底
+# 注意：set -euo pipefail 下管道中任一命令失败都会退出脚本，
+# 因此用 || true 兜底 swapon --show 不支持的情况，再检测 /proc/swaps
+has_swap=false
+if swapon --show 2>/dev/null | grep -q . || grep -q '^/' /proc/swaps 2>/dev/null; then
+  has_swap=true
+fi
+if [ "$has_swap" = false ]; then
+  echo "未检测到 swap，创建 2G swapfile 防止 OOM 卡死..."
+  if [ ! -f /swapfile ]; then
+    sudo fallocate -l 2G /swapfile
+    sudo chmod 600 /swapfile
+    sudo mkswap /swapfile
+  fi
+  sudo swapon /swapfile || true
+  # 持久化到 fstab，重启后仍生效
+  grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
+fi
+
 cd frontend
 # 清理旧产物，确保新 hash 文件名
 rm -rf dist
 npm install  # 确保依赖完整（首次或 package.json 变动时）
-npm run build
+# 给 Node 加内存上限，避免 Vite 转译 1217 模块时堆溢出
+NODE_OPTIONS="--max-old-space-size=2048" npm run build
 cd ..
 
 echo ""

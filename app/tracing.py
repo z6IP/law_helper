@@ -64,7 +64,10 @@ CREATE TABLE IF NOT EXISTS traces (
     duration_ms REAL,
     prompt_tokens INTEGER DEFAULT 0,
     completion_tokens INTEGER DEFAULT 0,
-    total_tokens INTEGER DEFAULT 0
+    total_tokens INTEGER DEFAULT 0,
+    llm_tokens INTEGER DEFAULT 0,
+    embedding_tokens INTEGER DEFAULT 0,
+    rerank_tokens INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS spans (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -89,6 +92,11 @@ def _init_db() -> None:
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(_TABLE_SQL)
+        # 迁移：为旧表添加新列（如果不存在）
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(traces)").fetchall()}
+        for col in ("llm_tokens", "embedding_tokens", "rerank_tokens"):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE traces ADD COLUMN {col} INTEGER DEFAULT 0")
         conn.commit()
     finally:
         conn.close()
@@ -116,14 +124,27 @@ def _emit(record: dict) -> None:
         f.write(line + "\n")
 
 
-def _add_tokens(trace_id: str, prompt: int | None, completion: int | None, total: int | None) -> None:
-    """把一次 LLM 调用的 token 累加到所属 trace 的汇总列。"""
+def _add_tokens(trace_id: str, event_name: str, prompt: int | None, completion: int | None, total: int | None) -> None:
+    """把一次模型调用的 token 累加到所属 trace 的汇总列。
+
+    根据 event_name 分流到 llm_tokens / embedding_tokens / rerank_tokens，
+    同时累加到 total_tokens（兼容旧逻辑）。
+    """
+    col_map = {
+        "llm.tokens": "llm_tokens",
+        "embedding.tokens": "embedding_tokens",
+        "rerank.tokens": "rerank_tokens",
+    }
+    col = col_map.get(event_name)
+    if col is None:
+        return
     with _LOCK:
         _db_execute(
-            "UPDATE traces SET prompt_tokens = prompt_tokens + ?, "
+            f"UPDATE traces SET {col} = {col} + ?, "
+            "prompt_tokens = prompt_tokens + ?, "
             "completion_tokens = completion_tokens + ?, total_tokens = total_tokens + ? "
             "WHERE trace_id = ?",
-            (prompt or 0, completion or 0, total or 0, trace_id),
+            (total or 0, prompt or 0, completion or 0, total or 0, trace_id),
         )
 
 
@@ -192,10 +213,11 @@ def event(name: str, **attrs) -> None:
     trace_id = _TRACE_ID.get()
     if trace_id is None:
         return
-    # llm.tokens 事件同时累加到 trace 的 token 汇总列，供 Dashboard 直接读数
-    if name == "llm.tokens":
+    # llm.tokens / embedding.tokens / rerank.tokens 事件累加到 trace 的分类汇总列
+    if name in ("llm.tokens", "embedding.tokens", "rerank.tokens"):
         _add_tokens(
             trace_id,
+            name,
             attrs.get("prompt_tokens"),
             attrs.get("completion_tokens"),
             attrs.get("total_tokens"),
@@ -281,7 +303,8 @@ def query_traces(limit: int = 200, offset: int = 0) -> dict:
     try:
         rows = conn.execute(
             "SELECT trace_id, kind, question, session_id, cache_hit, status, "
-            "started_at, duration_ms, prompt_tokens, completion_tokens, total_tokens "
+            "started_at, duration_ms, prompt_tokens, completion_tokens, total_tokens, "
+            "llm_tokens, embedding_tokens, rerank_tokens "
             "FROM traces ORDER BY started_at DESC LIMIT ? OFFSET ?",
             (limit, offset),
         ).fetchall()
@@ -306,6 +329,9 @@ def query_traces(limit: int = 200, offset: int = 0) -> dict:
             "prompt_tokens": r["prompt_tokens"] or 0,
             "completion_tokens": r["completion_tokens"] or 0,
             "total_tokens": r["total_tokens"] or 0,
+            "llm_tokens": r["llm_tokens"] or 0,
+            "embedding_tokens": r["embedding_tokens"] or 0,
+            "rerank_tokens": r["rerank_tokens"] or 0,
         }
         for r in rows
     ]

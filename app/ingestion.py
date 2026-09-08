@@ -19,6 +19,7 @@ from pathlib import Path
 from app.config import get_settings
 from app.embeddings import get_embedding_model
 from app.errors import DocumentNotFoundError, IngestionError
+from app.rerank import _classify_role
 from app.tracing import event, span
 
 # 章 / 节 / 条 标题识别
@@ -470,10 +471,11 @@ def parse_pdf(pdf_path) -> list[Article]:
 
 MANIFEST_FILENAME = "ingestion_manifest.db"
 
-# metadata schema 版本：每次扩展 ChromaDB metadata 字段时 bump 此值，
+# metadata schema 版本：每次扩展 ChromaDB metadata 字段或切换嵌入模型时 bump 此值，
 # _manifest_conn 检测到旧表 schema 不一致时会清空 manifest，强制全量重新导入，
-# 保证旧记录也能更新到新的 metadata 字段（基于 idempotent upsert，不会产生重复向量）。
-METADATA_SCHEMA_VERSION = 2
+# 保证旧记录也能更新到新的 metadata 字段或新嵌入模型向量（基于 idempotent upsert，不会产生重复向量）。
+# v4: 切换嵌入模型 qwen3.7-text-embedding(1024维) → BGE-base-zh-v1.5(768维)
+METADATA_SCHEMA_VERSION = 4
 
 
 _MANIFEST_SCHEMA = """
@@ -608,6 +610,9 @@ def _ingest_single_file(
             }
             for a in articles
         ]
+        # role 基于完整 metadata 判定，与 rerank.py 中 _classify_role 调用方式一致
+        for meta in metadatas:
+            meta["role"] = _classify_role(meta)
         ids = [_make_id(source, a.section_header, a.article_no) for a in articles]
         embeddings = embedding_model.embed_documents(documents)
         collection.upsert(
@@ -640,6 +645,50 @@ def ingest() -> IngestResult:
             "hnsw:M": 16,
         },
     )
+
+    # 维度检测：已有向量维度与当前模型不匹配时，删除旧集合重建。
+    # 场景：切换嵌入模型（如 qwen3.7-text-embedding 1024维 → BGE-base-zh-v1.5 768维）。
+    # 直接运行 python -m app.ingestion 时 main.py 的 preload 重建逻辑不会触发，
+    # 因此在此处显式检测，保证 CLI 直接导入也能自动处理维度变更。
+    existing = collection.get(include=["embeddings"])
+    existing_emb = existing.get("embeddings")
+    if existing_emb is not None and len(existing_emb) > 0:
+        actual_dim = len(existing_emb[0])
+        expected_dim = settings.embedding_dimensions
+        if actual_dim != expected_dim:
+            event(
+                "ingest.dim_mismatch",
+                stored_dim=actual_dim,
+                expected_dim=expected_dim,
+            )
+            client.delete_collection(name=COLLECTION_NAME)
+            collection = client.get_or_create_collection(
+                name=COLLECTION_NAME,
+                metadata={
+                    "hnsw:space": "cosine",
+                    "hnsw:construction_ef": 100,
+                    "hnsw:search_ef": 16,
+                    "hnsw:M": 16,
+                },
+            )
+            # 维度变更后必须清空 manifest，否则 manifest 记录的 schema 哈希
+            # 与当前文件一致，会误判为「无变化」而跳过重新嵌入，
+            # 导致旧维度向量残留、新模型未真正生效。
+            manifest_path = _manifest_path(settings.chroma_full_dir)
+            try:
+                manifest_path.unlink()
+            except FileNotFoundError:
+                pass
+    elif stale_manifest := _load_manifest(settings.chroma_full_dir):
+        # collection 已空但 manifest 仍记录历史 source 时，清空 manifest 强制全量重嵌。
+        # 场景：collection 被外部清空（手动删除目录 / 重建中途失败残留），
+        # 但 manifest 仍记录历史 source，会被识别为「未变化」而跳过，导致永远不重建。
+        event("ingest.stale_manifest_after_empty", sources=len(stale_manifest))
+        manifest_path = _manifest_path(settings.chroma_full_dir)
+        try:
+            manifest_path.unlink()
+        except FileNotFoundError:
+            pass
 
     manifest = _load_manifest(settings.chroma_full_dir)
     current_sources: dict[str, dict] = {}

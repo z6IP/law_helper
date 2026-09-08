@@ -6,7 +6,7 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # 项目根目录（app/ 的上一级）
@@ -44,13 +44,26 @@ class Settings(BaseSettings):
     # 若部署到多用户/网络环境，应设为 False，启用 session_ids 严格隔离。
     single_user_mode: bool = True
 
-    # Embedding / Rerank 模型（阿里云百炼 API）
+    # Embedding / Rerank 模型
+    # embedding_backend: "local" 使用本地 sentence-transformers 模型（零 token 消耗）
+    #                   "api"  使用阿里云百炼 API（消耗 token，作为兜底）
+    embedding_backend: str = "local"
+    # 本地嵌入模型名（sentence-transformers HuggingFace 模型 ID）
+    embedding_local_model: str = "BAAI/bge-base-zh-v1.5"
+    # API 模式嵌入模型（仅 embedding_backend=api 时使用）
     embedding_model_id: str = "qwen3.7-text-embedding"
     rerank_model_id: str = "qwen3.7-text-rerank"
-    # Embedding 向量维度（qwen3.7-text-embedding 支持 2560/2048/1536/1024/768/512/256，默认 1024）
-    embedding_dimensions: int = 1024
-    # DashScope API base（rerank 接口使用，区别于 OpenAI 兼容接口）
+    # Embedding 向量维度（BGE-base-zh-v1.5 固定 768；API 模式支持 2560/2048/1536/1024/768/512/256）
+    embedding_dimensions: int = 768
+    # DashScope API base（历史兼容，原 rerank 接口使用）
     dashscope_api_base: str = "https://dashscope.aliyuncs.com/api/v1"
+    # Rerank API 配置（阿里云百炼 DashScope 直连）
+    rerank_api_base: str = "https://dashscope.aliyuncs.com/api/v1"
+    rerank_api_key: str = ""  # 留空时自动回退到 openai_api_key（阿里云同一 key）
+    # rerank 接口子路径（拼接在 rerank_api_base 之后）
+    rerank_endpoint_path: str = "/services/rerank/text-rerank/text-rerank"
+    # rerank 请求格式：dashscope（嵌套 input/parameters）/ openai（扁平 query/documents/top_n）/ cloudflare（contexts + URL含模型名）
+    rerank_payload_format: str = "dashscope"
 
     # 多轮对话：参与历史改写的最大消息条数（3 轮 = 6 条）
     history_max_messages: int = Field(6, ge=0, le=20)
@@ -59,7 +72,14 @@ class Settings(BaseSettings):
     top_k_retrieve: int = Field(10, ge=1, le=50)
     bm25_weight: float = Field(0.5, ge=0.0, le=1.0)
     rrf_lambda: int = Field(60, ge=1)
-    rerank_top_n: int = Field(4, ge=1, le=10)
+    rerank_top_n: int = Field(5, ge=1, le=10)
+    # 多路检索：按 source 分路并行检索，保证跨法规召回覆盖
+    # 关闭时退回单路检索（兼容降级）
+    multi_route_enabled: bool = True
+    # 全局路召回数（无过滤，整体最相关法条）
+    top_k_global: int = Field(6, ge=1, le=50)
+    # 每个 source 分路召回数（保证每个法规都有候选进入重排）
+    top_k_per_source: int = Field(2, ge=1, le=10)
     # 重排相关性阈值：低于该分的候选视为不相关并丢弃，
     # 全部丢弃时由 LLM 简短拒答，不引用任何法条
     # 注意：此阈值基于 bge-reranker-v2-m3 标定，切换为 qwen3.7-text-rerank 后
@@ -82,6 +102,20 @@ class Settings(BaseSettings):
         if not v:
             raise ValueError("SESSION_SECRET_KEY 必须在 .env 中配置")
         return v
+
+    @model_validator(mode="after")
+    def _link_embedding_dimensions(self) -> "Settings":
+        """embedding_dimensions 与 backend 联动校验。
+
+        - local 模式：BGE-base-zh-v1.5 固定 768 维，配置不一致时报错防止误配
+        - api 模式：维度由用户根据模型规格设置（qwen3.7-text-embedding 默认 1024）
+        """
+        if self.embedding_backend == "local" and self.embedding_dimensions != 768:
+            raise ValueError(
+                f"embedding_backend=local 时 embedding_dimensions 必须为 768"
+                f"（BGE-base-zh-v1.5 固定维度），当前为 {self.embedding_dimensions}"
+            )
+        return self
 
     @property
     def cors_origins_list(self) -> list[str]:
