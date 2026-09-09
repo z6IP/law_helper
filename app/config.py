@@ -55,15 +55,6 @@ class Settings(BaseSettings):
     rerank_model_id: str = "qwen3.7-text-rerank"
     # Embedding 向量维度（BGE-base-zh-v1.5 固定 768；API 模式支持 2560/2048/1536/1024/768/512/256）
     embedding_dimensions: int = 768
-    # DashScope API base（历史兼容，原 rerank 接口使用）
-    dashscope_api_base: str = "https://dashscope.aliyuncs.com/api/v1"
-    # Rerank API 配置（阿里云百炼 DashScope 直连）
-    rerank_api_base: str = "https://dashscope.aliyuncs.com/api/v1"
-    rerank_api_key: str = ""  # 留空时自动回退到 openai_api_key（阿里云同一 key）
-    # rerank 接口子路径（拼接在 rerank_api_base 之后）
-    rerank_endpoint_path: str = "/services/rerank/text-rerank/text-rerank"
-    # rerank 请求格式：dashscope（嵌套 input/parameters）/ openai（扁平 query/documents/top_n）/ cloudflare（contexts + URL含模型名）
-    rerank_payload_format: str = "dashscope"
 
     # 多轮对话：参与历史改写的最大消息条数（3 轮 = 6 条）
     history_max_messages: int = Field(6, ge=0, le=20)

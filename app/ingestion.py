@@ -475,7 +475,8 @@ MANIFEST_FILENAME = "ingestion_manifest.db"
 # _manifest_conn 检测到旧表 schema 不一致时会清空 manifest，强制全量重新导入，
 # 保证旧记录也能更新到新的 metadata 字段或新嵌入模型向量（基于 idempotent upsert，不会产生重复向量）。
 # v4: 切换嵌入模型 qwen3.7-text-embedding(1024维) → BGE-base-zh-v1.5(768维)
-METADATA_SCHEMA_VERSION = 4
+# v5: 新增 category / 层级 / role 字段，切换回 API embedding (text-embedding-v3, 1024维)
+METADATA_SCHEMA_VERSION = 5
 
 
 _MANIFEST_SCHEMA = """

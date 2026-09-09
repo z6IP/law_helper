@@ -12,11 +12,34 @@ interface MessageListProps {
 
 export function MessageList({ messages, loading, restoring = false, thinkingLabel }: MessageListProps) {
   const bottomRef = useRef<HTMLDivElement>(null)
+  // 记录用户是否在底部附近：用户主动向上滚动后不再强制跳转到底部
+  const atBottomRef = useRef(true)
 
+  // 绑定滚动容器的 scroll 事件，实时更新 atBottomRef
   useEffect(() => {
-    // 图片预览打开时暂停自动滚动，避免流式输出干扰用户查看/关闭图片
+    const el = bottomRef.current
+    if (!el) return
+    const container = el.closest('.messages-area') as HTMLElement | null
+    if (!container) return
+
+    const onScroll = () => {
+      const distanceFromBottom =
+        container.scrollHeight - container.scrollTop - container.clientHeight
+      atBottomRef.current = distanceFromBottom < 80
+    }
+    container.addEventListener('scroll', onScroll, { passive: true })
+    onScroll() // 初始化一次
+
+    return () => container.removeEventListener('scroll', onScroll)
+  }, [messages.length])
+
+  // 新消息/流式输出到达时，仅当用户停留在底部附近才自动滚动；
+  // 用户已向上滚动查看历史时，绝不强制跳转，不阻碍用户操作
+  useEffect(() => {
     if (document.body.getAttribute('data-preview-open') === 'true') return
-    bottomRef.current?.scrollIntoView({ behavior: 'auto' })
+    if (atBottomRef.current) {
+      bottomRef.current?.scrollIntoView({ behavior: 'auto' })
+    }
   }, [messages, loading])
 
   if (messages.length === 0) {

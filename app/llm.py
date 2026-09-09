@@ -27,8 +27,13 @@ class BailianClient:
             base_url=settings.openai_api_base,
         )
 
-    def chat(self, system_prompt: str, user_prompt: str, temperature: float = 0.2) -> str:
-        """调用百炼生成回答，返回文本内容。temperature 可覆盖默认值（如查询改写用 0.0）。"""
+    def chat(self, system_prompt: str, user_prompt: str, temperature: float = 0.2, enable_thinking: bool = False) -> str:
+        """调用百炼生成回答，返回文本内容。temperature 可覆盖默认值（如查询改写用 0.0）。
+
+        非流式调用（含正式答案生成）默认关闭思考：思考过程只通过流式 chat_stream()
+        实时产出供前端展示；非流式路径无 reasoning 事件通道，开启思考会白白消耗
+        token 却无法让用户看到。如某场景确需思考，由调用方传 enable_thinking=True。
+        """
         self._ensure_loaded()
         settings = get_settings()
         try:
@@ -40,8 +45,7 @@ class BailianClient:
                         {"role": "user", "content": user_prompt},
                     ],
                     temperature=temperature,
-                    # qwen3 系列关闭思考输出（非流式调用不需要思考）；其他模型忽略该参数
-                    extra_body={"enable_thinking": False},
+                    extra_body={"enable_thinking": enable_thinking},
                 )
                 usage = getattr(resp, "usage", None)
                 if usage is not None:
@@ -62,6 +66,12 @@ class BailianClient:
         kind ∈ {"reasoning", "content"}：
         - reasoning：推理模型的思考过程（来自 delta.reasoning_content，普通模型为 None）
         - content：正文（来自 delta.content）
+
+        检索链构建方式：retrieval（BM25+向量 RRF 融合）→ rerank（CrossEncoder）→
+        角色调整后的法条原文作为 user_prompt 上下文注入；本方法只负责「调用模型思考过程
+        + 基于上下文生成答案」环节。enable_thinking 显式开启 qwen3.7-plus 的推理模式，
+        thinking_budget=2000 容纳完整法律推理链（行为定性→处罚依据→跨法规交集→匹配分析），
+        约 1000-1200 个汉字思考空间；思考过程通过 reasoning_content 流式产出供前端实时展示。
         """
         self._ensure_loaded()
         settings = get_settings()
@@ -75,6 +85,13 @@ class BailianClient:
                 temperature=0.2,
                 stream=True,
                 stream_options={"include_usage": True},
+                # qwen3.7-plus 是 hybrid 推理模型，必须显式启用 thinking 才能稳定产出
+                # reasoning_content；thinking_budget 限制思考 token 上限。
+                # 2000 token（约 1000-1200 汉字）足够完成法律推理链。
+                # 冗余思考（复述法条/草拟答案/检查约束）通过 system_prompt
+                # 【思考步骤】正向引导解决，不靠限制 token 强制截断。
+                # 思考 token 计入输出 token 计费。
+                extra_body={"enable_thinking": True, "thinking_budget": 2000},
             )
             usage = None
             with span("llm.chat_stream", model=settings.llm_model):

@@ -5,15 +5,67 @@ import re
 import time
 from functools import lru_cache
 
+import numpy as np
+
 from app.config import get_settings
 from app.errors import LawHelperError
 from app.llm import get_llm
-from app.query_expansion import hyde_embed, multi_query_rewrite
-from app.retrieval import get_retrieval_engine
+from app.query_expansion import expand_query, hyde_embed, multi_query_rewrite
+from app.retrieval import _tokenize, get_retrieval_engine
 from app.rerank import apply_role_adjustment, get_reranker
 from app.schemas import Reference
 from app.tracing import event, span
 from app.upload_retrieval import select_relevant_chunks
+
+
+def _ensure_expansion_hits(
+    expansions: list[str],
+    candidates: list[dict],
+    contexts: list[dict],
+    engine,
+) -> list[dict]:
+    """扩展查询关键条款保底：对每个扩展查询取 BM25 top2 条款，
+    如在 candidates 中但不在 contexts 中，强制加入 contexts。
+
+    解决 multi-款文章（如记分第十条 11 款）rerank 分数被长正文稀释，
+    关键条款未进入 top_n 的问题。最多追加 3 条，BM25 阈值 20。
+    追加后重新做角色排序，保证受保护条款仍在前。
+    """
+    if not expansions or engine._bm25 is None:
+        return contexts
+
+    EXPANSION_ENSURE_QUOTA = 3
+    EXPANSION_ENSURE_MIN_BM25 = 20.0
+    existing_ids = {c.get("id") for c in contexts}
+    ensured = 0
+    for exp_q in expansions:
+        if ensured >= EXPANSION_ENSURE_QUOTA:
+            break
+        bm25_scores = np.asarray(engine._bm25.get_scores(_tokenize(exp_q)))
+        top_indices = np.argsort(-bm25_scores)[:2]
+        for top_idx in top_indices:
+            if ensured >= EXPANSION_ENSURE_QUOTA:
+                break
+            top_idx = int(top_idx)
+            if float(bm25_scores[top_idx]) < EXPANSION_ENSURE_MIN_BM25:
+                continue
+            did = engine._ids[top_idx]
+            if did in existing_ids:
+                continue
+            for c in candidates:
+                if c.get("id") == did:
+                    contexts.append(c)
+                    existing_ids.add(did)
+                    ensured += 1
+                    event(
+                        "qa.expansion_ensure",
+                        source=c.get("metadata", {}).get("source", ""),
+                        article_no=c.get("metadata", {}).get("article_no", ""),
+                    )
+                    break
+    if ensured:
+        contexts = apply_role_adjustment(contexts)
+    return contexts
 
 
 @lru_cache(maxsize=1)
@@ -27,59 +79,61 @@ def _system_prompt() -> str:
     return (
         "你是「小Z」，一名熟悉中国法律法规的智能法律助手。"
         f"你能就以下法律法规回答问题：{law_list}。"
-        "系统会为你检索并提供与用户问题相关的法条原文供你参考，"
-        "这些法条并非用户提供，而是系统根据问题自动检索得到的。"
-        "请严格依据提供给你的法条原文回答问题，不要编造法条内容。\n"
-        "【回答结构】遵循「结论先行 + 法条支撑 + 实操建议」结构：\n"
-        "1. 先用 1-2 句话直接给出结论或实质性回答（不要先堆砌法条）；\n"
-        "2. 在结论中或结论后引用必要法条作为依据（指出条号），但不要整段照抄原文；\n"
-        "3. 针对用户实际场景给出可操作的建议、注意事项或后续步骤（如该怎么办、需准备什么、"
-        "可能的法律后果、如何维权、如何避免风险等）。\n"
-        "禁止只罗列法条原文而不给结论和建议。法条原文是支撑，不是回答本身。"
-        "如果提供的法条不足以回答，请明确说明依据不足，并给出合理的指引。"
-        "如果用户问题明显与上述法律法规无关，请直接说明你只能回答上述法律法规相关的问题，"
-        "不要引用任何法条原文，也不要编造法条。"
-        "【定义性条款运用】当检索结果中包含定义性/种类性条款"
-        "（如《治安管理处罚法》第十条明确将行政拘留列为法定处罚种类之一）时，"
-        "应在分析处罚性质、拘留依据等问题时主动引用，"
-        "用以说明该处罚属于法定种类的哪一类、是否需有具体法律授权等关键判断。"
-        "不要因为定义性条款不直接描述行为就忽略它——"
-        "它往往是判断处罚合法性、程序正当性的根本依据。\n"
-        "【表述规范】回答中涉及法条来源时，"
-        "请统一使用「系统检索到的法条」「根据检索到的法条」，"
-        f"或根据检索到的法条来源直接说「根据《xxx》」等（如「根据{law_list}」），"
-        "绝对不要出现「你提供的法条」「用户提供的法条」等表述。"
-        "回答中用「你」指代提问的用户即可。\n"
-        "【法治原则】恪守「法无禁止即可为，法无授权即禁止」，二者方向相反不可混用：\n"
-        "1. 私权利（民事主体依法享有的以保障个人需求为核心的人格权、财产权等合法权益）"
-        "适用「法无禁止即可为」——法律未明文禁止的行为即属可自由行使的权利；\n"
-        "2. 公权力（国家机关及公职人员管理公共事务的法定职权，广义涵盖人大、政协、"
-        "一府两院等所有行使国家权力的机关）适用「法无授权即禁止」"
-        "——必须有法律明确授权方可为之，无授权则不得剥夺或限制公民权利。\n"
-        "二者相辅相成：公民可大胆运用权利，亦可监督政府；政府须谨慎用权，并尊重公民每一项权利。\n"
-        "判断时必须先分清讨论对象是私权利还是公权力，再适用对应原则，严禁倒置——"
-        "不得对私权利要求「须有授权方可为」，亦不得对公权力放任「未禁止即可为」。\n"
-        "据此，当检索到的法条未明文禁止某行为时，不得以「地方规定可能禁止」「现场可能有禁令」"
-        "等模糊表述稀释公民权利；要禁止某行为或限制某权利，必须能指出明确的上位法依据。\n"
-        "【法律分析方法论】当用户询问「某行为是否合法」「处罚是否正确」「法律依据是否错位」"
-        "等定性问题时，必须按以下三步框架分析，严禁跳步或发散：\n"
-        "第一步【行为定性】：先判断用户描述的行为本身在法律上是什么性质——是合法行为、"
-        "违法行为还是禁止行为？依据哪部法律的哪一条？该条是明文禁止、"
-        "有条件允许、还是完全未提及？如果法律完全未提及该行为，"
-        "或反向承认该行为可做（如限速条款实质承认可通行），则行为本身不违法。\n"
-        "第二步【处罚依据】：处罚决定援引的是哪部法律的哪一条？"
-        "该条规定的处罚种类是什么（罚款、拘留、吊销等）？该条是否明确针对用户描述的行为？"
-        "如果处罚条款针对的行为与用户描述的行为不匹配，则存在法律依据错位。\n"
-        "第三步【错位分析】：行为定性与处罚依据是否匹配？"
-        "是否出现「把A法范畴的行为用B法处罚」「把合法行为当违法行为处罚」"
-        "「把此违法当彼违法处罚」等错位？错位即违法——公权力必须严格依法，"
-        "法无授权即禁止，法律依据错位等于没有法律依据。\n"
-        "严禁发散到用户未提及的场景。如果用户问的是「上高速被拘留」，"
-        "不要发散到「事故处理」「赔偿调解」「责任认定」等用户未提及的事项；"
-        "只聚焦于「上高速这个行为是否违法」和「拘留依据是否匹配」两个核心问题。\n"
-        "【思考语言】你的内部思考/推理过程（reasoning）必须全程使用中文，"
-        "包括语义解析、知识激活、逻辑拆解、因果推演、候选对比、安全校验等所有环节，"
-        "不要使用英文，确保用户展开思考时看到的是完整中文。"
+        "系统会根据用户问题自动检索相关法条原文并提供给你，"
+        "请严格依据检索到的法条回答，不要编造法条内容。\n"
+        "【回答结构】遵循「结论先行 + 法条支撑 + 实操建议」：\n"
+        "1. 结论：针对用户问题给出明确、中肯的判断和态度（如是否合法、可能涉及哪些情形、核心结论是什么），"
+        "不是单纯罗列法条处罚。结论中应包含核心处罚内容（罚款数额、记分、拘留天数等具体后果），"
+        "但处罚内容是支撑判断的依据，不能替代判断本身。不要把处罚数额挪到实操建议里；\n"
+        "2. 法条支撑：只写处罚依据（条号+简述处罚内容），不写「行为定性」「匹配分析」等标签；\n"
+        "3. 实操建议：给出可操作的建议或后续步骤，不要重复结论中已给出的罚款数额。\n"
+        "结论必须涵盖问题的全部情形——当同一行为因主体不同（机动车/非机动车/行人）"
+        "或情节不同而适用不同法条时，必须分情形分别说明，不得遗漏。"
+        "但当多个主体处罚完全相同时（如行人与非机动车驾驶人同适用第八十九条），"
+        "应合并为一条写，不要重复列示相同处罚。\n"
+        "【依据不足】当检索到的法条不足以回答时，逐条分析每条法条与问题的关系"
+        "（直接适用/间接相关/不相关及原因），再说明依据不足并指引应查询哪部法。\n"
+        "【定义性条款】检索结果中的定义性/种类性条款（如处罚种类定义）"
+        "是判断处罚合法性的根本依据，应在分析处罚性质时主动引用。\n"
+        "【法治原则】恪守「法无禁止即可为，法无授权即禁止」："
+        "对私权利（公民/驾驶人）适用「法无禁止即可为」——法律没有禁止的行为，公民有权为之，"
+        "行政机关不得处罚；对公权力（公安机关）适用「法无授权即禁止」——"
+        "行政机关必须有明确的法律授权才能实施处罚，尤其是行政拘留这类限制人身自由的处罚。"
+        "两者相辅相成，不可倒置。"
+        "当问题涉及处罚合法性判断（如「XX被拘留/罚款是否合法」「怎么看XX被处罚」）时，"
+        "必须在结论中同时运用原则的两侧进行分析："
+        "先从私权利侧指出「法无禁止即可为」——若检索到的法条未明确禁止该行为，"
+        "则公民有权为之，行政机关不得以此为由处罚；"
+        "再从公权力侧指出「法无授权即禁止」——行政机关必须有明确的法律授权才能实施处罚，"
+        "尤其是行政拘留这类限制人身自由的处罚，法无明文规定不得拘留。\n"
+        "【法律分析】思考时按三步推理：行为定性→处罚依据（法条含多款/项时精确到款/项）→"
+        "匹配分析（行为与处罚是否对应）。"
+        "当检索到同一法条的多款/项时，必须逐一评估每款/项与用户行为的关系，"
+        "引用所有相关的款/项，不得只选一款而忽略其他相关款/项。"
+        "引用某项时，必须核对该项描述的行为主体/对象与用户描述是否一致，不得张冠李戴："
+        "例如《治安管理处罚法》第七十六条第（一）项是「偷开他人机动车」，"
+        "第（二）项是「偷开他人航空器、机动船舶」，摩托车属于机动车，"
+        "偷开摩托车只能适用第（一）项，不能引用第（二）项。"
+        "示例：摩托车冲卡闯入高速公路收费站→可能同时适用《治安管理处罚法》第二十六条"
+        "第（一）项（扰乱企业、事业单位秩序，收费站运营单位属于企业事业单位）"
+        "和第（四）项（非法拦截或者强登、扒乘机动车），应分别说明。"
+        "引用某法条时若其他法规对其适用有交集性限制应一并说明。"
+        "检索到的法条凡与问题相关的，都应在「法条支撑」中引用，不得遗漏。"
+        "但答案中只输出处罚依据，不输出「行为定性」「匹配分析」标签。"
+        "只聚焦用户描述的行为和检索到的法条，严禁发散到未提及的场景。\n"
+        "【思考方式】思考是推理过程，不是答案草稿。禁止以下行为：\n"
+        "- 复述检索到的法条原文（你已能看到 context，不要抄）\n"
+        "- 草拟答案文本（不要写「草拟结论：」「草拟法条支撑：」等）\n"
+        "- 检查约束条件（不要写「检查约束：结论先行：有」等）\n"
+        "- 多轮循环（不要调整→整合→检查→再检查）\n"
+        "正确方式：用精炼的分析语言记录推理，每步 1-2 句话：\n"
+        "1. 行为定性（法律性质）\n"
+        "2. 法条匹配（哪条适用，精确到款）\n"
+        "3. 分情形（主体/情节不同时分别列出）\n"
+        "推理完成即可输出答案。\n"
+        "【表述】法条来源用「根据检索到的法条」或「根据《xxx》」，"
+        "不要出现「你提供的法条」等表述。用「你」指代用户。\n"
+        "【思考语言】内部思考（reasoning）全程使用中文。"
     )
 
 
@@ -313,7 +367,14 @@ def answer(question: str, history: list[dict] | None = None, document_text: str 
     # 改写查询仅用于检索，不进入最终 context；失败时回退到原问题单路检索。
     with span("multi_query_rewrite"):
         rewrites = multi_query_rewrite(resolved)
-    retrieval_queries = [resolved] + rewrites
+    # 关键词注入兜底：对触发词命中的查询（如"闯红灯"）注入法条术语，
+    # 解决 BM25 与法条正文无词项交集导致的召回失败（闯红灯→道交法第九十条）。
+    # 扩展查询放在 rewrites 之前：让它优先享受 retrieval.py REWRITE_QUOTA 配额，
+    # 避免 LLM 改写查询占满 3 条配额后扩展查询的关键条款被挤出候选池。
+    # expand_query 可能返回多条扩展（闯红灯命中道交法90条+记分办法10条+道交法62条），
+    # 每条精确命中一个法条，避免单条扩展关键词被长正文条款稀释。
+    expansions = expand_query(resolved)
+    retrieval_queries = [resolved] + expansions + rewrites
     # HyDE：LLM 生成假设性法律回答 → 嵌入向量 → 参与向量检索融合。
     # 合规：假设性文档文本绝不进入最终 context，仅用其向量做检索；
     # 失败时返回 None，跳过 HyDE 路径，行为退化为 P0。
@@ -338,6 +399,9 @@ def answer(question: str, history: list[dict] | None = None, document_text: str 
     # 规则法（基于 section_header），不调 LLM；只调整排序，不删除任何法条
     with span("role_adjustment"):
         contexts = apply_role_adjustment(contexts)
+
+    # 扩展查询关键条款保底：见 _ensure_expansion_hits 文档字符串
+    contexts = _ensure_expansion_hits(expansions, candidates, contexts, engine)
 
     # 无相关法条：不附带任何引用，由 LLM 简短拒答
     if not contexts:
@@ -443,7 +507,14 @@ def answer_stream(question: str, history: list[dict] | None = None, document_tex
     # 改写查询仅用于检索，不进入最终 context；失败时回退到原问题单路检索。
     with span("multi_query_rewrite"):
         rewrites = multi_query_rewrite(resolved)
-    retrieval_queries = [resolved] + rewrites
+    # 关键词注入兜底：对触发词命中的查询（如"闯红灯"）注入法条术语，
+    # 解决 BM25 与法条正文无词项交集导致的召回失败（闯红灯→道交法第九十条）。
+    # 扩展查询放在 rewrites 之前：让它优先享受 retrieval.py REWRITE_QUOTA 配额，
+    # 避免 LLM 改写查询占满 3 条配额后扩展查询的关键条款被挤出候选池。
+    # expand_query 可能返回多条扩展（闯红灯命中道交法90条+记分办法10条+道交法62条），
+    # 每条精确命中一个法条，避免单条扩展关键词被长正文条款稀释。
+    expansions = expand_query(resolved)
+    retrieval_queries = [resolved] + expansions + rewrites
     # HyDE：LLM 生成假设性法律回答 → 嵌入向量 → 参与向量检索融合。
     # 合规：假设性文档文本绝不进入最终 context，仅用其向量做检索；
     # 失败时返回 None，跳过 HyDE 路径，行为退化为 P0。
@@ -471,6 +542,9 @@ def answer_stream(question: str, history: list[dict] | None = None, document_tex
     # 规则法（基于 section_header），不调 LLM；只调整排序，不删除任何法条
     with span("role_adjustment"):
         contexts = apply_role_adjustment(contexts)
+
+    # 扩展查询关键条款保底：见 _ensure_expansion_hits 文档字符串
+    contexts = _ensure_expansion_hits(expansions, candidates, contexts, engine)
 
     references = [
         Reference.model_validate({

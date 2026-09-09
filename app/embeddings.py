@@ -20,8 +20,10 @@ from app.tracing import event, span
 class EmbeddingModel:
     """嵌入模型封装（懒加载单例，支持本地/API 双模式）。"""
 
-    # API 模式：百炼 embedding API 单次请求最大行数（qwen3.7-text-embedding 为 20）
-    _BATCH_SIZE = 20
+    # API 模式：百炼 embedding API 单次请求最大行数。
+    # text-embedding-v3 / v4 为 10，qwen3.7-text-embedding 为 20。
+    # 取 10 作为安全下限，兼容所有模型，避免切换模型时触发 400 错误。
+    _BATCH_SIZE = 10
 
     def __init__(self) -> None:
         self._client = None
