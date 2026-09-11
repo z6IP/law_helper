@@ -567,6 +567,7 @@ body {
 }
 
 .message-assistant-content {
+  width: 100%;
   max-width: 100%;
   color: var(--text);
 }
@@ -602,7 +603,24 @@ body {
 /* ===== Markdown ===== */
 .markdown-body {
   text-align: left;
+  font-size: 16px;
   line-height: 1.7;
+}
+
+.markdown-body h2 {
+  margin: 1.15em 0 0.4em;
+  font-size: 22px;
+  line-height: 1.4;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.markdown-body h2:first-child {
+  margin-top: 0;
+}
+
+.markdown-body h2 + p {
+  margin-top: 0;
 }
 
 .markdown-body p {
@@ -645,6 +663,7 @@ body {
 
 /* ===== 思考过程 ===== */
 .reasoning-block {
+  width: 100%;
   margin-bottom: 8px;
 }
 
@@ -678,6 +697,7 @@ body {
 }
 
 .reasoning-body {
+  width: 100%;
   padding: 10px 12px;
   margin-top: 4px;
   background: var(--bg-secondary);

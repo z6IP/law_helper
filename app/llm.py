@@ -5,6 +5,7 @@ from functools import lru_cache
 
 from app.config import get_settings
 from app.errors import LLMError
+from app.prompt_loader import render_prompt
 from app.tracing import event, span
 
 
@@ -27,8 +28,8 @@ class BailianClient:
             base_url=settings.openai_api_base,
         )
 
-    def chat(self, system_prompt: str, user_prompt: str, temperature: float = 0.2, enable_thinking: bool = False) -> str:
-        """调用百炼生成回答，返回文本内容。temperature 可覆盖默认值（如查询改写用 0.0）。
+    def chat(self, system_prompt: str, user_prompt: str, temperature: float | None = None, enable_thinking: bool | None = None) -> str:
+        """调用百炼生成回答，返回文本内容；未显式传入时使用 Settings 策略。
 
         非流式调用（含正式答案生成）默认关闭思考：思考过程只通过流式 chat_stream()
         实时产出供前端展示；非流式路径无 reasoning 事件通道，开启思考会白白消耗
@@ -36,6 +37,8 @@ class BailianClient:
         """
         self._ensure_loaded()
         settings = get_settings()
+        temperature = settings.answer_temperature if temperature is None else temperature
+        enable_thinking = False if enable_thinking is None else enable_thinking
         try:
             with span("llm.chat", model=settings.llm_model, temperature=temperature):
                 resp = self._client.chat.completions.create(
@@ -69,9 +72,8 @@ class BailianClient:
 
         检索链构建方式：retrieval（BM25+向量 RRF 融合）→ rerank（CrossEncoder）→
         角色调整后的法条原文作为 user_prompt 上下文注入；本方法只负责「调用模型思考过程
-        + 基于上下文生成答案」环节。enable_thinking 显式开启 qwen3.7-plus 的推理模式，
-        thinking_budget=2000 容纳完整法律推理链（行为定性→处罚依据→跨法规交集→匹配分析），
-        约 1000-1200 个汉字思考空间；思考过程通过 reasoning_content 流式产出供前端实时展示。
+        + 基于上下文生成答案」环节。思考开关和预算由 Settings 控制，
+        思考过程通过 reasoning_content 流式产出供前端实时展示。
         """
         self._ensure_loaded()
         settings = get_settings()
@@ -82,16 +84,13 @@ class BailianClient:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                temperature=0.2,
+                temperature=settings.answer_temperature,
                 stream=True,
                 stream_options={"include_usage": True},
-                # qwen3.7-plus 是 hybrid 推理模型，必须显式启用 thinking 才能稳定产出
-                # reasoning_content；thinking_budget 限制思考 token 上限。
-                # 2000 token（约 1000-1200 汉字）足够完成法律推理链。
-                # 冗余思考（复述法条/草拟答案/检查约束）通过 system_prompt
-                # 【思考步骤】正向引导解决，不靠限制 token 强制截断。
-                # 思考 token 计入输出 token 计费。
-                extra_body={"enable_thinking": True, "thinking_budget": 2000},
+                extra_body={
+                    "enable_thinking": settings.thinking_enabled,
+                    "thinking_budget": settings.thinking_budget,
+                },
             )
             usage = None
             with span("llm.chat_stream", model=settings.llm_model):
@@ -132,11 +131,7 @@ class BailianClient:
         settings = get_settings()
         if not base64_images:
             return ""
-        default_prompt = (
-            "请准确识别图片中的文字，按原始排版输出。"
-            "保留章节标题（如'1 范围'）和条款编号（如'3.1'、'5.2.1'）的格式，每个逻辑行单独一行。"
-            "表格请转换为'列名1 | 列名2 | ...'的文本格式，不要添加多余解释。"
-        )
+        default_prompt = render_prompt("ocr_default")
         user_content: list[dict] = [{"type": "text", "text": prompt or default_prompt}]
         for b64 in base64_images:
             user_content.append(
@@ -150,7 +145,7 @@ class BailianClient:
                 resp = self._client.chat.completions.create(
                     model=settings.ocr_model,
                     messages=[{"role": "user", "content": user_content}],
-                    temperature=0.1,
+                    temperature=settings.ocr_temperature,
                     extra_body={"enable_thinking": False},
                 )
                 usage = getattr(resp, "usage", None)

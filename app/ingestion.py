@@ -1,7 +1,7 @@
 """文档解析与向量化入库。
 
 将《中华人民共和国道路交通安全法》docx 按「章 / 节 / 条」结构化解析，
-每条法条作为一个 chunk 写入 ChromaDB。
+每条法条作为父 chunk 写入 ChromaDB；含多个分款的法条同时生成款项子 chunk。
 
 工程约束：
 - 每个 chunk 的 metadata 记录 section_header（章/节标题）与 article_no（条号）；
@@ -20,6 +20,7 @@ from app.config import get_settings
 from app.embeddings import get_embedding_model
 from app.errors import DocumentNotFoundError, IngestionError
 from app.rerank import _classify_role
+from app.policy import get_policy
 from app.tracing import event, span
 
 # 章 / 节 / 条 标题识别
@@ -28,6 +29,12 @@ SECTION_RE = re.compile(r"^第([零一二三四五六七八九十百千]+)节\s*
 # ARTICLE_RE 同时识别「第X条」与「第X条之Y」修正案条款（如刑法第一百二十条之一）
 # group(1): 条号主体，group(2): 之Y 后缀（可空）
 ARTICLE_RE = re.compile(r"^第([零一二三四五六七八九十百千]+)条(之[零一二三四五六七八九十百千]+)?")
+# 常见中文分款格式：（一）、（二）、(一)、一、
+CLAUSE_RE = re.compile(
+    r"(?m)^(?:（([一二三四五六七八九十百千万]+)）|"
+    r"\(([一二三四五六七八九十百千万]+)\)|"
+    r"([一二三四五六七八九十百千万]+)、)\s*"
+)
 
 COLLECTION_NAME = "road_traffic_law"
 
@@ -53,18 +60,14 @@ def _category_from_path(path: Path) -> str:
     parent = path.parent
     # statute/子文件夹/文件.docx → parent.name 即子文件夹名
     # 兼容 statute/根目录/文件.docx 的情况，返回空字符串
-    if parent.name in ("基础法律依据", "事故处理赔偿", "行政处罚程序"):
-        return parent.name
-    return ""
+    if parent.name == "statute":
+        return ""
+    return parent.name
 
 
 # 上位法 / 下位法 / 补充 规则
-_HIERARCHY_RULES = {
-    "基础法律依据": "上位法",
-    "事故处理赔偿": "下位法",
-    "行政处罚程序": "下位法",
-}
-_SUPPLEMENT_SOURCE = "中华人民共和国道路交通安全法实施条例"
+_HIERARCHY_RULES = get_policy()["retrieval"]["category_hierarchy"]
+_SUPPLEMENT_SOURCES = set(get_policy()["retrieval"]["supplement_sources"])
 
 
 def _hierarchy_from_path(path: Path, source: str) -> str:
@@ -74,7 +77,7 @@ def _hierarchy_from_path(path: Path, source: str) -> str:
     - 事故处理赔偿 / 行政处罚程序 → 下位法
     - 中华人民共和国道路交通安全法实施条例 → 补充（即便位于基础法律依据中也作为补充）
     """
-    if source == _SUPPLEMENT_SOURCE:
+    if source in _SUPPLEMENT_SOURCES:
         return "补充"
     category = _category_from_path(path)
     return _HIERARCHY_RULES.get(category, "")
@@ -86,6 +89,53 @@ class Article:
     section_header: str
     text: str
     source: str = ""
+    penalty_context: str = ""
+
+
+def _split_clauses(article: Article) -> list[Article]:
+    """保留完整父条文，并为至少两款的条文生成款项子块。"""
+    matches = list(CLAUSE_RE.finditer(article.text))
+    if len(matches) < 2:
+        return [article]
+
+    # 提取父条中第一个款项标记前的处罚前置句（如"有下列行为之一的，处五日以上
+    # 十日以下拘留……："），作为所有子款共享的处罚上下文。子款正文往往只含行为
+    # 描述、不含处罚词（如"拘留"），导致下游受保护召回按处罚词过滤时误删正确子款；
+    # 通过 penalty_context 让子款携带父条处罚信息，保证被正确召回与配额保障。
+    penalty_context = article.text[:matches[0].start()].strip()
+
+    chunks = [article]
+    for index, match in enumerate(matches):
+        start = match.start()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(article.text)
+        text = article.text[start:end].strip()
+        if not text:
+            continue
+        clause_no = next(group for group in match.groups() if group is not None)
+        chunks.append(
+            Article(
+                article_no=f"{article.article_no}第{clause_no}款",
+                section_header=article.section_header,
+                text=text,
+                source=article.source,
+                penalty_context=penalty_context,
+            )
+        )
+    return chunks
+
+
+def _expand_article_chunks(articles: list[Article]) -> list[Article]:
+    """构建父条文 + 款项子块索引，降低长条文整体向量的信息稀释。"""
+    return [chunk for article in articles for chunk in _split_clauses(article)]
+
+
+def _parent_article_no(article_no: str) -> str:
+    """从款项子块条号中提取父条号。"""
+    match = re.match(
+        r"^(第[零一二三四五六七八九十百千]+条(?:之[零一二三四五六七八九十百千]+)?)",
+        article_no,
+    )
+    return match.group(1) if match else article_no
 
 
 @dataclass
@@ -114,7 +164,6 @@ class ParserState:
         self.current = Article(
             article_no=article_no, section_header=self.section_header, text=""
         )
-
     def append_text(self, text: str) -> None:
         if self.current is None:
             return
@@ -475,14 +524,18 @@ MANIFEST_FILENAME = "ingestion_manifest.db"
 # _manifest_conn 检测到旧表 schema 不一致时会清空 manifest，强制全量重新导入，
 # 保证旧记录也能更新到新的 metadata 字段或新嵌入模型向量（基于 idempotent upsert，不会产生重复向量）。
 # v4: 切换嵌入模型 qwen3.7-text-embedding(1024维) → BGE-base-zh-v1.5(768维)
-# v5: 新增 category / 层级 / role 字段，切换回 API embedding (text-embedding-v3, 1024维)
-METADATA_SCHEMA_VERSION = 5
+# v6: 增加法条父块/款项子块 metadata
+# v7: 子款继承父条处罚上下文 penalty_context
+METADATA_SCHEMA_VERSION = 7
 
 
+# file_hash 不设 UNIQUE：允许同一文档内容出现在多个分类子文件夹（不同 source）。
+# 注意：旧库已带 UNIQUE 约束，升级时需删除 manifest 文件触发全量重建
+# （幂等 upsert，不会产生重复向量）。
 _MANIFEST_SCHEMA = """
 CREATE TABLE IF NOT EXISTS ingestion_manifest (
     source                  TEXT PRIMARY KEY,
-    file_hash               TEXT NOT NULL UNIQUE,
+    file_hash               TEXT NOT NULL,
     article_count           INTEGER NOT NULL DEFAULT 0,
     metadata_schema_version INTEGER NOT NULL DEFAULT 1
 )
@@ -504,6 +557,27 @@ class IngestResult:
 def _make_id(source: str, section_header: str, article_no: str) -> str:
     raw = f"{source}|{section_header}|{article_no}".encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
+
+
+def _make_unique_ids(articles: list[Article], source: str) -> list[str]:
+    """为解析结果生成唯一稳定 ID，兼容偶发的重复条号。"""
+    ids: list[str] = []
+    seen: set[str] = set()
+    for article in articles:
+        base_id = _make_id(source, article.section_header, article.article_no)
+        article_id = base_id
+        if article_id in seen:
+            text_digest = hashlib.sha256(article.text.encode("utf-8")).hexdigest()[:12]
+            article_id = _make_id(
+                source,
+                article.section_header,
+                f"{article.article_no}|{text_digest}",
+            )
+        while article_id in seen:
+            article_id = hashlib.sha256(f"{article_id}|{len(ids)}".encode("utf-8")).hexdigest()
+        seen.add(article_id)
+        ids.append(article_id)
+    return ids
 
 
 def _compute_file_hash(path: Path) -> str:
@@ -534,6 +608,16 @@ def _manifest_conn(chroma_dir: Path):
         col_names = {row[1] for row in cols}
         if col_names and "metadata_schema_version" not in col_names:
             conn.execute("DROP TABLE ingestion_manifest")
+        elif col_names:
+            # 旧 schema 的 file_hash 带 UNIQUE 约束：同一内容多副本会触发 IntegrityError。
+            # CREATE TABLE IF NOT EXISTS 不会改动已存在的表，需显式检测并重建
+            # （manifest 仅为缓存，重建后触发全量重导，幂等 upsert 不会产生重复向量）。
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='table' AND name='ingestion_manifest'"
+            ).fetchone()
+            if row and "file_hash" in (row[0] or "") and "UNIQUE" in (row[0] or ""):
+                conn.execute("DROP TABLE ingestion_manifest")
     except sqlite3.OperationalError:
         pass
     conn.execute(_MANIFEST_SCHEMA)
@@ -600,21 +684,25 @@ def _ingest_single_file(
         if not articles:
             raise IngestionError(f"未从文档中解析到任何内容：{path.name}")
 
+        articles = _expand_article_chunks(articles)
         documents = [a.text for a in articles]
         metadatas = [
             {
                 "article_no": a.article_no,
+                "parent_article_no": _parent_article_no(a.article_no),
+                "chunk_type": "clause" if a.article_no != _parent_article_no(a.article_no) else "article",
                 "section_header": a.section_header,
                 "source": source,
                 "category": category,
                 "层级": hierarchy,
+                "penalty_context": a.penalty_context,
             }
             for a in articles
         ]
         # role 基于完整 metadata 判定，与 rerank.py 中 _classify_role 调用方式一致
         for meta in metadatas:
             meta["role"] = _classify_role(meta)
-        ids = [_make_id(source, a.section_header, a.article_no) for a in articles]
+        ids = _make_unique_ids(articles, source)
         embeddings = embedding_model.embed_documents(documents)
         collection.upsert(
             ids=ids, documents=documents, metadatas=metadatas, embeddings=embeddings
@@ -641,9 +729,9 @@ def ingest() -> IngestResult:
         name=COLLECTION_NAME,
         metadata={
             "hnsw:space": "cosine",
-            "hnsw:construction_ef": 100,
-            "hnsw:search_ef": 16,
-            "hnsw:M": 16,
+            "hnsw:construction_ef": settings.hnsw_construction_ef,
+            "hnsw:search_ef": settings.hnsw_search_ef,
+            "hnsw:M": settings.hnsw_M,
         },
     )
 
@@ -667,9 +755,9 @@ def ingest() -> IngestResult:
                 name=COLLECTION_NAME,
                 metadata={
                     "hnsw:space": "cosine",
-                    "hnsw:construction_ef": 100,
-                    "hnsw:search_ef": 16,
-                    "hnsw:M": 16,
+                    "hnsw:construction_ef": settings.hnsw_construction_ef,
+                    "hnsw:search_ef": settings.hnsw_search_ef,
+                    "hnsw:M": settings.hnsw_M,
                 },
             )
             # 维度变更后必须清空 manifest，否则 manifest 记录的 schema 哈希

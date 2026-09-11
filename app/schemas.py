@@ -30,6 +30,16 @@ class Attachment(_BaseSchema):
 
 class ChatRequest(_BaseSchema):
     question: str = Field(..., description="用户提问")
+    law_source: str | None = Field(
+        None,
+        min_length=1,
+        description="限定回答依据的法规名称；为空时检索全部法规",
+    )
+    article_no: str | None = Field(
+        None,
+        min_length=1,
+        description="限定回答依据的条号，如“第九十一条”；为空时使用该法规全部条文",
+    )
     session_id: str | None = Field(
         None,
         description="当前会话 ID，用于权限校验和按会话限流",
@@ -59,10 +69,11 @@ class ChatRequest(_BaseSchema):
 
 
 class Reference(_BaseSchema):
-    source: str = Field("", description="法条来源文档名称")
+    source: str = Field("", description="法条来源文档全称")
     article_no: str = Field(..., min_length=1, description="条号，如“第九十一条”")
     section_header: str = Field("", description="所属章/节标题")
-    text: str = Field(..., min_length=1, description="法条原文")
+    text: str = Field(..., min_length=1, description="法条原文；同条多款合并后保留款标识")
+    merged_from: list[str] = Field(default_factory=list, description="合并来源的 chunk id 列表")
 
     @field_validator("article_no", "text", mode="after")
     @classmethod

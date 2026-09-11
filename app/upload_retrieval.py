@@ -11,6 +11,7 @@ import numpy as np
 
 from app.embeddings import get_embedding_model
 from app.rerank import get_reranker
+from app.policy import get_policy
 from app.tracing import event, span
 
 # 材料短于此字数直接全文注入，避免切块/嵌入开销
@@ -20,7 +21,7 @@ _CHUNK_TARGET = 400
 _CHUNK_MAX = 600
 # 粗排 top_k 与精排 top_n
 _COARSE_K = 8
-DOC_TOP_N = 3
+DOC_TOP_N = get_policy()["retrieval"]["upload_doc_top_n"]
 
 
 def split_chunks(text: str) -> list[str]:
@@ -111,7 +112,11 @@ def select_relevant_chunks(question: str, document_text: str) -> list[str] | Non
         coarse_candidates = [chunks[i] for i in coarse_indices]
 
         # 2) Reranker 精排，不设 min_score
-        candidates = [{"text": c} for c in coarse_candidates]
+        # 为候选补充稳定 id，保证 rerank 内部 _all_scored 与 top_ids 键一致，
+        # 避免无 id 候选在配额回退时被重复插入
+        candidates = [
+            {"id": f"chunk-{i}", "text": c} for i, c in enumerate(coarse_candidates)
+        ]
         ranked = get_reranker().rerank(
             question, candidates, top_n=DOC_TOP_N, min_score=None
         )

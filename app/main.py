@@ -18,13 +18,13 @@ from app.config import get_settings, USER_DATA_DIR
 from app.document_parser import parse_document
 from app.errors import LawHelperError
 from app.llm import get_llm
+from app.prompt_loader import render_prompt
 from app.qa import answer
 from app.tracing import event, finish_trace, query_traces, span, start_trace
 from app.schemas import (
     ChatRequest,
     ChatResponse,
     IngestResponse,
-    Reference,
     RunningJobsResponse,
     SessionData,
     SessionSaveRequest,
@@ -322,8 +322,8 @@ def _summarize_title_from_messages(messages: list[dict]) -> str:
             turns.append(f"{prefix}：{content}")
     # 若 LLM 无法总结，使用第一条用户内容兜底，避免标题为「新对话」
     fallback_title = _user_input_title(first_user_text) if first_user_text else "新对话"
-    prompt = "请根据以下对话内容，用不超过 10 个字生成一个会话标题。只输出标题，不要解释。\n\n" + "\n".join(turns)
-    system = "你是摘要助手，请用不超过 10 个字总结对话内容作为标题，不要加引号或解释。"
+    prompt = render_prompt("title_user", max_chars=10, turns="\n".join(turns))
+    system = render_prompt("title_system", max_chars=10)
     try:
         return get_llm().chat(system, prompt).strip()[:18] or fallback_title
     except Exception:  # noqa: BLE001 - LLM 调用失败时用 fallback 兜底，避免标题卡在「新对话」
@@ -441,25 +441,13 @@ def get_upload(filename: str, request: Request):
 def chat(req: ChatRequest, request: Request):
     _ensure_session_access(request, req.session_id)
     question = _effective_question(req.question, req.document_text)
-    # 单轮无历史时尝试命中答案缓存（answer_cache 已禁用，get() 永远返回 None）
-    if not req.history:
-        cached = answer_cache.get(question)
-        if cached:
-            start_trace(
-                kind="chat",
-                question=question,
-                session_id=req.session_id,
-                cache_hit=True,
-            )
-            references = [Reference.model_validate(r) for r in cached["references"]]
-            finish_trace()
-            return ChatResponse(answer=cached["answer"], references=references)
-
+    # answer_cache 已永久禁用（get/put 均 no-op），移除死代码分支。
+    # 若将来恢复缓存，get/put 条件必须补上 `not req.document_text`，
+    # 否则带材料的回答会污染裸问题的缓存（完整条件参见 jobs.py Job._run）。
     start_trace(kind="chat", question=question, session_id=req.session_id)
-    text, references = answer(question, req.history, req.document_text)
-    # 仅缓存有明确法条引用的回答（拒答/无关问题不缓存）
-    if not req.history and references:
-        answer_cache.put(question, text, [r.model_dump() for r in references])
+    text, references = answer(
+        question, req.history, req.document_text, req.law_source, req.article_no
+    )
     finish_trace()
     return ChatResponse(answer=text, references=references)
 
@@ -483,6 +471,8 @@ def chat_stream(req: ChatRequest, request: Request):
             req.history,
             title,
             req.document_text,
+            law_source=req.law_source,
+            article_no=req.article_no,
             file_names=req.file_names,
             attachments=[a.model_dump() for a in (req.attachments or [])],
         )

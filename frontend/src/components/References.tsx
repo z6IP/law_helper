@@ -26,6 +26,11 @@ export function References({ references }: ReferencesProps) {
               <div key={idx} className="reference-item">
                 <div className="reference-header">{header}</div>
                 <div className="reference-text">{ref.text}</div>
+                {ref.merged_from && ref.merged_from.length > 1 && (
+                  <div className="reference-merged">
+                    合并了 {ref.merged_from.length} 个相关片段
+                  </div>
+                )}
               </div>
             )
           })}

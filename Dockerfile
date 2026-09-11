@@ -41,6 +41,8 @@ ENV PATH="/opt/venv/bin:$PATH" \
 
 # 复制项目代码（.dockerignore 已排除 .env/node_modules/__pycache__ 等）
 COPY app/ ./app/
+COPY config/ ./config/
+COPY prompts/ ./prompts/
 COPY statute/ ./statute/
 COPY requirements.txt .
 

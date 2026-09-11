@@ -31,6 +31,19 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     llm_model: str = "qwen-plus"
 
+    # 版本化提示词模板目录；长文本提示词不再嵌入业务代码。
+    prompt_dir: str = "prompts"
+    # 模型生成策略：默认值与迁移前保持一致，可由 .env 覆盖。
+    answer_temperature: float = Field(0.2, ge=0.0, le=2.0)
+    retrieval_temperature: float = Field(0.0, ge=0.0, le=2.0)
+    ocr_temperature: float = Field(0.1, ge=0.0, le=2.0)
+    thinking_enabled: bool = True
+    thinking_budget: int = Field(4000, ge=0)
+    multi_query_count: int = Field(4, ge=1, le=10)
+    rewrite_max_length: int = Field(200, ge=20, le=1000)
+    expansion_ensure_quota: int = Field(5, ge=0, le=20)
+    expansion_ensure_min_bm25: float = Field(10.0, ge=0.0)
+
     # OCR 模型（扫描型 PDF 兜底，默认复用同一 OpenAI 兼容接口）
     ocr_model: str = "qwen3.5-ocr"
     ocr_dpi: int = 200
@@ -56,6 +69,9 @@ class Settings(BaseSettings):
     # Embedding 向量维度（BGE-base-zh-v1.5 固定 768；API 模式支持 2560/2048/1536/1024/768/512/256）
     embedding_dimensions: int = 768
 
+    # A4：答案幻觉自检后处理（默认关闭，避免额外 LLM 调用增加延迟）
+    answer_self_check_enabled: bool = False
+
     # 多轮对话：参与历史改写的最大消息条数（3 轮 = 6 条）
     history_max_messages: int = Field(6, ge=0, le=20)
 
@@ -63,19 +79,33 @@ class Settings(BaseSettings):
     top_k_retrieve: int = Field(10, ge=1, le=50)
     bm25_weight: float = Field(0.5, ge=0.0, le=1.0)
     rrf_lambda: int = Field(60, ge=1)
-    rerank_top_n: int = Field(5, ge=1, le=10)
+    rerank_top_n: int = Field(7, ge=1, le=10)
     # 多路检索：按 source 分路并行检索，保证跨法规召回覆盖
     # 关闭时退回单路检索（兼容降级）
     multi_route_enabled: bool = True
     # 全局路召回数（无过滤，整体最相关法条）
-    top_k_global: int = Field(6, ge=1, le=50)
+    top_k_global: int = Field(10, ge=1, le=50)
     # 每个 source 分路召回数（保证每个法规都有候选进入重排）
-    top_k_per_source: int = Field(2, ge=1, le=10)
+    top_k_per_source: int = Field(3, ge=1, le=10)
     # 重排相关性阈值：低于该分的候选视为不相关并丢弃，
     # 全部丢弃时由 LLM 简短拒答，不引用任何法条
     # 注意：此阈值基于 bge-reranker-v2-m3 标定，切换为 qwen3.7-text-rerank 后
     # 需根据实际得分分布重新标定（qwen3.7-text-rerank 的 relevance_score 范围为 0~1）
     rerank_min_score: float = Field(0.2, ge=0.0, le=1.0)
+
+    # R7：HNSW 索引参数（覆盖 collection metadata 默认值）
+    hnsw_construction_ef: int = Field(100, ge=10, le=1000)
+    hnsw_search_ef: int = Field(16, ge=1, le=1000)
+    hnsw_M: int = Field(16, ge=1, le=100)
+
+    # R7：多路检索与受保护条款召回参数，可由 .env 覆盖，未配置时从 policy.json 读取
+    route_floor_min: int = Field(2, ge=1, le=10)
+    route_floor_max: int = Field(3, ge=1, le=10)
+    concept_score_boost: float = Field(3.0, ge=1.0, le=10.0)
+    protected_path_rrf_weight: float = Field(4.0, ge=1.0, le=10.0)
+    protected_search_multiplier: int = Field(3, ge=1, le=10)
+    fusion_candidate_cap_multiplier: int = Field(5, ge=1, le=20)
+    rerank_candidate_limit: int = Field(24, ge=1, le=100)
 
     # 服务
     backend_url: str = "http://127.0.0.1:8000"

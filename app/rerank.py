@@ -17,11 +17,17 @@ import requests
 
 from app.config import get_settings
 from app.errors import RetrievalError
+from app.policy import get_policy
 from app.tracing import event, span
 
 
-# 默认排序任务指令（问答检索场景）
-_DEFAULT_INSTRUCT = "Given a web search query, retrieve relevant passages that answer the query."
+# 默认排序任务指令（法律检索场景）：强调同时覆盖行为规定与处罚依据，
+# 引导 rerank 模型不要只按表面语义相关性排序，保留定义/量刑等间接相关条款。
+_DEFAULT_INSTRUCT = (
+    "给定一个法律咨询问题，请检索与之相关的法律法规条文。"
+    "需要同时覆盖行为规定条款、处罚种类定义条款和处罚依据条款，"
+    "即使某些条款与问题的表面语义相关性较低，也请保留。"
+)
 
 # 各 rerank 模型单次请求最大文档数（API 硬约束，超过返回 HTTP 400）
 # 依据：https://help.aliyun.com/zh/model-studio/developer-reference/general-text-sorting-model
@@ -32,7 +38,7 @@ _RERANK_MAX_DOCS = {
     "qwen3.7-text-rerank": 500,
     "qwen3-rerank": 500,
     "qwen3-vl-rerank": 100,
-    "gte-rerank-v2": 30000,
+    "gte-rerank-v2": 500,
 }
 # 未知模型默认取最严格的文本上限，避免 400
 _DEFAULT_MAX_RERANK_DOCS = 100
@@ -55,34 +61,21 @@ _ROLE_PRIORITY = {
 # 注："处罚的种类和适用"命中治安管理处罚法第二章 16 条，其中第十条是真正
 # 的处罚种类定义，其余 15 条（时效、年龄、减轻等）混入是已知副作用，靠
 # rerank 模型语义匹配自然挤出，不进一步收紧关键词以避免漏召回第十条。
-_DEFINITION_KEYWORDS = (
-    "总则", "一般规定", "基本规定", "术语和定义", "处罚的种类和适用",
-    "民事权利", "行政强制的种类和设定", "记分分值", "附则",
-)
+_DEFINITION_KEYWORDS = tuple(get_policy()["rerank"]["definition_keywords"])
 
 # 行为定义+量刑章节关键词：治安管理处罚法第三章各节
 # 句式特征："有下列行为之一的，处...拘留/罚款"——具体行为+具体量刑
 # 仅治安管理处罚法第三章命中（64 条），精确无歧义
 # 覆盖：扰乱公共秩序、妨害公共安全、侵犯人身财产、妨害社会管理
-_BEHAVIOR_PENALTY_KEYWORDS = (
-    "行为和处罚",
-)
+_BEHAVIOR_PENALTY_KEYWORDS = tuple(get_policy()["rerank"]["behavior_penalty_keywords"])
 
 # 查询概念词：用于配额保障逻辑，检查 top_n 中是否有正文含概念词的"种类定义"条款
 # 与 retrieval.py 的 _DEFINITION_KEYWORDS 保持一致
 # 当查询含这些词时，top_n 中应有正文同时含概念词和"种类"的 definition 条款（如第十条）
-_CONCEPT_KEYWORDS = (
-    "拘留", "处罚", "种类", "定义", "什么是", "概念",
-    "罚款", "警告", "吊销", "暂扣", "驱逐",
-)
+_CONCEPT_KEYWORDS = tuple(get_policy()["rerank"]["concept_keywords"])
 
 # 程序性章节关键词：规定执行程序、救济途径、调查取证、复议诉讼等
-_PROCEDURAL_KEYWORDS = (
-    "程序", "执行", "复议", "诉讼", "管辖", "送达",
-    "调查", "受案", "报案", "认定与复核", "检验", "鉴定",
-    "强制执行", "简易程序", "期间计算", "备案审查",
-    "损害赔偿调解", "执法监督", "处罚程序",
-)
+_PROCEDURAL_KEYWORDS = tuple(get_policy()["rerank"]["procedural_keywords"])
 
 
 def _is_protected_role(role: str) -> bool:
@@ -125,10 +118,13 @@ def _classify_role(metadata: dict) -> str:
     return "substantive"
 
 
-def apply_role_adjustment(contexts: list[dict]) -> list[dict]:
+def apply_role_adjustment(
+    contexts: list[dict], intents: list[str] | None = None
+) -> list[dict]:
     """对 rerank 后的 contexts 做角色优先级稳定排序。
 
-    - 优先级：定义性 == 行为定义+量刑 > 实体性 > 程序性
+        - 只有查询明确命中对应意图时，才提升定义/行为/程序角色；
+            未提供意图时保持 rerank 原始相关性顺序。
     - 稳定排序：同角色内保持 rerank_score 降序（不破坏 qwen3.7-text-rerank 结果）
     - 不删除任何法条，只调整排序
     - 空 contexts 直接返回，无副作用
@@ -136,12 +132,19 @@ def apply_role_adjustment(contexts: list[dict]) -> list[dict]:
 
     合规：不替换 qwen3.7-text-rerank 在线模型的结果，只在其后追加角色排序。
     """
-    if not contexts:
+    if not contexts or not intents:
         return contexts
+    role_priority = dict(_ROLE_PRIORITY)
+    if "definition" in intents:
+        role_priority["definition"] = -1
+    if "penalty" in intents:
+        role_priority["behavior_penalty"] = -1
+    if "procedure" in intents:
+        role_priority["procedural"] = -1
     sorted_ctx = sorted(
         contexts,
         key=lambda c: (
-            _ROLE_PRIORITY[_classify_role(c.get("metadata", {}))],
+            role_priority[_classify_role(c.get("metadata", {}))],
             -c.get("rerank_score", 0.0),
         ),
     )
@@ -212,7 +215,7 @@ class Reranker:
             },
             "parameters": {
                 "top_n": api_top_n,
-                "instruct": _DEFAULT_INSTRUCT,
+                "instruct": get_policy()["rerank"].get("instruct") or _DEFAULT_INSTRUCT,
             },
         }
         headers = {
@@ -268,7 +271,19 @@ class Reranker:
         # 同 source 限流 + 同 section 去重：
         # - 同 source + 同 section_header 只保留 top1（避免 4.1 与表1 内容重复）
         # - 同 source 最多保留 3 条（多路检索后候选已均衡，放宽限流保留更多信息）
-        MAX_PER_SOURCE = 3
+        rerank_policy = get_policy()["rerank"]
+        MAX_PER_SOURCE = rerank_policy["max_per_source"]
+
+        # 全量分数查找表：遍历 API 返回的全部 results，为每个候选构建
+        # id → {candidate + rerank_score} 映射。该表不受 min_score / 同 source 限流 /
+        # behavior_penalty 限流等过滤影响，作为配额保障的终极回退数据源。
+        _all_scored: dict[str, dict] = {}
+        for r in results:
+            idx = r["index"]
+            score = float(r.get("relevance_score", r.get("score", 0.0)))
+            cid = str(candidates[idx].get("id") or idx)
+            _all_scored[cid] = {**candidates[idx], "rerank_score": score}
+
         source_counts: dict[str, int] = {}
         seen_sections: set[tuple[str, str]] = set()
         scored: list[dict] = []
@@ -276,37 +291,38 @@ class Reranker:
             idx = r["index"]
             # 兼容两种字段名：DashScope 用 relevance_score，OpenAI 兼容可能用 score
             score = float(r.get("relevance_score", r.get("score", 0.0)))
-            # 受保护条款放宽 min_score 阈值（×0.75），避免第十条"处罚种类包括拘留"
-            # 被 min_score=0.4 过滤（rerank 给 0.3995），导致配额保障逻辑找不到它
-            effective_min = min_score * 0.75 if _is_protected_role(
-                _classify_role(candidates[idx].get("metadata", {}))
-            ) else min_score
-            if min_score is not None and score < effective_min:
-                continue
             meta = candidates[idx].get("metadata", {})
+            role = _classify_role(meta)
+            # 受保护条款（definition + behavior_penalty）完全豁免 min_score：
+            # 这类条款与具体行为场景语义距离远，rerank 模型常给低分（如第十条"处罚种类"），
+            # 但它们是法律推理的核心论证依据，不能因低分被过滤。不再使用 0.75 倍放宽。
+            if not _is_protected_role(role) and min_score is not None and score < min_score:
+                continue
             source = meta.get("source", "")
             section = meta.get("section_header", "")
+            # 无 metadata 的候选（如上传材料切块）不参与 source/section 去重与限流：
+            # 否则所有候选的 (source, section) 均为 ("", "")，第一条之后全部被误删
+            has_meta = bool(source or section)
             section_key = (source, section)
-            role = _classify_role(meta)
             # 同 source + 同 section 已有更高分的条款，跳过
             # 例外：受保护条款（definition + behavior_penalty）不受同 section 去重限制
             # 同一"处罚的种类和适用"章下第十条（种类定义）与第十六条（适用规则）内容不同；
             # 治安管理处罚法第三章同节内多条行为+量刑条款内容也不同
-            if not _is_protected_role(role) and section_key in seen_sections:
+            if has_meta and not _is_protected_role(role) and section_key in seen_sections:
                 continue
             # 同 source 已达上限
             # 例外：受保护条款（definition + behavior_penalty）不受同 source 限流限制
             # 原因：治安管理处罚法有 25 条 definition 条款（第一章 9 + 第二章 16），
             # MAX_PER_SOURCE=3 会只保留 3 条，第十条（处罚种类定义）被挤出 scored 列表，
             # 无法通过配额保障进入 top_n
-            if source_counts.get(source, 0) >= MAX_PER_SOURCE and not _is_protected_role(role):
+            if has_meta and source_counts.get(source, 0) >= MAX_PER_SOURCE and not _is_protected_role(role):
                 continue
             # behavior_penalty 限流：top_n 中最多 2 条 behavior_penalty 条款
             # 原因：behavior_penalty 条款（第三章 64 条）正文含"拘留"字眼，rerank 给高分，
             # 会占满 top_n 前 3 位（如第三十六条危险物质、第五十九条损毁财物、第七十六条妨害社会管理），
             # 挤出道交法相关条款（道交法实施条例第八十三条、违法行为处理程序规定等）
             bp_count = sum(1 for s in scored if _classify_role(s.get("metadata", {})) == "behavior_penalty")
-            if role == "behavior_penalty" and bp_count >= 2:
+            if role == "behavior_penalty" and bp_count >= rerank_policy["behavior_penalty_max"]:
                 continue
             seen_sections.add(section_key)
             source_counts[source] = source_counts.get(source, 0) + 1
@@ -350,109 +366,116 @@ class Reranker:
             # 配额保障逻辑检查 len(scored) > top_n 来决定是否触发
             scored = kept + overflow
 
-        # 受保护条款配额保障：top_n 截断后若无 definition 或 behavior_penalty 条款，
-        # 从 scored 中取 rerank_score 最高的受保护条款插入 top_n 末尾（替换最后一条）。
-        # 场景：qwen3-rerank 对"处罚种类"等定义性条款、对"行为+量刑"条款打分偏低
-        # （与具体案件语义相关性弱），但法律推理中这两类条款是论证核心：
-        #   - 第十条支撑"拘留需有明确法律授权"
-        #   - 第二十六条等支撑"具体行为+具体量刑标准"
-        # 配额只保底1条，不破坏 rerank 结果主体顺序。
-        if len(scored) > top_n:
-            top = list(scored[:top_n])
-            has_protected = any(
-                _is_protected_role(_classify_role(c.get("metadata", {}))) for c in top
-            )
-            if not has_protected:
-                # 从 overflow 中找分数最高的受保护条款
-                overflow = scored[top_n:]
-                protected_candidates = [
-                    c for c in overflow
-                    if _is_protected_role(_classify_role(c.get("metadata", {})))
-                ]
-                if protected_candidates:
-                    best_protected = max(
-                        protected_candidates, key=lambda c: c.get("rerank_score", 0.0)
-                    )
-                    top[-1] = best_protected  # 替换 top_n 最后一条
-                    event(
-                        "rerank.definition_quota",
-                        article=best_protected.get("metadata", {}).get("article_no", ""),
-                        source=best_protected.get("metadata", {}).get("source", ""),
-                        rerank_score=best_protected.get("rerank_score", 0.0),
-                    )
-                    scored = top
+        # ── 配额保障（无条件执行，不再依赖 len(scored) > top_n）──
+        # 先取 top/overflow，维护 top 的 id 集合；各配额在 overflow 中找不到所需条款时，
+        # 回退到 _all_scored 全量查找表（该表包含被 min_score / 限流过滤掉的所有候选）。
+        top = list(scored[:top_n])
+        overflow = list(scored[top_n:])
+        top_ids = {str(c.get("id")) for c in top}
 
-        # 处罚种类定义配额保障：如果查询含概念词（如"拘留"），top_n 中必须有正文同时
-        # 含概念词和"种类"的 definition 条款（即处罚种类定义条款，如第十条）。
-        # 行为+量刑配额保障：top_n 中必须有正文含概念词和"扰乱"或"秩序"的
-        # behavior_penalty 条款（即扰乱公共秩序条款，如第二十六条）。
-        # 两个配额保障分别替换 top_n 的倒数第 2 和倒数第 1 条，避免互相冲突。
-        # 被替换的条款放回 overflow，供后续配额保障使用。
-        if len(scored) > top_n:
-            top = list(scored[:top_n])
-            concept_keywords = [kw for kw in _CONCEPT_KEYWORDS if kw in query]
-            overflow = list(scored[top_n:])
-            if concept_keywords:
-                # 检查是否有处罚种类定义条款
-                has_kind_def = any(
-                    _is_protected_role(_classify_role(c.get("metadata", {})))
+        def _find_best(predicate) -> dict | None:
+            """先在 overflow 中找最高分匹配项；找不到时回退到 _all_scored 全量查找。"""
+            pool = [c for c in overflow if predicate(c)]
+            if not pool:
+                pool = [
+                    c for cid, c in _all_scored.items()
+                    if cid not in top_ids and predicate(c)
+                ]
+            if not pool:
+                return None
+            return max(pool, key=lambda c: c.get("rerank_score", 0.0))
+
+        def _insert_quota(best: dict) -> None:
+            """把配额条款插入 top：优先替换最后一条非受保护条款，保持 top_n 长度；
+            若 top 中无非受保护条款且未满 top_n，则追加。"""
+            top_ids.add(str(best.get("id")))
+            for i in range(len(top) - 1, -1, -1):
+                if not _is_protected_role(_classify_role(top[i].get("metadata", {}))):
+                    top[i] = best
+                    return
+            if len(top) < top_n:
+                top.append(best)
+            else:
+                top[-1] = best
+
+        # 1. 受保护条款配额：top_n 中至少要有 1 条 definition 或 behavior_penalty 条款。
+        #    场景：rerank 对"处罚种类"等定义性条款、对"行为+量刑"条款打分偏低，但这些
+        #    条款是法律推理核心（第十条支撑"拘留需有明确法律授权"，第二十六条支撑具体量刑）。
+        has_protected = any(
+            _is_protected_role(_classify_role(c.get("metadata", {}))) for c in top
+        )
+        if not has_protected:
+            best = _find_best(
+                lambda c: _is_protected_role(_classify_role(c.get("metadata", {})))
+            )
+            if best is not None:
+                _insert_quota(best)
+                event(
+                    "rerank.protected_quota",
+                    article=best.get("metadata", {}).get("article_no", ""),
+                    source=best.get("metadata", {}).get("source", ""),
+                    rerank_score=best.get("rerank_score", 0.0),
+                )
+
+        # 2. 概念词触发的配额保障：处罚种类定义条款 + 行为+量刑条款。
+        #    场景：查询含"拘留"等概念词时，top_n 中必须同时具备"处罚种类定义"（如第十条）
+        #    和"行为+量刑"（如第二十六条）条款，二者共同支撑"拘留是否有法律授权"的论证。
+        concept_keywords = [kw for kw in _CONCEPT_KEYWORDS if kw in query]
+        if concept_keywords:
+            # 2a. 处罚种类定义条款：definition + 正文含"种类" + 概念词
+            has_kind_def = any(
+                _is_protected_role(_classify_role(c.get("metadata", {})))
+                and "种类" in (c.get("text", "") or "")
+                and any(kw in (c.get("text", "") or "") for kw in concept_keywords)
+                for c in top
+            )
+            if not has_kind_def:
+                best = _find_best(
+                    lambda c: _is_protected_role(_classify_role(c.get("metadata", {})))
                     and "种类" in (c.get("text", "") or "")
                     and any(kw in (c.get("text", "") or "") for kw in concept_keywords)
-                    for c in top
                 )
-                if not has_kind_def:
-                    kind_def_candidates = [
-                        c for c in overflow
-                        if _is_protected_role(_classify_role(c.get("metadata", {})))
-                        and "种类" in (c.get("text", "") or "")
-                        and any(kw in (c.get("text", "") or "") for kw in concept_keywords)
-                    ]
-                    if kind_def_candidates:
-                        best = max(
-                            kind_def_candidates,
-                            key=lambda c: c.get("rerank_score", 0.0)
-                        )
-                        overflow.append(top[-1])  # 被替换的条款放回 overflow
-                        top[-1] = best  # 替换倒数第 1 条
-                        event(
-                            "rerank.kind_definition_quota",
-                            article=best.get("metadata", {}).get("article_no", ""),
-                            source=best.get("metadata", {}).get("source", ""),
-                            rerank_score=best.get("rerank_score", 0.0),
-                        )
+                if best is not None:
+                    _insert_quota(best)
+                    event(
+                        "rerank.kind_definition_quota",
+                        article=best.get("metadata", {}).get("article_no", ""),
+                        source=best.get("metadata", {}).get("source", ""),
+                        rerank_score=best.get("rerank_score", 0.0),
+                    )
 
-                # 检查是否有扰乱公共秩序 behavior_penalty 条款
-                has_disturb_bp = any(
-                    _classify_role(c.get("metadata", {})) == "behavior_penalty"
-                    and any(kw in (c.get("text", "") or "") for kw in concept_keywords)
-                    and ("扰乱" in (c.get("text", "") or "") or "秩序" in (c.get("text", "") or ""))
-                    for c in top
+            # 2b. 行为+量刑条款：behavior_penalty + 正文含概念词
+            has_behavior_bp = any(
+                _classify_role(c.get("metadata", {})) == "behavior_penalty"
+                and any(
+                    kw in (c.get("text", "") or "")
+                    or kw in ((c.get("metadata") or {}).get("penalty_context", ""))
+                    for kw in concept_keywords
                 )
-                if not has_disturb_bp:
-                    bp_candidates = [
-                        c for c in overflow
-                        if _classify_role(c.get("metadata", {})) == "behavior_penalty"
-                        and any(kw in (c.get("text", "") or "") for kw in concept_keywords)
-                        and ("扰乱" in (c.get("text", "") or "") or "秩序" in (c.get("text", "") or ""))
-                    ]
-                    if bp_candidates:
-                        best = max(
-                            bp_candidates,
-                            key=lambda c: c.get("rerank_score", 0.0)
-                        )
-                        top[-2] = best  # 替换倒数第 2 条
-                        event(
-                            "rerank.behavior_penalty_quota",
-                            article=best.get("metadata", {}).get("article_no", ""),
-                            source=best.get("metadata", {}).get("source", ""),
-                            rerank_score=best.get("rerank_score", 0.0),
-                        )
-                scored = top
+                for c in top
+            )
+            if not has_behavior_bp:
+                best = _find_best(
+                    lambda c: _classify_role(c.get("metadata", {})) == "behavior_penalty"
+                    and any(
+                        kw in (c.get("text", "") or "")
+                        or kw in ((c.get("metadata") or {}).get("penalty_context", ""))
+                        for kw in concept_keywords
+                    )
+                )
+                if best is not None:
+                    _insert_quota(best)
+                    event(
+                        "rerank.behavior_penalty_quota",
+                        article=best.get("metadata", {}).get("article_no", ""),
+                        source=best.get("metadata", {}).get("source", ""),
+                        rerank_score=best.get("rerank_score", 0.0),
+                    )
 
         # 引用追踪：由 retrieval.py 的 REFERENCE_QUOTA 在候选池阶段统一处理，
         # rerank 阶段不再重复追踪，避免同一条被引用条款被重复加入导致 token 浪费。
 
-        return scored[:top_n]
+        return top[:top_n]
 
 
 @lru_cache

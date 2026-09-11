@@ -36,6 +36,7 @@ function App() {
 
   // 后台生成任务按会话独立管理：切换会话/新建对话/刷新页面都不会中断生成
   const [runningIds, setRunningIds] = useState<Set<string>>(new Set())
+  const [reasoningIds, setReasoningIds] = useState<Set<string>>(new Set())
   const [thinkingLabels, setThinkingLabels] = useState<Record<string, string>>({})
   const abortRefs = useRef<Map<string, () => void>>(new Map())
   const resumedRef = useRef<Set<string>>(new Set())
@@ -349,6 +350,11 @@ function App() {
           next.delete(sessionId)
           return next
         })
+        setReasoningIds((prev) => {
+          const next = new Set(prev)
+          next.delete(sessionId)
+          return next
+        })
         setThinkingLabels((prev) => {
           const next = { ...prev }
           delete next[sessionId]
@@ -383,6 +389,13 @@ function App() {
             updateLastMessage(sessionId, (m) => ({ ...m, reasoning: reasoningText }))
             break
           case 'delta':
+            setReasoningIds((prev) => {
+              if (!prev.has(sessionId)) return prev
+              const next = new Set(prev)
+              next.delete(sessionId)
+              return next
+            })
+            setThinkingLabels((prev) => ({ ...prev, [sessionId]: '思考完成' }))
             answerText += (data.content as string) || ''
             updateLastMessage(sessionId, (m) => ({ ...m, content: answerText }))
             break
@@ -494,6 +507,7 @@ function App() {
         // 清空占位内容，进入流式生成状态
         updateLastMessage(sessionId, (m) => ({ ...m, content: '', references: [], reasoning: null }))
         setRunningIds((prev) => new Set(prev).add(sessionId))
+        setReasoningIds((prev) => new Set(prev).add(sessionId))
         setThinkingLabels((prev) => ({ ...prev, [sessionId]: '思考中' }))
 
         runStream(sessionId, (h) =>
@@ -619,6 +633,7 @@ function App() {
             }
           }
           setRunningIds((prev) => new Set(prev).add(sid))
+          setReasoningIds((prev) => new Set(prev).add(sid))
           setThinkingLabels((prev) => ({ ...prev, [sid]: '思考中' }))
 
           runStream(sid, (h) => api.resumeChat(sid, h.onEvent, h.onDone, h.onError))
@@ -638,6 +653,7 @@ function App() {
   const isRestoring = !loaded && Boolean(hashId)
   const hasMessages = currentSession.messages.length > 0 || isRestoring
   const isCurrentLoading = currentId ? runningIds.has(currentId) : false
+  const isCurrentReasoning = currentId ? reasoningIds.has(currentId) : false
   const currentThinkingLabel = currentId ? thinkingLabels[currentId] || '思考中' : '思考中'
 
   return (
@@ -681,6 +697,7 @@ function App() {
             <MessageList
               messages={currentSession.messages}
               loading={isCurrentLoading}
+              reasoningLoading={isCurrentReasoning}
               restoring={isRestoring}
               thinkingLabel={currentThinkingLabel}
             />

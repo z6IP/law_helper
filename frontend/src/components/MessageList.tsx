@@ -6,14 +6,16 @@ import type { SessionMessage } from '../types'
 interface MessageListProps {
   messages: SessionMessage[]
   loading?: boolean
+  reasoningLoading?: boolean
   restoring?: boolean
   thinkingLabel?: string
 }
 
-export function MessageList({ messages, loading, restoring = false, thinkingLabel }: MessageListProps) {
+export function MessageList({ messages, loading, reasoningLoading = false, restoring = false, thinkingLabel }: MessageListProps) {
   const bottomRef = useRef<HTMLDivElement>(null)
   // 记录用户是否在底部附近：用户主动向上滚动后不再强制跳转到底部
   const atBottomRef = useRef(true)
+  const lastScrollTopRef = useRef(0)
 
   // 绑定滚动容器的 scroll 事件，实时更新 atBottomRef
   useEffect(() => {
@@ -25,9 +27,19 @@ export function MessageList({ messages, loading, restoring = false, thinkingLabe
     const onScroll = () => {
       const distanceFromBottom =
         container.scrollHeight - container.scrollTop - container.clientHeight
-      atBottomRef.current = distanceFromBottom < 80
+      const userIsScrollingUp = container.scrollTop < lastScrollTopRef.current - 2
+      const nearBottom = distanceFromBottom <= 24
+
+      if (userIsScrollingUp && !nearBottom) {
+        atBottomRef.current = false
+      } else if (nearBottom) {
+        atBottomRef.current = true
+      }
+
+      lastScrollTopRef.current = container.scrollTop
     }
     container.addEventListener('scroll', onScroll, { passive: true })
+    lastScrollTopRef.current = container.scrollTop
     onScroll() // 初始化一次
 
     return () => container.removeEventListener('scroll', onScroll)
@@ -61,6 +73,7 @@ export function MessageList({ messages, loading, restoring = false, thinkingLabe
           key={`msg-${idx}`}
           message={msg}
           isCurrentLoading={loading && idx === messages.length - 1 && msg.role === 'assistant'}
+          reasoningLoading={reasoningLoading && idx === messages.length - 1 && msg.role === 'assistant'}
           thinkingLabel={thinkingLabel}
         />
       ))}

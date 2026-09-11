@@ -35,6 +35,8 @@ class Job:
         history: list[dict],
         title: str,
         document_text: str | None = None,
+        law_source: str | None = None,
+        article_no: str | None = None,
         file_names: list[str] | None = None,
         attachments: list[dict] | None = None,
     ):
@@ -43,6 +45,8 @@ class Job:
         self.history = history
         self.title = title
         self.document_text = document_text
+        self.law_source = law_source
+        self.article_no = article_no
         self.file_names = file_names or []
         self.attachments = attachments or []
 
@@ -83,7 +87,12 @@ class Job:
             self._cond.notify_all()
 
     def _run(self) -> None:
-        cached = answer_cache.get(self.question) if not self.history and not self.document_text else None
+        cached = (
+            answer_cache.get(self.question)
+            if not self.history and not self.document_text
+            and not self.law_source and not self.article_no
+            else None
+        )
         start_trace(
             kind="chat_stream",
             question=self.question,
@@ -97,7 +106,13 @@ class Job:
                 self.append_event({"type": "references", "references": self.references})
                 self.append_event({"type": "delta", "content": self.answer_text})
             else:
-                for payload in answer_stream(self.question, self.history, self.document_text):
+                for payload in answer_stream(
+                    self.question,
+                    self.history,
+                    self.document_text,
+                    self.law_source,
+                    self.article_no,
+                ):
                     self.append_event(payload)
                     t = payload.get("type")
                     if t == "references":
@@ -108,7 +123,10 @@ class Job:
                         self.answer_text += payload.get("content") or ""
 
             # 答案缓存仅对「无历史的单轮问题且带引用」启用（与同步 /chat 一致）
-            if not self.history and self.references and not self.document_text:
+            if (
+                not self.history and self.references and not self.document_text
+                and not self.law_source and not self.article_no
+            ):
                 answer_cache.put(self.question, self.answer_text, self.references)
 
             self.answer_text = self.answer_text or "（未生成有效回答）"
@@ -122,8 +140,16 @@ class Job:
             # 生成失败也落库错误提示，避免刷新后助手消息丢失
             if not self.answer_text:
                 self.answer_text = message
-            _persist(self, with_answer=True)
-            self._set_status("error")
+            try:
+                _persist(self, with_answer=True)
+            except Exception:  # noqa: BLE001 - 落库失败不得阻止状态流转，否则会话永久 running
+                import logging
+
+                logging.getLogger(__name__).exception(
+                    "job 结果落库失败: session_id=%s", self.session_id
+                )
+            finally:
+                self._set_status("error")
         finally:
             finish_trace(status="error" if self.error else "ok")
 
@@ -158,6 +184,8 @@ def submit_chat_job(
     history: list[dict],
     title: str,
     document_text: str | None = None,
+    law_source: str | None = None,
+    article_no: str | None = None,
     file_names: list[str] | None = None,
     attachments: list[dict] | None = None,
 ) -> Job:
@@ -166,7 +194,10 @@ def submit_chat_job(
         existing = _JOBS.get(session_id)
         if existing is not None and existing.status == "running":
             raise JobConflictError()
-        job = Job(session_id, question, history, title, document_text, file_names, attachments)
+        job = Job(
+            session_id, question, history, title, document_text,
+            law_source, article_no, file_names, attachments,
+        )
         _JOBS[session_id] = job
 
     _persist(job, with_answer=False)  # 立即落盘标题 + 用户消息

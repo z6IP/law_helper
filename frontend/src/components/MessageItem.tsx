@@ -183,10 +183,11 @@ function computeTargetRect(sourceRect: DOMRect) {
 interface MessageItemProps {
   message: SessionMessage
   isCurrentLoading?: boolean
+  reasoningLoading?: boolean
   thinkingLabel?: string
 }
 
-export function MessageItem({ message, isCurrentLoading, thinkingLabel }: MessageItemProps) {
+export function MessageItem({ message, isCurrentLoading, reasoningLoading, thinkingLabel }: MessageItemProps) {
   const [reasoningOpen, setReasoningOpen] = useState(false)
   interface PreviewInfo {
     url: string
@@ -200,6 +201,11 @@ export function MessageItem({ message, isCurrentLoading, thinkingLabel }: Messag
     if (isUser) return ''
     return renderMarkdown(message.content)
   }, [message.content, isUser])
+
+  const reasoningHtml = useMemo(
+    () => (message.reasoning ? renderMarkdown(message.reasoning) : ''),
+    [message.reasoning],
+  )
 
   if (isUser) {
     const hasAttachments = message.attachments && message.attachments.length > 0
@@ -241,7 +247,7 @@ export function MessageItem({ message, isCurrentLoading, thinkingLabel }: Messag
               onClick={() => setReasoningOpen((v) => !v)}
             >
               <ChevronDown size={14} className={reasoningOpen ? 'open' : ''} />
-              {isCurrentLoading ? (
+              {reasoningLoading ? (
                 <>
                   <span className="spinner" />
                   <span>{thinkingLabel || '思考中'}</span>
@@ -253,9 +259,7 @@ export function MessageItem({ message, isCurrentLoading, thinkingLabel }: Messag
             {reasoningOpen && (
               <div
                 className="reasoning-body"
-                dangerouslySetInnerHTML={{
-                  __html: renderMarkdown(message.reasoning || ''),
-                }}
+                dangerouslySetInnerHTML={{ __html: reasoningHtml }}
               />
             )}
           </div>

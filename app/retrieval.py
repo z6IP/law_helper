@@ -20,18 +20,80 @@ from app.config import get_settings
 from app.embeddings import get_embedding_model
 from app.errors import RetrievalError
 from app.ingestion import COLLECTION_NAME
+from app.policy import get_policy
 from app.tracing import event, span
+
+
+def _ensure_legal_dict_loaded() -> None:
+    """按需加载法律/交通领域用户词典。
+
+    词典路径：项目根目录 / config / legal_dict.txt。
+    文件缺失或加载失败时降级为默认分词，不影响主流程。
+
+    除了 jieba.load_userdict 外，对词典中的每个词调用 add_word 强制加入，
+    确保像"机动车驾驶人"、"安全头盔"等默认模型容易切分的专业术语被保留为整词。
+    """
+    if getattr(_ensure_legal_dict_loaded, "_loaded", False):
+        return
+    import jieba
+    from app.config import BASE_DIR
+
+    dict_path = BASE_DIR / "config" / "legal_dict.txt"
+    if dict_path.is_file():
+        try:
+            jieba.load_userdict(str(dict_path))
+            added = 0
+            for line in dict_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if not parts:
+                    continue
+                word = parts[0]
+                freq = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+                jieba.add_word(word, freq=freq)
+                added += 1
+            event("retrieval.legal_dict_loaded", path=str(dict_path), words=added)
+        except Exception as exc:  # noqa: BLE001
+            event("retrieval.legal_dict_failed", error=str(exc))
+    _ensure_legal_dict_loaded._loaded = True
 
 
 def _tokenize(text: str) -> list[str]:
     import jieba
 
+    _ensure_legal_dict_loaded()
     return [t for t in jieba.cut(text) if t.strip()]
 
 
 def _rrf(rank: int) -> float:
     settings = get_settings()
     return 1.0 / (settings.rrf_lambda + rank)
+
+
+def _resolve_bm25_weight(query: str) -> float:
+    """R9：根据查询意图动态选择 BM25 权重，未命中意图时使用 Settings 默认值。
+
+    设计思路：
+    - 概念/定义/效力类查询语义性强，降低 BM25 权重，提高向量语义权重；
+    - 处罚/否定/责任类查询依赖关键词精确命中，提高 BM25 权重；
+    - 其他场景保持默认平衡。
+    """
+    settings = get_settings()
+    default_weight = settings.bm25_weight
+    try:
+        from app.query_expansion import classify_query_intents
+    except ImportError:  # pragma: no cover
+        return default_weight
+    intents = classify_query_intents(query)
+    if not intents:
+        return default_weight
+    dynamic = get_policy()["retrieval"].get("dynamic_weights", {})
+    for intent in intents:
+        if intent in dynamic and "bm25_weight" in dynamic[intent]:
+            return float(dynamic[intent]["bm25_weight"])
+    return default_weight
 
 
 def _get_embedding_dim() -> int:
@@ -74,9 +136,9 @@ class RetrievalEngine:
             name=COLLECTION_NAME,
             metadata={
                 "hnsw:space": "cosine",
-                "hnsw:construction_ef": 100,
-                "hnsw:search_ef": 16,
-                "hnsw:M": 16,
+                "hnsw:construction_ef": settings.hnsw_construction_ef,
+                "hnsw:search_ef": settings.hnsw_search_ef,
+                "hnsw:M": settings.hnsw_M,
             },
         )
         result = collection.get(include=["documents", "metadatas", "embeddings"])
@@ -99,8 +161,27 @@ class RetrievalEngine:
                 self._dim_mismatch = True
 
         if self._documents and not self._dim_mismatch:
-            self._bm25 = BM25Okapi([_tokenize(d) for d in self._documents])
+            self._bm25 = BM25Okapi([_tokenize(self._lexical_text(i)) for i in range(len(self._documents))])
         self._loaded = True
+
+    def _lexical_text(self, index: int) -> str:
+        """返回用于 BM25 的上下文文本，补充法规、章节和条号 metadata。
+
+        penalty_context 让子款在 BM25 词项上与处罚词（如"拘留"）建立匹配，
+        解决子款正文仅含行为描述、不含处罚词导致的召回失败。
+        """
+        metadata = self._metadatas[index] or {}
+        return " ".join(
+            str(value)
+            for value in (
+                metadata.get("source", ""),
+                metadata.get("section_header", ""),
+                metadata.get("article_no", ""),
+                metadata.get("penalty_context", ""),
+                self._documents[index],
+            )
+            if value
+        )
 
     @property
     def needs_rebuild(self) -> bool:
@@ -149,9 +230,8 @@ class RetrievalEngine:
         bm25_rank = _rank_from_scores(-bm25_scores)
         vec_rank = _rank_from_scores(-vec_scores)
 
-        settings = get_settings()
-        w_bm25 = settings.bm25_weight
-        w_vec = 1.0 - settings.bm25_weight
+        w_bm25 = _resolve_bm25_weight(query)
+        w_vec = 1.0 - w_bm25
 
         scores = np.asarray(
             [w_bm25 * _rrf(bm25_rank[i]) + w_vec * _rrf(vec_rank[i]) for i in range(len(indices))]
@@ -200,9 +280,8 @@ class RetrievalEngine:
         bm25_rank = _rank_from_scores(-bm25_scores)
         vec_rank = _rank_from_scores(-vec_scores)
 
-        settings = get_settings()
-        w_bm25 = settings.bm25_weight
-        w_vec = 1.0 - settings.bm25_weight
+        w_bm25 = _resolve_bm25_weight(query)
+        w_vec = 1.0 - w_bm25
 
         scores = np.asarray(
             [w_bm25 * _rrf(bm25_rank[i]) + w_vec * _rrf(vec_rank[i]) for i in range(n)]
@@ -219,7 +298,13 @@ class RetrievalEngine:
             for i in order
         ]
 
-    def search(self, query: str, top_k: int) -> list[dict]:
+    def search(
+        self,
+        query: str,
+        top_k: int,
+        law_source: str | None = None,
+        article_no: str | None = None,
+    ) -> list[dict]:
         """返回融合排序后的 top_k 结果。
 
         每项结构：{"id", "text", "metadata", "score"}
@@ -232,10 +317,10 @@ class RetrievalEngine:
             # 维度不匹配时回退到仅 BM25 搜索
             if not self._documents or self._bm25 is None:
                 return []
-            n = len(self._documents)
             bm25_scores = np.asarray(self._bm25.get_scores(_tokenize(query)))
-            order = np.argsort(-bm25_scores)[:top_k]
-            return [
+            scoped_indices = self._scope_indices(law_source, article_no)
+            order = sorted(scoped_indices, key=lambda i: -bm25_scores[i])[:top_k]
+            hits = [
                 {
                     "id": self._ids[i],
                     "text": self._documents[i],
@@ -244,17 +329,27 @@ class RetrievalEngine:
                 }
                 for i in order
             ]
+            return self._filter_scope(hits, law_source, article_no)
 
         settings = get_settings()
         if not settings.multi_route_enabled:
-            return self._single_route_search(query, top_k)
+            scoped_indices = self._scope_indices(law_source, article_no)
+            bm25_scores = np.asarray(self._bm25.get_scores(_tokenize(query)))
+            q_vec = np.asarray(get_embedding_model().embed_query(query))
+            return self._fuse_and_topk(
+                query,
+                scoped_indices,
+                top_k,
+                bm25_scores_all=bm25_scores,
+                q_vec=q_vec,
+            )
 
         # 多路检索：预计算 BM25 全库得分和查询向量，分路复用，避免重复 API 调用
         bm25_scores_all = np.asarray(self._bm25.get_scores(_tokenize(query)))
         q_vec = np.asarray(get_embedding_model().embed_query(query))
 
         # 路径 1：全局路（无过滤，整体最相关法条）
-        all_indices = list(range(len(self._documents)))
+        all_indices = self._scope_indices(law_source, article_no)
         global_hits = self._fuse_and_topk(
             query, all_indices, settings.top_k_global,
             bm25_scores_all=bm25_scores_all, q_vec=q_vec,
@@ -262,6 +357,14 @@ class RetrievalEngine:
 
         # 路径 2：按 source 分路（保证每个法规都有候选进入重排）
         source_groups = self._group_by_source()
+        if law_source or article_no:
+            source_groups = {
+                source: [
+                    i for i in indices
+                    if i in all_indices
+                ]
+                for source, indices in source_groups.items()
+            }
         per_source_hits: list[dict] = []
         for source, indices in source_groups.items():
             hits = self._fuse_and_topk(
@@ -283,6 +386,101 @@ class RetrievalEngine:
         # 截断到调用方要求的 top_k（实际由 rerank 再次排序，此处保留全部合并结果）
         # 注：不截断，让 rerank 在更大候选集上选 top_n，跨法规覆盖更好
         return merged
+
+    def _scope_indices(
+        self, law_source: str | None, article_no: str | None
+    ) -> list[int]:
+        return [
+            i for i, metadata in enumerate(self._metadatas)
+            if (not law_source or metadata.get("source") == law_source)
+            and (not article_no or metadata.get("article_no") == article_no)
+        ]
+
+    @staticmethod
+    def _filter_scope(
+        hits: list[dict], law_source: str | None, article_no: str | None
+    ) -> list[dict]:
+        if not law_source and not article_no:
+            return hits
+        return [
+            h for h in hits
+            if (not law_source or (h.get("metadata") or {}).get("source") == law_source)
+            and (not article_no or (h.get("metadata") or {}).get("article_no") == article_no)
+        ]
+
+    def _expand_article_hierarchy(
+        self,
+        hits: list[dict],
+        quota: int,
+        law_source: str | None = None,
+        article_no: str | None = None,
+    ) -> list[dict]:
+        """R5：法条条-款项层级展开。
+
+        命中父条时补充其款项子块，命中子款时带回父条上下文。
+        用于解决长父条向量稀释、子款具体要件无法被单独召回的问题。
+        """
+        if quota <= 0 or not hits or not self._documents:
+            return []
+
+        # 构建 (source, article_no/parent_article_no) -> indices 的映射
+        children_map: dict[tuple[str, str], list[int]] = {}
+        parent_map: dict[tuple[str, str], int] = {}
+        for idx, meta in enumerate(self._metadatas):
+            src = meta.get("source", "")
+            if law_source and src != law_source:
+                continue
+            parent_no = meta.get("parent_article_no", "")
+            chunk_type = meta.get("chunk_type", "")
+            art_no = meta.get("article_no", "")
+            if chunk_type == "clause" and parent_no:
+                children_map.setdefault((src, parent_no), []).append(idx)
+            if chunk_type == "article" and art_no:
+                parent_map[(src, art_no)] = idx
+
+        added: list[dict] = []
+        seen_ids: set[str] = {h["id"] for h in hits}
+        for h in hits:
+            meta = h.get("metadata") or {}
+            src = meta.get("source", "")
+            art_no = meta.get("article_no", "")
+            parent_no = meta.get("parent_article_no", "")
+            chunk_type = meta.get("chunk_type", "")
+            if article_no and art_no != article_no and parent_no != article_no:
+                continue
+            # 父条命中：补充所有子款
+            if chunk_type == "article":
+                for idx in children_map.get((src, art_no), []):
+                    did = self._ids[idx]
+                    if did in seen_ids:
+                        continue
+                    added.append({
+                        "id": did,
+                        "text": self._documents[idx],
+                        "metadata": self._metadatas[idx],
+                        "score": h.get("score", 0.0) * 0.95,
+                    })
+                    seen_ids.add(did)
+                    if len(added) >= quota:
+                        return added
+            # 子款命中：带回父条上下文
+            elif chunk_type == "clause" and parent_no:
+                idx = parent_map.get((src, parent_no))
+                if idx is None:
+                    continue
+                did = self._ids[idx]
+                if did in seen_ids:
+                    continue
+                added.append({
+                    "id": did,
+                    "text": self._documents[idx],
+                    "metadata": self._metadatas[idx],
+                    "score": h.get("score", 0.0) * 0.95,
+                })
+                seen_ids.add(did)
+                if len(added) >= quota:
+                    return added
+        return added
 
     def _definition_boost_search(self, query: str, top_k: int, all_queries: list = None) -> list[dict]:
         """定义性+行为量刑条款召回路径：在 role ∈ {definition, behavior_penalty}
@@ -312,20 +510,11 @@ class RetrievalEngine:
         bm25_scores_all = np.asarray(self._bm25.get_scores(_tokenize(query)))
         q_vec = np.asarray(get_embedding_model().embed_query(query))
 
-        # 按 source 分组，在受保护条款子集上分路检索（不截断，返回全部）
-        PROTECTED_ROLES = ("definition", "behavior_penalty")
-        # 概念词过滤：behavior_penalty 条款只召回正文含查询概念词的
+        # 按 source 分组，在受保护条款子集上分路检索（不截断，返回全部）。
+        # 具体行为相关性由 BM25、向量检索和 rerank 综合判断，不使用固定行为词过滤。
+        retrieval_policy = get_policy()["retrieval"]
+        PROTECTED_ROLES = tuple(retrieval_policy.get("protected_roles", ["definition", "behavior_penalty"]))
         concept_keywords = [kw for kw in self._DEFINITION_KEYWORDS if kw in query]
-        # 改写关键词过滤：从改写查询中提取行为关键词（扰乱/冲卡/阻碍等）
-        # 避免"拘留"概念词过滤太宽，让第三十六条（危险物质）、第五十九条（损毁财物）
-        # 等不相关 behavior_penalty 条款通过
-        rewrite_behavior_keywords = []
-        if all_queries:
-            for q in all_queries[1:]:  # 跳过原问题，只看改写
-                for kw in ("扰乱", "秩序", "冲卡", "阻碍", "执法", "强制", "通行",
-                           "驾驶", "机动车", "道路", "交通", "高速公路"):
-                    if kw in q and kw not in rewrite_behavior_keywords:
-                        rewrite_behavior_keywords.append(kw)
         source_groups = self._group_by_source()
         merged: list[dict] = []
         seen_ids: set[str] = set()
@@ -336,14 +525,25 @@ class RetrievalEngine:
                 role = (self._metadatas[i] or {}).get("role")
                 if role not in PROTECTED_ROLES:
                     continue
-                # behavior_penalty 双重过滤：
-                # a. 正文含概念词（如"拘留"）
-                # b. 正文含改写关键词（如"扰乱/冲卡/阻碍"）——如果有改写关键词
+                # 仅保留与当前概念词有文本联系的行为处罚条款，具体相关性
+                # 交给后续 BM25、向量检索和 rerank 判断。
                 if role == "behavior_penalty":
                     text = self._documents[i] or ""
-                    if concept_keywords and not any(kw in text for kw in concept_keywords):
-                        continue
-                    if rewrite_behavior_keywords and not any(kw in text for kw in rewrite_behavior_keywords):
+                    # 子款正文可能不含处罚词，合并父条处罚上下文后再判断，
+                    # 避免第二十六条第一款第一项等正确子款被误删。
+                    penalty_ctx = (self._metadatas[i] or {}).get("penalty_context", "")
+                    combined_text = f"{text} {penalty_ctx}"
+                    def has_penalty_signal(keyword: str) -> bool:
+                        if keyword == "处罚":
+                            markers = retrieval_policy.get(
+                                "penalty_signal_markers", ["拘留", "罚款", "警告", "吊销", "暂扣"]
+                            )
+                            return any(marker in combined_text for marker in markers)
+                        return keyword in combined_text
+
+                    if concept_keywords and not any(
+                        has_penalty_signal(kw) for kw in concept_keywords
+                    ):
                         continue
                 def_indices.append(i)
             if not def_indices:
@@ -366,10 +566,11 @@ class RetrievalEngine:
         # boost ×3 后第十条进入前 20，通过配额进入候选池
         # concept_keywords 已在上方计算，此处直接复用
         if concept_keywords:
+            concept_boost = get_settings().concept_score_boost
             for h in merged:
                 text = h.get("text", "") or ""
                 if any(kw in text for kw in concept_keywords):
-                    h["score"] = h.get("score", 0.0) * 3.0
+                    h["score"] = h.get("score", 0.0) * concept_boost
 
         return merged
 
@@ -388,10 +589,7 @@ class RetrievalEngine:
     #   与"摩托车上高速被拘留"都含"拘留"，rerank 给 0.4877 分进入 top_n）
     #   definition 条款（第十条"处罚种类"、第二十三条"不执行拘留"）更概括性，
     #   作为"拘留法律依据"参考更合适，且不会因具体行为描述误匹配
-    _DEFINITION_KEYWORDS = (
-        "拘留", "处罚", "种类", "定义", "什么是", "概念",
-        "罚款", "警告", "吊销", "暂扣", "驱逐",
-    )
+    _DEFINITION_KEYWORDS = tuple(get_policy()["rerank"]["concept_keywords"])
 
     def _has_definition_intent(self, query: str) -> bool:
         """检测查询是否含定义性概念词。"""
@@ -401,26 +599,21 @@ class RetrievalEngine:
         self,
         queries: list[str],
         top_k: int,
-        hyde_vector: list[float] | None = None,
+        law_source: str | None = None,
+        article_no: str | None = None,
     ) -> list[dict]:
-        """多查询并行检索 + 跨查询 RRF 融合，可选 HyDE 向量路。
+        """多查询并行检索 + 跨查询 RRF 融合。
 
         对每条查询调用 search() 得到候选及该查询内的排名，按 RRF
         （1/(lambda+rank)）跨查询累加得分，去重后按总分降序返回。
 
-        - 无 HyDE 向量且单查询时直接退化为 search()，避免无谓融合开销
-        - 多查询或传入 HyDE 向量时跨路 RRF 是 scale-free，无需归一化各路得分
-        - 改写查询与 HyDE 向量仅用于检索，最终回答仍来自 rerank 选出的法条原文
-        - HyDE 向量路只参与排名融合，不引入任何文本（合规：假设性文档不进 context）
-        - 末尾按总分降序截断到 top_k*3，与改造前候选规模一致
+        - 多查询跨路 RRF 是 scale-free，无需归一化各路得分
+        - 候选融合后直接交给 rerank，不再进行 BM25 二次粗排
         """
-        if not queries and hyde_vector is None:
-            return []
         if not queries:
-            # 仅 HyDE 向量路：等价于纯向量检索
-            return self._hyde_only_search(hyde_vector, top_k)
-        if len(queries) == 1 and hyde_vector is None:
-            # 单查询无 HyDE：若查询含定义性概念词，仍走受保护召回路径，
+            return []
+        if len(queries) == 1 and not (law_source or article_no):
+            # 单查询若含定义性概念词，仍走受保护召回路径，
             # 否则受保护条款（如治安管理处罚法第十条 definition、
             # 第二十六条 behavior_penalty）永远不会进入候选。
             if not self._has_definition_intent(queries[0]):
@@ -431,10 +624,21 @@ class RetrievalEngine:
         # 每条查询的 ranked 列表（按 score 降序，rank 0 起）
         per_query_ranked: list[list[dict]] = []
         for q in queries:
-            hits = self.search(q, top_k)
+            hits = self.search(q, top_k, law_source=law_source, article_no=article_no)
             # search() 已按 score 降序返回；保险起见再排一次
             hits.sort(key=lambda h: h.get("score", 0.0), reverse=True)
             per_query_ranked.append(hits)
+
+        # 保留每条检索路线的头部候选，防止后续受保护条款扩展把直接命中条款挤出候选池。
+        # 例如原问题已经命中“高速公路上的两轮摩托车”条款，不能因为“拘留”触发了
+        # 大量行为处罚条款保护召回，就在 RRF 截断阶段丢失该直接命中。
+        settings = get_settings()
+        route_floor = max(settings.route_floor_min, min(settings.route_floor_max, top_k // 3))
+        route_floor_hits = {
+            hit["id"]: hit
+            for ranked in per_query_ranked
+            for hit in ranked[:route_floor]
+        }
 
         # id → (累加 RRF 分, doc)
         fused: dict[str, dict] = {}
@@ -458,43 +662,43 @@ class RetrievalEngine:
         def_intent = self._has_definition_intent(queries[0]) if queries else False
         def_hits: list[dict] = []
         if def_intent:
-            def_hits = self._definition_boost_search(queries[0], max(top_k * 3, top_k), all_queries=queries)
-            def_hits.sort(key=lambda h: h.get("score", 0.0), reverse=True)
+            # 各改写查询可能表达不同的法律关系：原问题保留“拘留”语义，
+            # 行为改写则可能命中“扰乱公共秩序”等具体构成要件。
+            # 每条查询独立召回后合并，避免只用原问题导致行为条款排名过低。
+            protected_by_id: dict[str, dict] = {}
+            multiplier = max(settings.protected_search_multiplier, 1)
+            for protected_query in queries:
+                for hit in self._definition_boost_search(
+                    protected_query, max(top_k * multiplier, top_k)
+                ):
+                    old = protected_by_id.get(hit["id"])
+                    if old is None or hit.get("score", 0.0) > old.get("score", 0.0):
+                        protected_by_id[hit["id"]] = hit
+            def_hits = sorted(
+                protected_by_id.values(),
+                key=lambda h: h.get("score", 0.0),
+                reverse=True,
+            )
             for rank, h in enumerate(def_hits):
                 did = h["id"]
-                scores[did] = scores.get(did, 0.0) + _rrf(rank) * 4
+                scores[did] = scores.get(did, 0.0) + _rrf(rank) * settings.protected_path_rrf_weight
                 if did not in fused:
                     fused[did] = h
 
-        # HyDE 向量路：取 top_k*3 向量相似度候选参与 RRF 融合
-        # 不遍历全库（库可能上千条，会触发 rerank API 文档数上限）
-        if hyde_vector is not None and self._embeddings is not None:
-            hyde_vec = np.asarray(hyde_vector, dtype=self._embeddings.dtype)
-            hyde_scores = self._embeddings @ hyde_vec
-            hyde_top_n = max(top_k * 3, top_k)
-            hyde_order = np.argsort(-hyde_scores)[:hyde_top_n]
-            for rank, i in enumerate(hyde_order):
-                did = self._ids[i]
-                scores[did] = scores.get(did, 0.0) + _rrf(rank)
-                if did not in fused:
-                    fused[did] = {
-                        "id": did,
-                        "text": self._documents[i],
-                        "metadata": self._metadatas[i],
-                        "score": float(hyde_scores[i]),
-                    }
-
-        # 按总分降序排序并截断到 top_k*5，确保主路径高分条款（如第八十三条）
-        # 不被受保护路径 RRF ×4 加权挤出候选池
-        # 原因：受保护路径 RRF ×4 加权导致受保护条款分数远高于主路径高分条款，
+        # 按总分降序排序并截断到 top_k * fusion_candidate_cap_multiplier，确保主路径高分条款（如第八十三条）
+        # 不被受保护路径加权挤出候选池。
+        # 原因：受保护路径加权导致受保护条款分数远高于主路径高分条款，
         # cap=30 时第八十三条（主路径 RRF 排名第 1，score=0.05）被挤出，
         # 因为受保护条款 RRF = 1/(60+0) × 4 = 0.0667 > 0.05
-        # cap=50 后第八十三条进入候选池，由 rerank 模型根据语义相关性排序
-        cap = max(top_k * 5, top_k)
+        # cap 放大后第八十三条进入候选池，由 rerank 模型根据语义相关性排序
+        cap = max(top_k * settings.fusion_candidate_cap_multiplier, top_k)
         merged = [
             {**fused[did], "score": scores[did]}
             for did in sorted(scores, key=lambda d: -scores[d])
         ][:cap]
+        for did, hit in route_floor_hits.items():
+            if did not in {item["id"] for item in merged}:
+                merged.append({**hit, "score": scores.get(did, hit.get("score", 0.0))})
 
         # 受保护配额保障：受保护候选（definition + behavior_penalty）若因 RRF 分数低被挤出 cap，
         # 分别追加 definition 和 behavior_penalty 到 merged 末尾，确保两类条款都有候选进入
@@ -503,8 +707,9 @@ class RetrievalEngine:
         # 原因：behavior_penalty 64 条（治安管理处罚法第三章）如果与 definition 356 条
         # 共享 DEF_QUOTA=10 配额，会因 RRF 分数较高占满配额，挤出第十条（definition）
         # 拆分后 definition 8 条（含第十条）+ behavior_penalty 2 条（含第二十六条）
-        DEF_QUOTA = 8
-        BP_QUOTA = 2
+        retrieval_policy = get_policy()["retrieval"]
+        DEF_QUOTA = retrieval_policy["definition_quota"]
+        BP_QUOTA = retrieval_policy["behavior_penalty_quota"]
         if def_intent and def_hits:
             existing_ids = {h["id"] for h in merged}
             def_added = 0
@@ -544,13 +749,14 @@ class RetrievalEngine:
         # 取 top 2 而非 top 1 的原因：扩展查询"驾驶机动车不按交通信号灯指示通行
         # 一次记6分"下，BM25 top1 是记分办法第七条（分值定义），top2 是第十条
         # （闯红灯记6分具体条款），二者都需召回。
-        REWRITE_QUOTA = 3
-        REWRITE_MIN_BM25 = 20.0
-        REWRITE_TOP_PER_QUERY = 2
+        REWRITE_QUOTA = retrieval_policy["rewrite_quota"]
+        REWRITE_MIN_BM25 = retrieval_policy["rewrite_min_bm25"]
+        REWRITE_TOP_PER_QUERY = retrieval_policy["rewrite_top_per_query"]
         existing_ids = {h["id"] for h in merged}
         rewrite_added = 0
         for q in queries[1:]:  # 跳过原问题，只看改写/扩展
-            if rewrite_added >= REWRITE_QUOTA:
+            if rewrite_added >= REWRITE_QUOTA or self._bm25 is None:
+                # 空库/维度不匹配时 BM25 未构建，跳过配额保障，避免 AttributeError
                 break
             bm25_scores_q = np.asarray(self._bm25.get_scores(_tokenize(q)))
             top_indices = np.argsort(-bm25_scores_q)[:REWRITE_TOP_PER_QUERY]
@@ -579,78 +785,12 @@ class RetrievalEngine:
                 merged_count=len(merged),
             )
 
-        # rerank 前 BM25 粗排：对候选池按所有查询 BM25 分数之和粗排取 top 20，
-        # 再追加被粗排挤出的受保护条款（definition 2 + behavior_penalty 1）= 23 条送 rerank
-        # 行业标准做法（LangChain/LlamaIndex/BGE 都在 rerank 前粗排到 20-50 条）：
-        # 65 条全部送 rerank 会消耗 7144 token，粗排后 23 条约 2520 token（节省 65%）
-        # 风险控制：主路径已有 RRF 融合（含向量相似度），粗排只是二次筛选；
-        # 受保护条款通过配额保障补回，不丢失关键条款（第十条/第二十六条）
-        PRERERANK_TOP = 20
-        if len(merged) > PRERERANK_TOP:
-            # 用所有查询（原问题+改写）的 BM25 分数之和做粗排
-            # 原因：改写查询可能扩展出年龄条件等关键词，让跨法规交集条款
-            # （如驾驶证申领规定第十四条年龄条件）在改写查询下 BM25 排名第 1，
-            # 但原问题下排名低。用所有查询分数之和，让改写查询的高分能拉高排名
-            bm25_scores_sum = np.zeros(len(self._ids))
-            for q in queries:
-                bm25_scores_sum += np.asarray(self._bm25.get_scores(_tokenize(q)))
-            # O(1) 查找：预先建 id → 全库索引的字典，避免对每个候选取 list.index()
-            id_to_idx = {did: i for i, did in enumerate(self._ids)}
-            scored_merged = [
-                (idx, float(bm25_scores_sum[id_to_idx[h["id"]]]) if h["id"] in id_to_idx else 0.0)
-                for idx, h in enumerate(merged)
-            ]
-            scored_merged.sort(key=lambda x: x[1], reverse=True)
-            top_indices = [x[0] for x in scored_merged[:PRERERANK_TOP]]
-            rerank_pool = [merged[i] for i in top_indices]
-
-            # 配额保障：补回被粗排挤出的受保护条款（definition 2 + behavior_penalty 1）
-            PRE_DEF_QUOTA = 2
-            PRE_BP_QUOTA = 1
-            if def_intent and def_hits:
-                existing_ids = {h["id"] for h in rerank_pool}
-                pre_def_added = 0
-                pre_bp_added = 0
-                for h in def_hits:
-                    if h["id"] in existing_ids:
-                        continue
-                    role = (h.get("metadata") or {}).get("role", "")
-                    if role == "definition" and pre_def_added < PRE_DEF_QUOTA:
-                        rerank_pool.append({**h, "score": scores.get(h["id"], 0.0)})
-                        existing_ids.add(h["id"])
-                        pre_def_added += 1
-                    elif role == "behavior_penalty" and pre_bp_added < PRE_BP_QUOTA:
-                        rerank_pool.append({**h, "score": scores.get(h["id"], 0.0)})
-                        existing_ids.add(h["id"])
-                        pre_bp_added += 1
-
-                # 强制保障第十条（处罚种类定义）进入候选池：
-                # 第十条"治安管理处罚的种类包括行政拘留"是处罚种类定义条款，
-                # 用户查询含"拘留"时应召回该条作为处罚依据
-                has_article_10 = any(
-                    (h.get("metadata") or {}).get("article_no") == "第十条"
-                    and "治安管理" in (h.get("metadata") or {}).get("source", "")
-                    for h in rerank_pool
-                )
-                if not has_article_10:
-                    for h in def_hits:
-                        m = h.get("metadata") or {}
-                        if (m.get("article_no") == "第十条"
-                                and "治安管理" in m.get("source", "")
-                                and h["id"] not in existing_ids):
-                            rerank_pool.append({**h, "score": scores.get(h["id"], 0.0)})
-                            existing_ids.add(h["id"])
-                            pre_def_added += 1
-                            break
-
-                event(
-                    "retrieval.prererank_coarse",
-                    pool_before=len(merged),
-                    pool_after=len(rerank_pool),
-                    def_added=pre_def_added,
-                    bp_added=pre_bp_added,
-                )
-            merged = rerank_pool
+        # 直接将融合后的候选送入 rerank；保留各路线头部候选，避免保护路径覆盖直接命中。
+        existing_ids = {h["id"] for h in merged}
+        for did, hit in route_floor_hits.items():
+            if did not in existing_ids:
+                merged.append({**hit, "score": scores.get(did, hit.get("score", 0.0))})
+                existing_ids.add(did)
 
         # 引用追踪：候选池中某条款正文可能引用其他条款作为处罚依据：
         # 1. 同法引用："依照本法第N条"（如第九十五条→第九十条）
@@ -658,18 +798,24 @@ class RetrievalEngine:
         # 被引用的条款因正文不含查询关键词，BM25 分数低，无法被正常召回。
         # 提取引用关系，把被引用条款也加入候选池，最多追加 3 条。
         import re
-        REFERENCE_QUOTA = 3
+        REFERENCE_QUOTA = retrieval_policy["reference_quota"]
         ref_added = 0
         existing_ids = {h["id"] for h in merged}
 
         # 同法引用：依照本法第N条 / 依照本规定第N条 / 依照本条例第N条
         same_law_patterns = [
-            re.compile(r"[依照按照依据根据]本[法法规条例规定]+(第[一二三四五六七八九十百零]+条)(?:第[一二三四五六七八九十百零]+款)?"),
+            re.compile(p)
+            for p in retrieval_policy.get("same_law_reference_patterns", [
+                r"[依照按照依据根据]本[法法规条例规定]+(第[一二三四五六七八九十百零]+条)(?:第[一二三四五六七八九十百零]+款)?",
+            ])
         ]
         # 跨法引用：依照《XXX》第N条 / 按照《XXX》第N条 / 依据《XXX》第N条 / 根据《XXX》第N条
         # 注意：引用的法律名可能是全称或简称（如"道路交通安全法"="中华人民共和国道路交通安全法"）
         cross_law_pattern = re.compile(
-            r"[依照按照依据根据][《<]([^》<>]+?)[》>]第([一二三四五六七八九十百零]+条)"
+            retrieval_policy.get(
+                "cross_law_reference_pattern",
+                r"[依照按照依据根据][《<]([^》<>]+?)[》>]第([一二三四五六七八九十百零]+条)",
+            )
         )
 
         # 法律名→source 字段的映射（简称→全称）
@@ -752,32 +898,78 @@ class RetrievalEngine:
                 merged_count=len(merged),
             )
 
+        # R5 条-款项层级展开：父条命中时补充其款项子块，子款命中时带回父条上下文
+        hierarchy_quota = retrieval_policy.get("article_hierarchy_expand_quota", 8)
+        if hierarchy_quota > 0:
+            expanded = self._expand_article_hierarchy(
+                merged,
+                hierarchy_quota,
+                law_source=law_source,
+                article_no=article_no,
+            )
+            if expanded:
+                existing_ids = {h["id"] for h in merged}
+                for h in expanded:
+                    if h["id"] not in existing_ids:
+                        merged.append(h)
+                        existing_ids.add(h["id"])
+                event(
+                    "retrieval.hierarchy_expand",
+                    added=len(expanded),
+                    quota=hierarchy_quota,
+                    merged_count=len(merged),
+                )
+
+        # RRF 候选直接进入 rerank，不再做 BM25 粗排；这里仅按 RRF 融合分数
+        # 控制 rerank 输入预算。每条检索路线的头部候选已在 route_floor_hits 中
+        # 保留，避免预算截断时丢失原问题或改写查询的直接命中。
+        candidate_limit = get_settings().rerank_candidate_limit
+        if len(merged) > candidate_limit:
+            selected: list[dict] = []
+            selected_ids: set[str] = set()
+            for did in route_floor_hits:
+                for hit in merged:
+                    if hit["id"] == did:
+                        selected.append(hit)
+                        selected_ids.add(did)
+                        break
+            ranked_remaining = sorted(
+                (hit for hit in merged if hit["id"] not in selected_ids),
+                key=lambda hit: hit.get("score", 0.0),
+                reverse=True,
+            )
+            merged = (selected + ranked_remaining)[:candidate_limit]
+            event(
+                "retrieval.rerank_budget",
+                before=len(selected) + len(ranked_remaining),
+                after=len(merged),
+                limit=candidate_limit,
+            )
+
+        # R10 检索可观测性汇总：来源分布与候选得分统计
+        source_distribution: dict[str, int] = {}
+        score_list: list[float] = []
+        for h in merged:
+            src = (h.get("metadata") or {}).get("source", "unknown")
+            source_distribution[src] = source_distribution.get(src, 0) + 1
+            score_list.append(float(h.get("score", 0.0)))
+        event(
+            "retrieval.observability",
+            query_count=len(queries),
+            candidate_count=len(merged),
+            source_distribution=source_distribution,
+            score_max=max(score_list) if score_list else 0.0,
+            score_min=min(score_list) if score_list else 0.0,
+            score_avg=round(sum(score_list) / len(score_list), 6) if score_list else 0.0,
+        )
+
         event(
             "retrieval.multi_query",
             query_count=len(queries),
-            hyde_enabled=hyde_vector is not None,
             definition_boost=def_intent,
             merged_count=len(merged),
         )
         return merged
-
-    def _hyde_only_search(self, hyde_vector: list[float], top_k: int) -> list[dict]:
-        """仅 HyDE 向量检索路（无文本查询时使用）。"""
-        self._ensure_loaded()
-        if self._embeddings is None or not self._documents:
-            return []
-        hyde_vec = np.asarray(hyde_vector, dtype=self._embeddings.dtype)
-        scores = self._embeddings @ hyde_vec
-        order = np.argsort(-scores)[:top_k]
-        return [
-            {
-                "id": self._ids[i],
-                "text": self._documents[i],
-                "metadata": self._metadatas[i],
-                "score": float(scores[i]),
-            }
-            for i in order
-        ]
 
 
 @lru_cache

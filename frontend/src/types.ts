@@ -3,6 +3,7 @@ export interface Reference {
   article_no: string
   section_header: string
   text: string
+  merged_from?: string[]
 }
 
 export interface Attachment {
