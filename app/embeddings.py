@@ -1,10 +1,10 @@
-"""嵌入模型封装：支持本地 sentence-transformers 模型与阿里云百炼 API 双模式。
+"""嵌入模型封装：支持阿里云百炼 API 与本地 sentence-transformers 双模式。
 
 工程约束：
-- 本地模式（embedding_backend=local）：使用 sentence-transformers 加载本地模型，
-  零 token 消耗，适配内存受限环境（2GB RAM）。默认使用 BGE-base-zh-v1.5（768 维）。
-- API 模式（embedding_backend=api）：通过阿里云百炼 OpenAI 兼容 API 调用，
-  消耗 token，作为兜底方案。返回向量已做 L2 归一化，可直接用于余弦相似度计算。
+- API 模式（embedding_backend=api，默认部署方式）：通过阿里云百炼 OpenAI 兼容 API 调用，
+  模型与维度由 .env 显式配置。返回向量已做 L2 归一化，可直接用于余弦相似度计算。
+- 本地模式（embedding_backend=local，离线/零 token 场景）：使用 sentence-transformers
+  加载本地模型，默认使用 BGE-base-zh-v1.5（768 维），适配内存受限环境（2GB RAM）。
 """
 from __future__ import annotations
 

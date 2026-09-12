@@ -1,6 +1,7 @@
 # 环境与密钥
 .env
 .env.*
+!.env.example
 
 # 调试脚本
 _debug_*.py
@@ -11,6 +12,9 @@ dashboard.html
 
 # AI 助手本地权限配置
 settings.json
+
+# AI 助手项目数据（计划文档等，不入仓库，本地保留）
+.codebuddy/
 
 # Python
 __pycache__/

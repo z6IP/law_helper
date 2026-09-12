@@ -58,16 +58,18 @@ class Settings(BaseSettings):
     single_user_mode: bool = True
 
     # Embedding / Rerank 模型
-    # embedding_backend: "local" 使用本地 sentence-transformers 模型（零 token 消耗）
-    #                   "api"  使用阿里云百炼 API（消耗 token，作为兜底）
-    embedding_backend: str = "local"
-    # 本地嵌入模型名（sentence-transformers HuggingFace 模型 ID）
+    # embedding_backend / embedding_model_id / embedding_dimensions 为必填项，
+    # 必须在 .env 中显式配置（代码不设默认值，避免与实际部署的模型不一致）。
+    # embedding_backend: "api"   通过阿里云百炼 OpenAI 兼容接口调用（默认部署方式）
+    #                   "local" 使用本地 sentence-transformers 模型（离线/零 token 场景）
+    embedding_backend: str
+    # 本地嵌入模型名（sentence-transformers HuggingFace 模型 ID，仅 embedding_backend=local 时使用）
     embedding_local_model: str = "BAAI/bge-base-zh-v1.5"
     # API 模式嵌入模型（仅 embedding_backend=api 时使用）
-    embedding_model_id: str = "qwen3.7-text-embedding"
+    embedding_model_id: str
     rerank_model_id: str = "qwen3.7-text-rerank"
-    # Embedding 向量维度（BGE-base-zh-v1.5 固定 768；API 模式支持 2560/2048/1536/1024/768/512/256）
-    embedding_dimensions: int = 768
+    # Embedding 向量维度（API 模式支持 2560/2048/1536/1024/768/512/256；local 模式 BGE-base-zh-v1.5 固定 768）
+    embedding_dimensions: int
 
     # A4：答案幻觉自检后处理（默认关闭，避免额外 LLM 调用增加延迟）
     answer_self_check_enabled: bool = False
