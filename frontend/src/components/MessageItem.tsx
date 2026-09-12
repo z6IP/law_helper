@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import { ChevronDown, FileText, Image } from 'lucide-react'
@@ -188,7 +188,7 @@ interface MessageItemProps {
   deepThinking?: boolean
 }
 
-export function MessageItem({ message, isCurrentLoading, reasoningLoading, thinkingLabel, deepThinking }: MessageItemProps) {
+export const MessageItem = memo(function MessageItem({ message, isCurrentLoading, reasoningLoading, thinkingLabel, deepThinking }: MessageItemProps) {
   const [reasoningOpen, setReasoningOpen] = useState(false)
   interface PreviewInfo {
     url: string
@@ -279,4 +279,4 @@ export function MessageItem({ message, isCurrentLoading, reasoningLoading, think
       </div>
     </div>
   )
-}
+})

@@ -69,16 +69,19 @@ export function MessageList({ messages, loading, reasoningLoading = false, resto
 
   return (
     <div className="message-list">
-      {messages.map((msg, idx) => (
-        <MessageItem
-          key={`msg-${idx}`}
-          message={msg}
-          isCurrentLoading={loading && idx === messages.length - 1 && msg.role === 'assistant'}
-          reasoningLoading={reasoningLoading && idx === messages.length - 1 && msg.role === 'assistant'}
-          thinkingLabel={thinkingLabel}
-          deepThinking={deepThinking}
-        />
-      ))}
+      {messages.map((msg, idx) => {
+        const isLast = idx === messages.length - 1
+        return (
+          <MessageItem
+            key={`msg-${idx}`}
+            message={msg}
+            isCurrentLoading={loading && isLast && msg.role === 'assistant'}
+            reasoningLoading={reasoningLoading && isLast && msg.role === 'assistant'}
+            thinkingLabel={isLast ? thinkingLabel : undefined}
+            deepThinking={deepThinking}
+          />
+        )
+      })}
       <div ref={bottomRef} />
     </div>
   )

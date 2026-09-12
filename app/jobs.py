@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import threading
+import time
 
 from app import answer_cache, session_store
 from app.errors import LawHelperError
@@ -23,6 +24,59 @@ from app.tracing import finish_trace, start_trace
 class JobConflictError(LawHelperError):
     status_code = 409
     message = "该会话正在生成回答"
+
+
+# delta/reasoning 事件微批合并阈值：避免每个 LLM 字符 chunk 独立成事件，
+# 减少 Condition 锁竞争、线程池调度与 HTTP chunk 数量，从而降低前端渲染压力。
+_DELTA_MERGE_CHARS = 32
+_DELTA_MERGE_INTERVAL = 0.05  # 50ms
+
+
+def merge_stream_events(stream):
+    """对 delta/reasoning 事件做微批合并，返回合并后的事件流。
+
+    合并规则（不改变事件顺序与最终拼接文本）：
+    - delta 与 reasoning 分属不同 kind，各自独立缓冲；切换 kind 时先 flush 旧缓冲；
+    - 遇到非 delta/reasoning 事件（references/progress/done/error）先 flush 缓冲再透传，
+      保证即时下发；
+    - 缓冲达到字符阈值，或距上次 flush 超过时间阈值时 flush；
+    - 迭代结束时 flush 残留缓冲。
+
+    时间阈值在「每次新 chunk 到来」时检查（消费端同步拉动，无需独立线程）：
+    慢速输出时不额外滞留，快速输出时按字符阈值合并。
+    """
+    buf_kind: str | None = None
+    buf_parts: list[str] = []
+    buf_len = 0
+    last_flush = time.monotonic()
+
+    def flush():
+        nonlocal buf_kind, buf_parts, buf_len, last_flush
+        if buf_parts:
+            yield {"type": buf_kind, "content": "".join(buf_parts)}
+        buf_kind = None
+        buf_parts = []
+        buf_len = 0
+        last_flush = time.monotonic()
+
+    for payload in stream:
+        t = payload.get("type")
+        if t in ("delta", "reasoning"):
+            text = payload.get("content") or ""
+            if buf_kind is not None and buf_kind != t:
+                yield from flush()
+            buf_kind = t
+            buf_parts.append(text)
+            buf_len += len(text)
+            if (
+                buf_len >= _DELTA_MERGE_CHARS
+                or (time.monotonic() - last_flush) >= _DELTA_MERGE_INTERVAL
+            ):
+                yield from flush()
+        else:
+            yield from flush()
+            yield payload
+    yield from flush()
 
 
 class Job:
@@ -108,13 +162,15 @@ class Job:
                 self.append_event({"type": "references", "references": self.references})
                 self.append_event({"type": "delta", "content": self.answer_text})
             else:
-                for payload in answer_stream(
-                    self.question,
-                    self.history,
-                    self.document_text,
-                    self.law_source,
-                    self.article_no,
-                    deep_thinking=self.deep_thinking,
+                for payload in merge_stream_events(
+                    answer_stream(
+                        self.question,
+                        self.history,
+                        self.document_text,
+                        self.law_source,
+                        self.article_no,
+                        deep_thinking=self.deep_thinking,
+                    )
                 ):
                     self.append_event(payload)
                     t = payload.get("type")

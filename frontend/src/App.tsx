@@ -354,8 +354,34 @@ function App() {
       let answerText = ''
       let reasoningText = ''
       let references: Reference[] = []
+      let rafId = 0
+      let firstDeltaDone = false
+
+      // delta/reasoning 增量合并到本帧：每个字符只追加到本地累积值，
+      // 通过 rAF 每帧最多触发一次 setState，避免每字符级全量重渲染。
+      const flush = () => {
+        rafId = 0
+        updateLastMessage(sessionId, (m) => ({
+          ...m,
+          content: answerText,
+          reasoning: reasoningText || null,
+        }))
+      }
+      const scheduleFlush = () => {
+        if (rafId) return
+        rafId = requestAnimationFrame(flush)
+      }
+      // 兜底：取消未执行的 rAF 并立即落地，保证最终内容不丢（后台标签页 rAF 暂停时）
+      const flushNow = () => {
+        if (rafId) {
+          cancelAnimationFrame(rafId)
+          rafId = 0
+          flush()
+        }
+      }
 
       const finalize = () => {
+        flushNow()
         setRunningIds((prev) => {
           const next = new Set(prev)
           next.delete(sessionId)
@@ -397,25 +423,28 @@ function App() {
             break
           case 'reasoning':
             reasoningText += (data.content as string) || ''
-            updateLastMessage(sessionId, (m) => ({ ...m, reasoning: reasoningText }))
+            scheduleFlush()
             break
           case 'delta':
-            setReasoningIds((prev) => {
-              if (!prev.has(sessionId)) return prev
-              const next = new Set(prev)
-              next.delete(sessionId)
-              return next
-            })
-            setThinkingLabels((prev) => ({ ...prev, [sessionId]: '思考完成' }))
+            if (!firstDeltaDone) {
+              firstDeltaDone = true
+              setReasoningIds((prev) => {
+                if (!prev.has(sessionId)) return prev
+                const next = new Set(prev)
+                next.delete(sessionId)
+                return next
+              })
+              setThinkingLabels((prev) => ({ ...prev, [sessionId]: '思考完成' }))
+            }
             answerText += (data.content as string) || ''
-            updateLastMessage(sessionId, (m) => ({ ...m, content: answerText }))
+            scheduleFlush()
             break
         }
       }
 
       const onError = (err: Error) => {
         answerText += (answerText ? '\n\n' : '') + '后端调用失败：' + err.message
-        updateLastMessage(sessionId, (m) => ({ ...m, content: answerText }))
+        // finalize 内 flushNow 会将含错误提示的完整文本落地
         finalize()
       }
 
