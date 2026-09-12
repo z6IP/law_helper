@@ -493,7 +493,8 @@ function App() {
         { role: 'user', content: text, fileNames: files?.map((f) => f.name), attachments: localAttachments },
       ])
       await appendMessages(sessionId, [
-        { role: 'assistant', content: hasFiles ? '文件解析中...' : '', references: [], reasoning: null },
+        // deepThinking 在发送时刻固化为消息快照，生成中切换开关不影响本条渲染
+        { role: 'assistant', content: hasFiles ? '文件解析中...' : '', references: [], reasoning: null, deepThinking },
       ])
 
       // 首条消息发送即写入 URL hash：思考/回答过程中刷新，能恢复到当前生成中的会话，
@@ -742,7 +743,6 @@ function App() {
               reasoningLoading={isCurrentReasoning}
               restoring={isRestoring}
               thinkingLabel={currentThinkingLabel}
-              deepThinking={deepThinking}
             />
           </div>
           <div className="input-area">

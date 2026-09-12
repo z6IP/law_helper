@@ -26,7 +26,6 @@ venv/
 .pytest_cache/
 
 # 运行时数据
-chroma/
 models/
 data/
 logs/

@@ -19,6 +19,8 @@ export interface SessionMessage {
   reasoning?: string | null
   fileNames?: string[]
   attachments?: Attachment[]
+  /** 发送时的深度思考快照：渲染等待指示器用，生成中切换全局开关不影响本条 */
+  deepThinking?: boolean
 }
 
 export interface Session {

@@ -185,10 +185,9 @@ interface MessageItemProps {
   isCurrentLoading?: boolean
   reasoningLoading?: boolean
   thinkingLabel?: string
-  deepThinking?: boolean
 }
 
-export const MessageItem = memo(function MessageItem({ message, isCurrentLoading, reasoningLoading, thinkingLabel, deepThinking }: MessageItemProps) {
+export const MessageItem = memo(function MessageItem({ message, isCurrentLoading, reasoningLoading, thinkingLabel }: MessageItemProps) {
   const [reasoningOpen, setReasoningOpen] = useState(false)
   interface PreviewInfo {
     url: string
@@ -236,7 +235,8 @@ export const MessageItem = memo(function MessageItem({ message, isCurrentLoading
   }
 
   const hasReasoning = message.reasoning !== null && message.reasoning !== ''
-  const showReasoning = hasReasoning || (isCurrentLoading && !!deepThinking)
+  // 只读消息自带的发送时快照，不读全局开关：生成中切换开关不影响本条
+  const showReasoning = hasReasoning || (isCurrentLoading && !!message.deepThinking)
 
   return (
     <div className="message message-assistant">
@@ -266,7 +266,8 @@ export const MessageItem = memo(function MessageItem({ message, isCurrentLoading
             )}
           </div>
         )}
-        {isCurrentLoading && !deepThinking && !message.content && (
+        {/* 互斥兜底：推理块显示期间绝不同时渲染普通加载圈 */}
+        {isCurrentLoading && !message.deepThinking && !hasReasoning && !message.content && (
           <div className="answer-loading">
             <span className="spinner" />
           </div>
