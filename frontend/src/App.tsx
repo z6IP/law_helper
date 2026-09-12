@@ -9,6 +9,7 @@ import * as api from './api'
 import type { Attachment, Reference } from './types'
 
 const SIDEBAR_KEY = 'sidebarVisible'
+const DEEP_THINKING_KEY = 'deepThinking'
 // 输入框最大宽度 800px + 侧边栏宽度 260px，低于此宽度主内容会被挤压
 const SIDEBAR_AUTO_THRESHOLD = 1060
 // 拖拽上传限制
@@ -46,6 +47,11 @@ function App() {
 
   const [sidebarVisible, setSidebarVisible] = useState(() => {
     const saved = localStorage.getItem(SIDEBAR_KEY)
+    return saved ? saved === 'true' : false
+  })
+  // 深度思考开关：默认关闭，记住上次选择（localStorage）
+  const [deepThinking, setDeepThinking] = useState<boolean>(() => {
+    const saved = localStorage.getItem(DEEP_THINKING_KEY)
     return saved ? saved === 'true' : false
   })
   // 主题状态以 DOM（<html data-theme>）为唯一事实来源，不在 App 中订阅，
@@ -276,6 +282,11 @@ function App() {
   const toggleSidebar = useCallback((visible: boolean) => {
     setSidebarVisible(visible)
     localStorage.setItem(SIDEBAR_KEY, String(visible))
+  }, [])
+
+  const handleDeepThinkingChange = useCallback((value: boolean) => {
+    setDeepThinking(value)
+    localStorage.setItem(DEEP_THINKING_KEY, String(value))
   }, [])
 
   // 用户手动打开/关闭侧边栏时，取消系统自动收起状态
@@ -522,6 +533,7 @@ function App() {
             documentText,
             files?.map((f) => f.name),
             uploadedAttachments,
+            deepThinking,
           ),
         )
       })()
@@ -536,6 +548,7 @@ function App() {
       updateLastMessage,
       clearPendingFiles,
       clearPendingText,
+      deepThinking,
     ],
   )
 
@@ -700,6 +713,7 @@ function App() {
               reasoningLoading={isCurrentReasoning}
               restoring={isRestoring}
               thinkingLabel={currentThinkingLabel}
+              deepThinking={deepThinking}
             />
           </div>
           <div className="input-area">
@@ -710,6 +724,8 @@ function App() {
               text={pendingText}
               onTextChange={(text) => setPendingText(currentSession.id, text)}
               disabled={isCurrentLoading}
+              deepThinking={deepThinking}
+              onDeepThinkingChange={handleDeepThinkingChange}
             />
           </div>
         </div>

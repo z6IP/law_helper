@@ -60,15 +60,18 @@ class Settings(BaseSettings):
     # Embedding / Rerank 模型
     # embedding_backend / embedding_model_id / embedding_dimensions 为必填项，
     # 必须在 .env 中显式配置（代码不设默认值，避免与实际部署的模型不一致）。
-    # embedding_backend: "api"   通过阿里云百炼 OpenAI 兼容接口调用（默认部署方式）
-    #                   "local" 使用本地 sentence-transformers 模型（离线/零 token 场景）
+    # embedding_backend: "api"       通过阿里云百炼 OpenAI 兼容接口调用
+    #                   "dashscope" 通过 DashScope 原生 SDK 调用（支持 qwen3-vl-embedding 等）
+    #                   "local"     使用本地 sentence-transformers 模型（离线/零 token 场景）
     embedding_backend: str
+    # DashScope 原生 SDK API Key（embedding_backend=dashscope 时使用；为空则复用 OPENAI_API_KEY）
+    dashscope_api_key: str = ""
     # 本地嵌入模型名（sentence-transformers HuggingFace 模型 ID，仅 embedding_backend=local 时使用）
     embedding_local_model: str = "BAAI/bge-base-zh-v1.5"
-    # API 模式嵌入模型（仅 embedding_backend=api 时使用）
+    # Embedding 模型 ID（api / dashscope 模式必填；如 qwen3.7-text-embedding / qwen3-vl-embedding）
     embedding_model_id: str
     rerank_model_id: str = "qwen3.7-text-rerank"
-    # Embedding 向量维度（API 模式支持 2560/2048/1536/1024/768/512/256；local 模式 BGE-base-zh-v1.5 固定 768）
+    # Embedding 向量维度（非 local 模式由模型规格决定；local 模式 BGE-base-zh-v1.5 固定 768）
     embedding_dimensions: int
 
     # A4：答案幻觉自检后处理（默认关闭，避免额外 LLM 调用增加延迟）
@@ -126,12 +129,20 @@ class Settings(BaseSettings):
             raise ValueError("SESSION_SECRET_KEY 必须在 .env 中配置")
         return v
 
+    @field_validator("embedding_backend")
+    @classmethod
+    def _validate_embedding_backend(cls, v: str) -> str:
+        allowed = {"api", "dashscope", "local"}
+        if v not in allowed:
+            raise ValueError(f"embedding_backend 必须是 {allowed} 之一，当前为 {v!r}")
+        return v
+
     @model_validator(mode="after")
     def _link_embedding_dimensions(self) -> "Settings":
         """embedding_dimensions 与 backend 联动校验。
 
         - local 模式：BGE-base-zh-v1.5 固定 768 维，配置不一致时报错防止误配
-        - api 模式：维度由用户根据模型规格设置（qwen3.7-text-embedding 默认 1024）
+        - 非 local 模式：维度由用户根据模型规格设置（qwen3.7-text-embedding / qwen3-vl-embedding 等）
         """
         if self.embedding_backend == "local" and self.embedding_dimensions != 768:
             raise ValueError(

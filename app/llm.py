@@ -63,7 +63,7 @@ class BailianClient:
         except Exception as exc:  # noqa: BLE001 - 统一转为领域异常
             raise LLMError(f"大模型调用失败：{exc}") from exc
 
-    def chat_stream(self, system_prompt: str, user_prompt: str):
+    def chat_stream(self, system_prompt: str, user_prompt: str, enable_thinking: bool | None = None):
         """流式调用百炼生成回答，逐段产出 (kind, text) 元组。
 
         kind ∈ {"reasoning", "content"}：
@@ -72,11 +72,15 @@ class BailianClient:
 
         检索链构建方式：retrieval（BM25+向量 RRF 融合）→ rerank（CrossEncoder）→
         角色调整后的法条原文作为 user_prompt 上下文注入；本方法只负责「调用模型思考过程
-        + 基于上下文生成答案」环节。思考开关和预算由 Settings 控制，
-        思考过程通过 reasoning_content 流式产出供前端实时展示。
+        + 基于上下文生成答案」环节。思考开关由调用方按请求传入（enable_thinking），
+        未显式传入时回退 Settings 全局配置；思考过程通过 reasoning_content 流式产出供前端实时展示。
         """
         self._ensure_loaded()
         settings = get_settings()
+        thinking_on = settings.thinking_enabled if enable_thinking is None else enable_thinking
+        extra: dict = {"enable_thinking": thinking_on}
+        if thinking_on:
+            extra["thinking_budget"] = settings.thinking_budget
         try:
             resp = self._client.chat.completions.create(
                 model=settings.llm_model,
@@ -87,10 +91,7 @@ class BailianClient:
                 temperature=settings.answer_temperature,
                 stream=True,
                 stream_options={"include_usage": True},
-                extra_body={
-                    "enable_thinking": settings.thinking_enabled,
-                    "thinking_budget": settings.thinking_budget,
-                },
+                extra_body=extra,
             )
             usage = None
             with span("llm.chat_stream", model=settings.llm_model):

@@ -9,9 +9,10 @@ interface MessageListProps {
   reasoningLoading?: boolean
   restoring?: boolean
   thinkingLabel?: string
+  deepThinking?: boolean
 }
 
-export function MessageList({ messages, loading, reasoningLoading = false, restoring = false, thinkingLabel }: MessageListProps) {
+export function MessageList({ messages, loading, reasoningLoading = false, restoring = false, thinkingLabel, deepThinking }: MessageListProps) {
   const bottomRef = useRef<HTMLDivElement>(null)
   // 记录用户是否在底部附近：用户主动向上滚动后不再强制跳转到底部
   const atBottomRef = useRef(true)
@@ -75,6 +76,7 @@ export function MessageList({ messages, loading, reasoningLoading = false, resto
           isCurrentLoading={loading && idx === messages.length - 1 && msg.role === 'assistant'}
           reasoningLoading={reasoningLoading && idx === messages.length - 1 && msg.role === 'assistant'}
           thinkingLabel={thinkingLabel}
+          deepThinking={deepThinking}
         />
       ))}
       <div ref={bottomRef} />

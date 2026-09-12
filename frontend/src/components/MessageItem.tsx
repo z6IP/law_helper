@@ -185,9 +185,10 @@ interface MessageItemProps {
   isCurrentLoading?: boolean
   reasoningLoading?: boolean
   thinkingLabel?: string
+  deepThinking?: boolean
 }
 
-export function MessageItem({ message, isCurrentLoading, reasoningLoading, thinkingLabel }: MessageItemProps) {
+export function MessageItem({ message, isCurrentLoading, reasoningLoading, thinkingLabel, deepThinking }: MessageItemProps) {
   const [reasoningOpen, setReasoningOpen] = useState(false)
   interface PreviewInfo {
     url: string
@@ -234,7 +235,8 @@ export function MessageItem({ message, isCurrentLoading, reasoningLoading, think
     )
   }
 
-  const showReasoning = message.reasoning !== null || isCurrentLoading
+  const hasReasoning = message.reasoning !== null && message.reasoning !== ''
+  const showReasoning = hasReasoning || (isCurrentLoading && !!deepThinking)
 
   return (
     <div className="message message-assistant">
@@ -262,6 +264,11 @@ export function MessageItem({ message, isCurrentLoading, reasoningLoading, think
                 dangerouslySetInnerHTML={{ __html: reasoningHtml }}
               />
             )}
+          </div>
+        )}
+        {isCurrentLoading && !deepThinking && !message.content && (
+          <div className="answer-loading">
+            <span className="spinner" />
           </div>
         )}
         <div

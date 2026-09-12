@@ -39,6 +39,7 @@ class Job:
         article_no: str | None = None,
         file_names: list[str] | None = None,
         attachments: list[dict] | None = None,
+        deep_thinking: bool = False,
     ):
         self.session_id = session_id
         self.question = question
@@ -49,6 +50,7 @@ class Job:
         self.article_no = article_no
         self.file_names = file_names or []
         self.attachments = attachments or []
+        self.deep_thinking = deep_thinking
 
         self.status = "running"  # running / done / error
         self.error: str | None = None
@@ -112,6 +114,7 @@ class Job:
                     self.document_text,
                     self.law_source,
                     self.article_no,
+                    deep_thinking=self.deep_thinking,
                 ):
                     self.append_event(payload)
                     t = payload.get("type")
@@ -188,6 +191,7 @@ def submit_chat_job(
     article_no: str | None = None,
     file_names: list[str] | None = None,
     attachments: list[dict] | None = None,
+    deep_thinking: bool = False,
 ) -> Job:
     """创建并启动一个后台问答任务；同会话已有任务在跑时抛出 JobConflictError。"""
     with _JOBS_LOCK:
@@ -196,7 +200,7 @@ def submit_chat_job(
             raise JobConflictError()
         job = Job(
             session_id, question, history, title, document_text,
-            law_source, article_no, file_names, attachments,
+            law_source, article_no, file_names, attachments, deep_thinking,
         )
         _JOBS[session_id] = job
 

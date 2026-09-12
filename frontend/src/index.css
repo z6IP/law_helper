@@ -580,6 +580,12 @@ body {
   font-size: 0.95em;
 }
 
+.answer-loading {
+  display: flex;
+  align-items: center;
+  padding: 8px 0;
+}
+
 .spinner {
   width: 14px;
   height: 14px;
@@ -786,11 +792,45 @@ body {
 .chat-input-actions {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: space-between;
   gap: 8px;
   width: 100%;
   flex-shrink: 0;
   padding-top: 12px;
+}
+
+.chat-input-actions-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.deep-think-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 16px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: color 0.2s ease, background 0.2s ease, border-color 0.2s ease;
+}
+
+.deep-think-btn:hover {
+  background: var(--hover-bg);
+  color: var(--text);
+}
+
+.deep-think-btn.active {
+  background: var(--button-bg);
+  border-color: var(--button-bg);
+  color: var(--button-text);
 }
 
 .chat-input-wrap textarea::placeholder {

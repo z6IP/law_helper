@@ -134,6 +134,7 @@ export function streamChat(
   documentText?: string,
   fileNames?: string[],
   attachments?: Attachment[],
+  deepThinking?: boolean,
 ): () => void {
   const payload = {
     question,
@@ -142,6 +143,7 @@ export function streamChat(
     document_text: documentText,
     file_names: fileNames,
     attachments,
+    deep_thinking: deepThinking,
     history: history.map((m) => ({
       role: m.role,
       content: m.content,

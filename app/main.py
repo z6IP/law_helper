@@ -475,6 +475,7 @@ def chat_stream(req: ChatRequest, request: Request):
             article_no=req.article_no,
             file_names=req.file_names,
             attachments=[a.model_dump() for a in (req.attachments or [])],
+            deep_thinking=req.deep_thinking,
         )
     except jobs.JobConflictError as exc:
         raise HTTPException(status_code=409, detail=exc.message)

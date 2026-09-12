@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { ArrowUp, Plus, X } from 'lucide-react'
+import { ArrowUp, Brain, Plus, X } from 'lucide-react'
 
 interface ChatInputProps {
   onSend: (text: string, files?: File[]) => void
@@ -9,6 +9,8 @@ interface ChatInputProps {
   onTextChange?: (text: string) => void
   disabled?: boolean
   placeholder?: string
+  deepThinking?: boolean
+  onDeepThinkingChange?: (deepThinking: boolean) => void
 }
 
 const ACCEPT_TYPES = '.docx,.pdf,.png,.jpg,.jpeg,.webp,.bmp'
@@ -23,6 +25,8 @@ export function ChatInput({
   onTextChange,
   disabled,
   placeholder = '请输入您的法律问题',
+  deepThinking = false,
+  onDeepThinkingChange,
 }: ChatInputProps) {
   const [internalText, setInternalText] = useState('')
   const [internalFiles, setInternalFiles] = useState<File[]>([])
@@ -201,23 +205,35 @@ export function ChatInput({
         <div className="chat-input-actions">
           <button
             type="button"
-            className="attach-btn"
-            onClick={() => fileInputRef.current?.click()}
-            disabled={disabled || files.length >= MAX_FILE_COUNT}
-            aria-label="上传文件"
-            title="上传文件"
+            className={`deep-think-btn${deepThinking ? ' active' : ''}`}
+            onClick={() => onDeepThinkingChange?.(!deepThinking)}
+            aria-pressed={deepThinking}
+            title={deepThinking ? '关闭深度思考' : '开启深度思考'}
           >
-            <Plus size={18} />
+            <Brain size={16} />
+            <span>深度思考</span>
           </button>
-          <button
-            type="button"
-            className="send-btn"
-            onClick={submit}
-            disabled={!canSend}
-            aria-label="发送"
-          >
-            <ArrowUp size={18} />
-          </button>
+          <div className="chat-input-actions-right">
+            <button
+              type="button"
+              className="attach-btn"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={disabled || files.length >= MAX_FILE_COUNT}
+              aria-label="上传文件"
+              title="上传文件"
+            >
+              <Plus size={18} />
+            </button>
+            <button
+              type="button"
+              className="send-btn"
+              onClick={submit}
+              disabled={!canSend}
+              aria-label="发送"
+            >
+              <ArrowUp size={18} />
+            </button>
+          </div>
         </div>
       </div>
     </div>

@@ -20,6 +20,7 @@ jieba>=0.42.1
 # LLM & Embedding & Rerank（阿里云百炼 API）
 openai>=1.50.0
 requests>=2.31.0
+dashscope>=1.13.0  # DashScope 原生 SDK（embedding_backend=dashscope 时使用）
 
 # 会话、限流
 starsessions>=2.2.0

@@ -66,6 +66,10 @@ class ChatRequest(_BaseSchema):
         default=None,
         description="当前用户消息携带的附件元信息列表",
     )
+    deep_thinking: bool = Field(
+        False,
+        description="是否开启深度思考（LLM 推理思考），默认关闭；由前端输入框按钮控制",
+    )
 
 
 class Reference(_BaseSchema):

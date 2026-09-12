@@ -806,6 +806,7 @@ def answer_stream(
     document_text: str | None = None,
     law_source: str | None = None,
     article_no: str | None = None,
+    deep_thinking: bool = False,
 ):
     """流式问答：先产出引用法条事件，再逐段产出回答文本增量。
 
@@ -828,7 +829,7 @@ def answer_stream(
         event("trivial_reject", question=question)
         yield {"type": "references", "references": []}
         user_prompt = _refusal_prompt_template("out_of_scope").format(question=question)
-        for kind, text in get_llm().chat_stream(_system_prompt(), user_prompt):
+        for kind, text in get_llm().chat_stream(_system_prompt(), user_prompt, enable_thinking=deep_thinking):
             if kind == "reasoning":
                 yield {"type": "reasoning", "content": text}
             else:
@@ -851,7 +852,7 @@ def answer_stream(
             event("trivial_reject", resolved=resolved)
             yield {"type": "references", "references": []}
             user_prompt = _refusal_prompt_template("out_of_scope").format(question=question)
-            for kind, text in get_llm().chat_stream(_system_prompt(), user_prompt):
+            for kind, text in get_llm().chat_stream(_system_prompt(), user_prompt, enable_thinking=deep_thinking):
                 if kind == "reasoning":
                     yield {"type": "reasoning", "content": text}
                 else:
@@ -862,7 +863,7 @@ def answer_stream(
     if history and _is_conversation_meta(resolved):
         event("conversation_meta", question=resolved)
         yield {"type": "references", "references": []}
-        for kind, text in get_llm().chat_stream(_META_ANSWER_SYSTEM, _history_prompt(question, history)):
+        for kind, text in get_llm().chat_stream(_META_ANSWER_SYSTEM, _history_prompt(question, history), enable_thinking=deep_thinking):
             if kind == "reasoning":
                 yield {"type": "reasoning", "content": text}
             else:
@@ -890,7 +891,7 @@ def answer_stream(
             )
         else:
             user_prompt = _refusal_prompt_template(refusal_type).format(question=question)
-        for kind, text in get_llm().chat_stream(_system_prompt(), user_prompt):
+        for kind, text in get_llm().chat_stream(_system_prompt(), user_prompt, enable_thinking=deep_thinking):
             if kind == "reasoning":
                 yield {"type": "reasoning", "content": text}
             else:
@@ -903,7 +904,7 @@ def answer_stream(
         resolved, contexts, document_text, document_chunks, law_source, article_no
     )
     with span("llm_generate"):
-        for kind, text in get_llm().chat_stream(_compose_system_prompt(contexts), user_prompt):
+        for kind, text in get_llm().chat_stream(_compose_system_prompt(contexts), user_prompt, enable_thinking=deep_thinking):
             if kind == "reasoning":
                 yield {"type": "reasoning", "content": text}
             else:

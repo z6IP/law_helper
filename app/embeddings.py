@@ -1,10 +1,15 @@
-"""嵌入模型封装：支持阿里云百炼 API 与本地 sentence-transformers 双模式。
+"""嵌入模型封装：支持阿里云百炼 OpenAI 兼容 API、DashScope 原生 SDK 与本地 sentence-transformers 三模式。
 
 工程约束：
-- API 模式（embedding_backend=api，默认部署方式）：通过阿里云百炼 OpenAI 兼容 API 调用，
-  模型与维度由 .env 显式配置。返回向量已做 L2 归一化，可直接用于余弦相似度计算。
+- API 模式（embedding_backend=api）：通过阿里云百炼 OpenAI 兼容 API 调用，
+  模型与维度由 .env 显式配置。
+- DashScope 原生模式（embedding_backend=dashscope）：通过 dashscope SDK 调用，
+  支持 qwen3.7-text-embedding、qwen3-vl-embedding 等模型；自动按模型名选择
+  TextEmbedding 或 MultiModalEmbedding。复用 DASHSCOPE_API_KEY（未配置时回退 OPENAI_API_KEY）。
 - 本地模式（embedding_backend=local，离线/零 token 场景）：使用 sentence-transformers
   加载本地模型，默认使用 BGE-base-zh-v1.5（768 维），适配内存受限环境（2GB RAM）。
+
+所有模式返回向量均做 L2 归一化，可直接用于余弦相似度计算。
 """
 from __future__ import annotations
 
@@ -13,12 +18,12 @@ from functools import lru_cache
 import numpy as np
 
 from app.config import get_settings
-from app.errors import ConfigError
+from app.errors import ConfigError, RetrievalError
 from app.tracing import event, span
 
 
 class EmbeddingModel:
-    """嵌入模型封装（懒加载单例，支持本地/API 双模式）。"""
+    """嵌入模型封装（懒加载单例，支持本地 / OpenAI-API / DashScope 三模式）。"""
 
     # API 模式：百炼 embedding API 单次请求最大行数。
     # text-embedding-v3 / v4 为 10，qwen3.7-text-embedding 为 20。
@@ -63,7 +68,24 @@ class EmbeddingModel:
                 from_project_dir=local_dir.exists(),
             )
             return
-        # API 模式（兜底）
+        if settings.embedding_backend == "dashscope":
+            import dashscope
+
+            api_key = settings.dashscope_api_key or settings.openai_api_key
+            if not api_key or api_key.startswith("your_"):
+                raise ConfigError(
+                    "请在 .env 中配置有效的 DASHSCOPE_API_KEY（或 OPENAI_API_KEY）"
+                )
+            dashscope.api_key = api_key
+            self._backend = "dashscope"
+            event(
+                "embedding.dashscope_loaded",
+                model=settings.embedding_model_id,
+                dim=settings.embedding_dimensions,
+            )
+            return
+
+        # API 模式（OpenAI 兼容，兜底）
         from openai import OpenAI
 
         if not settings.openai_api_key or settings.openai_api_key.startswith("your_"):
@@ -97,6 +119,8 @@ class EmbeddingModel:
 
         if self._backend == "local":
             return self._embed_documents_local(texts, model_name)
+        if self._backend == "dashscope":
+            return self._embed_documents_dashscope(texts, settings, model_name)
         return self._embed_documents_api(texts, settings, model_name)
 
     def _embed_documents_local(
@@ -155,6 +179,8 @@ class EmbeddingModel:
 
         if self._backend == "local":
             return self._embed_query_local(text, model_name)
+        if self._backend == "dashscope":
+            return self._embed_query_dashscope(text, settings, model_name)
         return self._embed_query_api(text, settings, model_name)
 
     def _embed_query_local(self, text: str, model_name: str) -> list[float]:
@@ -185,6 +211,94 @@ class EmbeddingModel:
                     total_tokens=usage.total_tokens,
                 )
             return self._normalize(resp.data[0].embedding)
+
+    def _embed_documents_dashscope(
+        self, texts: list[str], settings, model_name: str
+    ) -> list[list[float]]:
+        """DashScope 原生模式：批量调用文本或多模态 embedding。"""
+        import dashscope
+        from http import HTTPStatus
+
+        is_vl = "vl" in settings.embedding_model_id.lower()
+        all_vectors: list[list[float]] = []
+        with span("embedding.documents", model=model_name, count=len(texts)):
+            for i in range(0, len(texts), self._BATCH_SIZE):
+                batch = texts[i : i + self._BATCH_SIZE]
+                resp = self._call_dashscope_embedding(dashscope, settings, batch, is_vl)
+
+                if resp.status_code != HTTPStatus.OK:
+                    raise RetrievalError(
+                        f"DashScope embedding 错误 {resp.status_code}: "
+                        f"{getattr(resp, 'message', resp)}"
+                    )
+
+                for vec in self._extract_dashscope_embeddings(resp, is_vl):
+                    all_vectors.append(self._normalize(vec))
+
+                usage = getattr(resp, "usage", None)
+                if usage is not None:
+                    total_tokens = getattr(usage, "total_tokens", None)
+                    if total_tokens is not None:
+                        event(
+                            "embedding.tokens",
+                            model=settings.embedding_model_id,
+                            total_tokens=total_tokens,
+                        )
+
+        return all_vectors
+
+    def _embed_query_dashscope(
+        self, text: str, settings, model_name: str
+    ) -> list[float]:
+        """DashScope 原生模式：单条查询 embedding。"""
+        import dashscope
+        from http import HTTPStatus
+
+        is_vl = "vl" in settings.embedding_model_id.lower()
+        with span("embedding.query", model=model_name):
+            resp = self._call_dashscope_embedding(dashscope, settings, [text], is_vl)
+
+            if resp.status_code != HTTPStatus.OK:
+                raise RetrievalError(
+                    f"DashScope embedding 错误 {resp.status_code}: "
+                    f"{getattr(resp, 'message', resp)}"
+                )
+
+            embeddings = self._extract_dashscope_embeddings(resp, is_vl)
+            return self._normalize(embeddings[0])
+
+    def _call_dashscope_embedding(
+        self, dashscope, settings, texts: list[str], is_vl: bool
+    ):
+        """构造 DashScope embedding 请求。
+
+        - 视觉模型（模型名含 "vl"，如 qwen3-vl-embedding）走 MultiModalEmbedding，
+          输入按 contents 格式传入文本；
+        - 文本模型走 TextEmbedding，支持 dimension 参数。
+        """
+        if is_vl:
+            return dashscope.MultiModalEmbedding.call(
+                model=settings.embedding_model_id,
+                input={"contents": [{"text": t} for t in texts]},
+            )
+        kwargs = {
+            "model": settings.embedding_model_id,
+            "input": texts,
+        }
+        if settings.embedding_dimensions:
+            kwargs["dimension"] = settings.embedding_dimensions
+        return dashscope.TextEmbedding.call(**kwargs)
+
+    @staticmethod
+    def _extract_dashscope_embeddings(resp, is_vl: bool) -> list[list[float]]:
+        """从 DashScope 响应中按输入顺序提取向量。
+
+        TextEmbedding 用 text_index，MultiModalEmbedding 用 index 对齐输入顺序。
+        """
+        embeddings = resp.output.get("embeddings", [])
+        key = "index" if is_vl else "text_index"
+        sorted_embeddings = sorted(embeddings, key=lambda d: d.get(key, 0))
+        return [d["embedding"] for d in sorted_embeddings]
 
 
 @lru_cache
