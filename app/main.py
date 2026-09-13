@@ -65,7 +65,7 @@ app.add_middleware(
     SessionMiddleware,
     store=CookieStore(secret_key=settings.session_secret_key),
     lifetime=settings.session_lifetime_seconds,
-    cookie_https_only=False,
+    cookie_https_only=settings.cookie_https_only,
     cookie_same_site="lax",
 )
 
@@ -518,8 +518,9 @@ def running_jobs(request: Request):
     )
 
 
-@app.post("/api/v1/ingest", response_model=IngestResponse)
+@app.post("/api/v1/ingest", response_model=IngestResponse, dependencies=[Depends(_local_only)])
 def ingest():
+    """重建索引。仅限内网/本机调用（运维操作，避免公网触发耗资源的重建）。"""
     _ensure_preload_ready()
     start_trace(kind="ingest")
     result = ingestion.ingest()

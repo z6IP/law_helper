@@ -118,6 +118,8 @@ class Settings(BaseSettings):
     # 会话 Cookie（starsessions）
     session_secret_key: str = ""
     session_lifetime_seconds: int = 3600 * 24 * 14
+    # 上线 HTTPS 后设为 True（Cookie 仅通过 https 传输）；本地开发保持 False
+    cookie_https_only: bool = False
 
     # CORS：开发时前端在 http://localhost:5173；生产通过逗号分隔配置多个来源
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"

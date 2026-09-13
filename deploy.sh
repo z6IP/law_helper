@@ -12,6 +12,46 @@ git reset --hard origin/main
 git clean -fd  # 清理未跟踪的文件（如构建产物）
 
 echo ""
+echo "===== 1.5 安全前置：TLS 证书与访问口令 ====="
+# 域名与 Basic Auth 用户名（可覆盖为真实值）
+DOMAIN="${DOMAIN:-your-domain.com}"
+BASIC_AUTH_USER="${BASIC_AUTH_USER:-admin}"
+
+# 1) TLS 证书：域名就绪前用自签名占位保证 nginx 能启动；域名就绪后 certbot 申请真证书
+CERT_DIR="/etc/nginx/certs"
+LIVE_DIR="/etc/letsencrypt/live/${DOMAIN}"
+sudo mkdir -p "$CERT_DIR"
+if [ -f "$LIVE_DIR/fullchain.pem" ] && [ -f "$LIVE_DIR/privkey.pem" ]; then
+  # 真证书已就绪：软链接到固定路径（certbot 续期后无需改 nginx 配置）
+  sudo ln -sf "$LIVE_DIR/fullchain.pem" "$CERT_DIR/fullchain.pem"
+  sudo ln -sf "$LIVE_DIR/privkey.pem" "$CERT_DIR/privkey.pem"
+  echo "已链接正式证书：$LIVE_DIR"
+elif [ ! -f "$CERT_DIR/fullchain.pem" ] || [ ! -f "$CERT_DIR/privkey.pem" ]; then
+  echo "未检测到正式证书，生成自签名占位证书（域名就绪后请用 certbot 替换）..."
+  sudo openssl req -x509 -nodes -days 90 -newkey rsa:2048 \
+    -keyout "$CERT_DIR/privkey.pem" -out "$CERT_DIR/fullchain.pem" \
+    -subj "/CN=${DOMAIN}" 2>/dev/null
+fi
+
+# 2) Basic Auth 口令文件（首次生成；已存在则跳过）
+HTPASSWD_FILE="nginx/.htpasswd"
+if [ ! -f "$HTPASSWD_FILE" ]; then
+  if [ -z "${BASIC_AUTH_PASS:-}" ]; then
+    echo "首次部署需设置访问口令（用户：${BASIC_AUTH_USER}）："
+    read -rsp "请输入访问口令: " BASIC_AUTH_PASS || true
+    echo
+  fi
+  if [ -z "$BASIC_AUTH_PASS" ]; then
+    echo "口令不能为空。请设置 BASIC_AUTH_PASS 环境变量后重试，或手动生成："
+    echo "  printf '${BASIC_AUTH_USER}:' > nginx/.htpasswd && openssl passwd -apr1 >> nginx/.htpasswd"
+    exit 1
+  fi
+  printf '%s:%s\n' "$BASIC_AUTH_USER" "$(openssl passwd -apr1 "$BASIC_AUTH_PASS")" > "$HTPASSWD_FILE"
+  chmod 600 "$HTPASSWD_FILE"
+  echo "已生成 $HTPASSWD_FILE"
+fi
+
+echo ""
 echo "===== 2. 重建后端 Docker 镜像 ====="
 docker compose build backend
 
@@ -65,4 +105,14 @@ docker compose ps
 
 echo ""
 echo "===== 部署完成 ====="
-echo "访问 http://<服务器IP> 验证"
+echo "域名就绪前：http://<服务器IP>（自签名证书会触发浏览器告警，属正常过渡期现象）"
+echo "域名就绪后（需先完成下方证书申请）：https://<你的域名>"
+echo ""
+echo "===== 附：域名就绪后申请正式 HTTPS 证书 ====="
+echo "1. 将 nginx/nginx.conf 中的两处 your-domain.com 替换为真实域名"
+echo "2. 安装 certbot 并申请证书（webroot 模式，无需停 nginx）："
+echo "   sudo certbot certonly --webroot -w /var/www/certbot -d 你的域名"
+echo "3. 重新运行: bash deploy.sh（自动链接正式证书到固定路径并 reload）"
+echo "4. 证书续期（certbot timer 默认启用，续期后自动 reload nginx）："
+echo "   sudo certbot renew --deploy-hook 'docker exec law-helper-nginx nginx -s reload'"
+echo "5. 在 .env 中设置：COOKIE_HTTPS_ONLY=true、CORS_ORIGINS=https://你的域名"

@@ -42,11 +42,20 @@ services:
     restart: unless-stopped
     ports:
       - "80:80"
+      - "443:443"
     volumes:
       # 前端静态文件（构建产物，只读挂载）
       - ./frontend/dist:/usr/share/nginx/html:ro
       # nginx 配置
       - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      # TLS 证书（deploy.sh 维护：正式证书软链接或自签名占位）
+      - /etc/nginx/certs:/etc/nginx/certs:ro
+      # certbot 证书根目录（挂载整个目录，使 live/ 下的软链接可解析到 archive/）
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      # ACME webroot 挑战目录
+      - /var/www/certbot:/var/www/certbot:ro
+      # Basic Auth 密码文件（deploy.sh 生成）
+      - ./nginx/.htpasswd:/etc/nginx/htpasswd:ro
     networks:
       - law-helper-net
     depends_on:

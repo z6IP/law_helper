@@ -3,6 +3,15 @@
 .env.*
 !.env.example
 
+# Basic Auth 口令文件（敏感，不入仓库）
+nginx/.htpasswd
+
+# 证书与私钥（敏感，不入仓库；正式证书仅存放于服务器 /etc/letsencrypt）
+*.pem
+*.key
+*.crt
+*.p12
+
 # 调试脚本
 _debug_*.py
 .trae/
@@ -12,6 +21,7 @@ dashboard.html
 
 # AI 助手本地权限配置
 settings.json
+.claude/
 
 # AI 助手项目数据（计划文档等，不入仓库，本地保留）
 .codebuddy/
@@ -24,6 +34,8 @@ __pycache__/
 venv/
 .ruff_cache/
 .pytest_cache/
+.coverage
+htmlcov/
 
 # 运行时数据
 models/
@@ -36,6 +48,7 @@ node_modules/
 dist/
 frontend/node_modules/
 frontend/dist/
+*.tsbuildinfo
 
 # IDE
 .idea/
