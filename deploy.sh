@@ -55,7 +55,7 @@ if [ ! -f "$HTPASSWD_FILE" ]; then
     exit 1
   fi
   printf '%s:%s\n' "$BASIC_AUTH_USER" "$(openssl passwd -apr1 "$BASIC_AUTH_PASS")" > "$HTPASSWD_FILE"
-  chmod 600 "$HTPASSWD_FILE"
+  chmod 644 "$HTPASSWD_FILE"
   echo "已生成 $HTPASSWD_FILE"
 fi
 
@@ -95,7 +95,7 @@ if [ "$has_swap" = false ]; then
   echo "未检测到 swap，创建 2G swapfile..."
   if [ ! -f /swapfile ]; then
     sudo fallocate -l 2G /swapfile
-    sudo chmod 600 /swapfile
+    sudo chmod 644 /swapfile
     sudo mkswap /swapfile
   fi
   sudo swapon /swapfile || true
