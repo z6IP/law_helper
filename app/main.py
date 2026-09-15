@@ -9,11 +9,11 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi_throttle import RateLimiter
 from starsessions import CookieStore, SessionAutoloadMiddleware, SessionMiddleware
 
-from app import answer_cache, ingestion, jobs, session_db, session_store
+from app import answer_cache, auth, ingestion, jobs, session_db, session_store, turnstile
 from app.config import get_settings, USER_DATA_DIR
 from app.document_parser import parse_document
 from app.errors import LawHelperError
@@ -30,11 +30,29 @@ from app.schemas import (
     SessionSaveRequest,
     SummarizeTitleRequest,
     SummarizeTitleResponse,
+    TokenCreateRequest,
+    TokenListResponse,
+    TokenResponse,
     TracesResponse,
 )
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
+
+
+class _AccessLogRedactionFilter(logging.Filter):
+    """屏蔽 uvicorn access log 中含授权令牌明文的请求（/api/v1/access/）。
+
+    授权兑换链接为 GET /api/v1/access/{明文token}，token 会出现在 uvicorn 默认
+    access log 与 Docker 日志中；此过滤器在日志层将其整行丢弃，配合 nginx 侧
+    关闭该路径访问日志，彻底避免令牌明文落盘。
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "/api/v1/access/" not in record.getMessage()
+
+
+logging.getLogger("uvicorn.access").addFilter(_AccessLogRedactionFilter())
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DASHBOARD_HTML_PATH = BASE_DIR / "dashboard.html"
@@ -193,13 +211,13 @@ async def law_error_handler(request, exc: LawHelperError):
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
 
 
-def _browser_session_key(req: Request) -> str:
-    """为当前浏览器会话生成/复用一个稳定的 key，用于限流。"""
-    key = req.session.get("browser_session_id")
-    if not key:
-        key = uuid.uuid4().hex
-        req.session["browser_session_id"] = key
-    return key
+def _user_id_key(req: Request) -> str:
+    """以匿名 user_id 作为限流 key。
+
+    注意：user_id 随 session cookie 持久化，清 cookie 即换新身份、重置限流与配额；
+    该漏洞由可选启用的 Turnstile 人机验证兜底（见 docs/auth.md）。
+    """
+    return auth.get_or_create_user(req)
 
 
 def _ensure_session_access(req: Request, session_id: str | None) -> None:
@@ -240,8 +258,8 @@ def _effective_question(question: str, document_text: str | None) -> str:
     return question
 
 
-# 按浏览器会话限流：每个浏览器会话在 60 秒内最多请求 10 次聊天接口
-chat_limiter = RateLimiter(times=10, seconds=60, key_func=_browser_session_key)
+# 按用户限流：每个匿名用户在 60 秒内最多请求 10 次聊天接口
+chat_limiter = RateLimiter(times=10, seconds=60, key_func=_user_id_key)
 
 
 @app.get("/api/v1/health")
@@ -259,6 +277,42 @@ def ready():
     }
 
 
+@app.get("/api/v1/access/{token}")
+def access_token(token: str, request: Request):
+    """授权入口：访客点击带令牌的链接，校验通过后种授权标记并跳回首页。
+
+    全程无需输入任何凭据；无效/已吊销/已过期令牌统一返回 403 提示页。
+    """
+    if auth.consume_token(request, token):
+        return RedirectResponse("/", status_code=302)
+    return HTMLResponse(
+        "<html><body><h1>链接无效或已过期</h1>"
+        "<p>请联系管理员获取新的访问链接。</p></body></html>",
+        status_code=403,
+    )
+
+
+@app.post("/api/v1/admin/tokens", response_model=TokenResponse, dependencies=[Depends(_local_only)])
+def admin_create_token(req: TokenCreateRequest):
+    """本地运维接口：生成一枚授权令牌（仅本机可调用）。"""
+    days = req.days if req.days is not None else get_settings().access_token_default_days
+    info = auth.generate_token(req.note, days)
+    return TokenResponse(**info)
+
+
+@app.get("/api/v1/admin/tokens", response_model=TokenListResponse, dependencies=[Depends(_local_only)])
+def admin_list_tokens():
+    """列出全部令牌（不含明文）。"""
+    return TokenListResponse(tokens=auth.list_tokens())
+
+
+@app.delete("/api/v1/admin/tokens/{token_hash}", dependencies=[Depends(_local_only)])
+def admin_revoke_token(token_hash: str):
+    """吊销令牌。"""
+    ok = auth.revoke_token(token_hash)
+    return {"status": "ok" if ok else "not_found"}
+
+
 def _ensure_preload_ready() -> None:
     """chat 接口前置检查：预热未完成或失败时返回 503，避免冷启动超时。"""
     if _PRELOAD_STATE["error"] is not None:
@@ -271,6 +325,16 @@ def _ensure_preload_ready() -> None:
             status_code=503,
             detail=f"模型加载中（阶段：{_PRELOAD_STATE['stage']}），请稍后再试",
         )
+
+
+def _verify_turnstile(token: str | None) -> None:
+    """Turnstile 人机验证门禁：未启用时直接放行，启用但未通过时返回 403。
+
+    不传 remoteip：反代后 request.client.host 是 nginx 容器内网 IP 而非真实客户端 IP，
+    传错反而可能导致 siteverify 误判；IP 级防护已由 nginx limit_req 承担。
+    """
+    if not turnstile.verify(token):
+        raise HTTPException(status_code=403, detail="人机验证未通过，请刷新页面后重试")
 
 
 def _user_input_title(content: str, max_length: int = 18) -> str:
@@ -333,7 +397,7 @@ def _summarize_title_from_messages(messages: list[dict]) -> str:
 @app.post(
     "/api/v1/sessions/{session_id}/summarize",
     response_model=SummarizeTitleResponse,
-    dependencies=[Depends(_ensure_preload_ready)],
+    dependencies=[Depends(_ensure_preload_ready), Depends(auth.require_authorized_user)],
 )
 def summarize_session(session_id: str, req: SummarizeTitleRequest, request: Request):
     """根据会话消息生成总结性标题并持久化。"""
@@ -366,8 +430,15 @@ def _save_upload(content: bytes, filename: str | None) -> tuple[str, str]:
     return f"/api/v1/uploads/{saved_name}", saved_name
 
 
-@app.post("/api/v1/chat/upload", dependencies=[Depends(chat_limiter)])
-def chat_upload(request: Request, file: UploadFile = File(...), session_id: str | None = None):
+@app.post(
+    "/api/v1/chat/upload",
+    dependencies=[Depends(chat_limiter), Depends(auth.require_authorized_user)],
+)
+def chat_upload(
+    request: Request,
+    file: UploadFile = File(...),
+    session_id: str | None = None,
+):
     """上传并解析文件，返回提取的文本内容（仅作为一次性上下文）以及文件 URL。
 
     session_id 可选：传入时将上传文件标记为该会话的待持久化附件，
@@ -400,7 +471,7 @@ def chat_upload(request: Request, file: UploadFile = File(...), session_id: str 
     return {"text": text, "url": url, "name": file.filename}
 
 
-@app.get("/api/v1/uploads/{filename}")
+@app.get("/api/v1/uploads/{filename}", dependencies=[Depends(auth.require_authorized_user)])
 def get_upload(filename: str, request: Request):
     """获取上传的文件，仅限当前浏览器会话中可访问的会话附件。"""
     allowed = set(request.session.get("session_ids", []))
@@ -437,14 +508,30 @@ def get_upload(filename: str, request: Request):
     return FileResponse(dest)
 
 
-@app.post("/api/v1/chat", response_model=ChatResponse, dependencies=[Depends(_ensure_preload_ready), Depends(chat_limiter)])
+@app.post(
+    "/api/v1/chat",
+    response_model=ChatResponse,
+    dependencies=[
+        Depends(_ensure_preload_ready),
+        Depends(chat_limiter),
+        Depends(auth.require_authorized_user),
+    ],
+)
 def chat(req: ChatRequest, request: Request):
     _ensure_session_access(request, req.session_id)
+    _verify_turnstile(req.turnstile_token)
+    # 配额在会话校验与人机验证之后递增：被拒绝的请求不应消耗每日额度
+    auth.enforce_daily_chat_quota(request)
     question = _effective_question(req.question, req.document_text)
     # answer_cache 已永久禁用（get/put 均 no-op），移除死代码分支。
     # 若将来恢复缓存，get/put 条件必须补上 `not req.document_text`，
     # 否则带材料的回答会污染裸问题的缓存（完整条件参见 jobs.py Job._run）。
-    start_trace(kind="chat", question=question, session_id=req.session_id)
+    start_trace(
+        kind="chat",
+        question=question,
+        session_id=req.session_id,
+        user_id=auth.get_or_create_user(request),
+    )
     text, references = answer(
         question, req.history, req.document_text, req.law_source, req.article_no
     )
@@ -452,7 +539,14 @@ def chat(req: ChatRequest, request: Request):
     return ChatResponse(answer=text, references=references)
 
 
-@app.post("/api/v1/chat/stream", dependencies=[Depends(_ensure_preload_ready), Depends(chat_limiter)])
+@app.post(
+    "/api/v1/chat/stream",
+    dependencies=[
+        Depends(_ensure_preload_ready),
+        Depends(chat_limiter),
+        Depends(auth.require_authorized_user),
+    ],
+)
 def chat_stream(req: ChatRequest, request: Request):
     """提交后台问答任务，并以 NDJSON 流式回放事件（references / reasoning / delta / progress）。
 
@@ -460,6 +554,9 @@ def chat_stream(req: ChatRequest, request: Request):
     完成后自动写入会话存储。
     """
     _ensure_session_access(request, req.session_id)
+    _verify_turnstile(req.turnstile_token)
+    # 配额在会话校验与人机验证之后递增：被拒绝的请求不应消耗每日额度
+    auth.enforce_daily_chat_quota(request)
     question = _effective_question(req.question, req.document_text)
     if not req.session_id:
         raise HTTPException(status_code=400, detail="缺少会话 ID")
@@ -476,6 +573,7 @@ def chat_stream(req: ChatRequest, request: Request):
             file_names=req.file_names,
             attachments=[a.model_dump() for a in (req.attachments or [])],
             deep_thinking=req.deep_thinking,
+            user_id=auth.get_or_create_user(request),
         )
     except jobs.JobConflictError as exc:
         raise HTTPException(status_code=409, detail=exc.message)
@@ -502,14 +600,14 @@ def _job_event_stream(session_id: str):
         job.wait_for(cursor)
 
 
-@app.get("/api/v1/chat/jobs/{session_id}/stream")
+@app.get("/api/v1/chat/jobs/{session_id}/stream", dependencies=[Depends(auth.require_authorized_user)])
 def job_stream(session_id: str, request: Request):
     """订阅某个会话的后台生成事件（用于刷新/关闭标签页后恢复展示进行中的回答）。"""
     _ensure_session_access(request, session_id)
     return StreamingResponse(_job_event_stream(session_id), media_type="application/x-ndjson")
 
 
-@app.get("/api/v1/chat/jobs/running", response_model=RunningJobsResponse)
+@app.get("/api/v1/chat/jobs/running", response_model=RunningJobsResponse, dependencies=[Depends(auth.require_authorized_user)])
 def running_jobs(request: Request):
     """返回当前浏览器会话可见的、正在生成回答的会话 ID 列表。"""
     allowed = set(request.session.get("session_ids", []))
@@ -537,6 +635,16 @@ def llm_model():
     return {"llm_model": get_settings().llm_model}
 
 
+@app.get("/api/v1/settings/security")
+def security_settings():
+    """返回 Turnstile 是否启用及 sitekey（公开），供前端决定是否渲染验证组件。"""
+    s = get_settings()
+    return {
+        "turnstile_enabled": turnstile.is_enabled(),
+        "turnstile_site_key": s.turnstile_site_key,
+    }
+
+
 @app.get("/api/v1/traces", response_model=TracesResponse, dependencies=[Depends(_local_only)])
 def traces(limit: int = 200, offset: int = 0):
     """观测面板只读接口：返回 trace 摘要列表与汇总统计（按开始时间倒序）。仅本地可访问。"""
@@ -561,7 +669,7 @@ def _read_dashboard_html() -> str:
         return "<html><body><h1>可观测性面板</h1><p>dashboard.html 缺失</p></body></html>"
 
 
-@app.get("/api/v1/sessions", response_model=list[SessionData])
+@app.get("/api/v1/sessions", response_model=list[SessionData], dependencies=[Depends(auth.require_authorized_user)])
 def list_sessions(request: Request):
     """当前浏览器会话有权访问的会话列表（按 updated_at 降序）。"""
     allowed = set(request.session.get("session_ids", []))
@@ -569,7 +677,7 @@ def list_sessions(request: Request):
     return [SessionData.model_validate(s) for s in all_sessions if s["id"] in allowed]
 
 
-@app.put("/api/v1/sessions/{session_id}", response_model=SessionData)
+@app.put("/api/v1/sessions/{session_id}", response_model=SessionData, dependencies=[Depends(auth.require_authorized_user)])
 def save_session(session_id: str, req: SessionSaveRequest, request: Request):
     """upsert 会话（空会话不应调用此接口）。"""
     _ensure_session_access(request, session_id)
@@ -582,7 +690,7 @@ def save_session(session_id: str, req: SessionSaveRequest, request: Request):
     )
 
 
-@app.delete("/api/v1/sessions/{session_id}")
+@app.delete("/api/v1/sessions/{session_id}", dependencies=[Depends(auth.require_authorized_user)])
 def delete_session(session_id: str, request: Request):
     _ensure_session_access(request, session_id)
     ok = session_store.delete(session_id)

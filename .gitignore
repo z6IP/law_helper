@@ -3,9 +3,6 @@
 .env.*
 !.env.example
 
-# Basic Auth 口令文件（敏感，不入仓库）
-nginx/.htpasswd
-
 # 证书与私钥（敏感，不入仓库；正式证书仅存放于服务器 /etc/letsencrypt）
 *.pem
 *.key

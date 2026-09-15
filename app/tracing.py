@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS traces (
     kind TEXT,
     question TEXT,
     session_id TEXT,
+    user_id TEXT,
     cache_hit INTEGER DEFAULT 0,
     status TEXT DEFAULT 'ok',
     started_at TEXT,
@@ -94,6 +95,8 @@ def _init_db() -> None:
         conn.executescript(_TABLE_SQL)
         # 迁移：为旧表添加新列（如果不存在）
         cols = {row[1] for row in conn.execute("PRAGMA table_info(traces)").fetchall()}
+        if "user_id" not in cols:
+            conn.execute("ALTER TABLE traces ADD COLUMN user_id TEXT")
         for col in ("llm_tokens", "embedding_tokens", "rerank_tokens"):
             if col not in cols:
                 conn.execute(f"ALTER TABLE traces ADD COLUMN {col} INTEGER DEFAULT 0")
@@ -178,13 +181,14 @@ def start_trace(**attrs) -> str:
     kind = attrs.get("kind")
     question = attrs.get("question")
     session_id = attrs.get("session_id")
+    user_id = attrs.get("user_id")
     cache_hit = 1 if attrs.get("cache_hit") else 0
     with _LOCK:
         _db_execute(
             "INSERT OR REPLACE INTO traces "
-            "(trace_id, kind, question, session_id, cache_hit, status, started_at) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (trace_id, kind, question, session_id, cache_hit, "ok", started_at),
+            "(trace_id, kind, question, session_id, user_id, cache_hit, status, started_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (trace_id, kind, question, session_id, user_id, cache_hit, "ok", started_at),
         )
     return trace_id
 
@@ -302,7 +306,7 @@ def query_traces(limit: int = 200, offset: int = 0) -> dict:
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(
-            "SELECT trace_id, kind, question, session_id, cache_hit, status, "
+            "SELECT trace_id, kind, question, session_id, user_id, cache_hit, status, "
             "started_at, duration_ms, prompt_tokens, completion_tokens, total_tokens, "
             "llm_tokens, embedding_tokens, rerank_tokens "
             "FROM traces ORDER BY started_at DESC LIMIT ? OFFSET ?",
@@ -322,6 +326,7 @@ def query_traces(limit: int = 200, offset: int = 0) -> dict:
             "kind": r["kind"],
             "question": r["question"],
             "session_id": r["session_id"],
+            "user_id": r["user_id"] or "",
             "cache_hit": bool(r["cache_hit"]),
             "status": r["status"],
             "started_at": r["started_at"] or "",

@@ -121,6 +121,22 @@ class Settings(BaseSettings):
     # 上线 HTTPS 后设为 True（Cookie 仅通过 https 传输）；本地开发保持 False
     cookie_https_only: bool = False
 
+    # 免登录认证（详见 docs/auth.md）
+    # auth_mode: "open" = 仅匿名身份 + 限流（单用户本地默认，行为不变）
+    #            "token" = 启用令牌门禁，未授权访客不能调用核心接口
+    auth_mode: str = "open"
+    # 每用户每日聊天配额（0 表示不限制）
+    user_daily_chat_quota: int = Field(50, ge=0)
+    # 管理员生成授权令牌的默认有效期（天）；<=0 表示永不过期
+    access_token_default_days: int = 30
+
+    # Cloudflare Turnstile 人机验证（防刷兜底，默认禁用）
+    # site_key 与 secret_key 同时配置才启用；sitekey 公开，secret 机密（勿进 git）
+    turnstile_site_key: str = ""
+    turnstile_secret_key: str = ""
+    # 前端 hostname 白名单（逗号分隔）；生产建议配置，空则跳过 hostname 校验
+    turnstile_hostnames: str = ""
+
     # CORS：开发时前端在 http://localhost:5173；生产通过逗号分隔配置多个来源
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
 
@@ -137,6 +153,14 @@ class Settings(BaseSettings):
         allowed = {"api", "dashscope", "local"}
         if v not in allowed:
             raise ValueError(f"embedding_backend 必须是 {allowed} 之一，当前为 {v!r}")
+        return v
+
+    @field_validator("auth_mode")
+    @classmethod
+    def _validate_auth_mode(cls, v: str) -> str:
+        allowed = {"open", "token"}
+        if v not in allowed:
+            raise ValueError(f"auth_mode 必须是 {allowed} 之一，当前为 {v!r}")
         return v
 
     @model_validator(mode="after")

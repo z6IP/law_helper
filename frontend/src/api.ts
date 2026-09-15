@@ -28,6 +28,15 @@ export async function fetchLLMModel(): Promise<string> {
   return data.llm_model
 }
 
+export interface SecuritySettings {
+  turnstile_enabled: boolean
+  turnstile_site_key: string
+}
+
+export async function fetchSecuritySettings(): Promise<SecuritySettings> {
+  return fetchJson<SecuritySettings>('/settings/security')
+}
+
 export async function listRunningJobs(): Promise<string[]> {
   const data = await fetchJson<{ sessions: string[] }>('/chat/jobs/running')
   return data.sessions
@@ -135,6 +144,7 @@ export function streamChat(
   fileNames?: string[],
   attachments?: Attachment[],
   deepThinking?: boolean,
+  turnstileToken?: string,
 ): () => void {
   const payload = {
     question,
@@ -144,6 +154,7 @@ export function streamChat(
     file_names: fileNames,
     attachments,
     deep_thinking: deepThinking,
+    turnstile_token: turnstileToken,
     history: history.map((m) => ({
       role: m.role,
       content: m.content,

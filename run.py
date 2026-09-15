@@ -146,7 +146,6 @@ def main() -> None:
     threading.Thread(target=_stream, args=("backend", backend.stdout), daemon=True).start()
 
     # 等待后端预热完成（模型加载、索引校验）后再启动前端，避免前端代理报错
-    print("[启动] 等待后端预热完成（最长 5 分钟，重启电脑后首次启动可能较慢）...")
     if not _wait_for_backend():
         print("\n[错误] 后端预热超时，请查看上方输出的后端日志")
         _terminate()

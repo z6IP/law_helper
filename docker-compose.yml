@@ -54,8 +54,6 @@ services:
       - /etc/letsencrypt:/etc/letsencrypt:ro
       # ACME webroot 挑战目录
       - /var/www/certbot:/var/www/certbot:ro
-      # Basic Auth 密码文件（deploy.sh 生成）
-      - ./nginx/.htpasswd:/etc/nginx/htpasswd:ro
     networks:
       - law-helper-net
     depends_on:

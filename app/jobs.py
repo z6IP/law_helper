@@ -94,6 +94,7 @@ class Job:
         file_names: list[str] | None = None,
         attachments: list[dict] | None = None,
         deep_thinking: bool = False,
+        user_id: str | None = None,
     ):
         self.session_id = session_id
         self.question = question
@@ -105,6 +106,7 @@ class Job:
         self.file_names = file_names or []
         self.attachments = attachments or []
         self.deep_thinking = deep_thinking
+        self.user_id = user_id
 
         self.status = "running"  # running / done / error
         self.error: str | None = None
@@ -154,6 +156,7 @@ class Job:
             question=self.question,
             session_id=self.session_id,
             cache_hit=cached is not None,
+            user_id=self.user_id,
         )
         try:
             if cached is not None:
@@ -248,6 +251,7 @@ def submit_chat_job(
     file_names: list[str] | None = None,
     attachments: list[dict] | None = None,
     deep_thinking: bool = False,
+    user_id: str | None = None,
 ) -> Job:
     """创建并启动一个后台问答任务；同会话已有任务在跑时抛出 JobConflictError。"""
     with _JOBS_LOCK:
@@ -256,7 +260,7 @@ def submit_chat_job(
             raise JobConflictError()
         job = Job(
             session_id, question, history, title, document_text,
-            law_source, article_no, file_names, attachments, deep_thinking,
+            law_source, article_no, file_names, attachments, deep_thinking, user_id,
         )
         _JOBS[session_id] = job
 

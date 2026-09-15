@@ -70,6 +70,11 @@ class ChatRequest(_BaseSchema):
         False,
         description="是否开启深度思考（LLM 推理思考），默认关闭；由前端输入框按钮控制",
     )
+    turnstile_token: str | None = Field(
+        None,
+        max_length=2048,
+        description="Cloudflare Turnstile 一次性人机验证 token（后端启用验证时必填）",
+    )
 
 
 class Reference(_BaseSchema):
@@ -140,6 +145,7 @@ class TraceItem(_BaseSchema):
     kind: str = Field(..., description="trace 类型：chat/chat_stream/preload/ingest")
     question: str | None = Field(None, description="用户问题（仅问答类有）")
     session_id: str | None = Field(None, description="会话 ID")
+    user_id: str = Field("", description="匿名用户 ID（免登录认证模块）")
     cache_hit: bool = Field(False, description="是否命中答案缓存")
     status: str = Field("ok", description="trace 状态：ok/error")
     started_at: str = Field("", description="开始时间（ISO）")
@@ -160,3 +166,37 @@ class TracesResponse(_BaseSchema):
     total_tokens: int = Field(0, description="全部 trace 累计 token")
     cache_hit_count: int = Field(0, description="命中缓存的 trace 数")
     avg_duration_ms: float = Field(0, description="平均耗时（毫秒）")
+
+
+class TokenCreateRequest(_BaseSchema):
+    """管理员生成授权令牌的请求体。"""
+
+    note: str = Field("", description="备注（可选，如分发给谁）")
+    days: int | None = Field(
+        None,
+        ge=0,
+        description="有效期天数；为空时用 access_token_default_days；0 表示永不过期",
+    )
+
+
+class TokenResponse(_BaseSchema):
+    """令牌生成结果（明文 token 仅此一次返回）。"""
+
+    token: str = Field(..., description="明文令牌，用于拼授权链接")
+    token_hash: str = Field(..., description="令牌哈希（库中存储值）")
+    expires_at: str | None = Field(None, description="过期时间（ISO），None 表示永不过期")
+    note: str = Field("", description="备注")
+
+
+class TokenInfo(_BaseSchema):
+    """令牌列表项（不含明文）。"""
+
+    token_hash: str = Field(..., description="令牌哈希")
+    created_at: str = Field(..., description="创建时间（ISO）")
+    expires_at: str | None = Field(None, description="过期时间（ISO）")
+    note: str = Field("", description="备注")
+    revoked: bool = Field(False, description="是否已吊销")
+
+
+class TokenListResponse(_BaseSchema):
+    tokens: list[TokenInfo] = Field(default_factory=list, description="令牌列表")

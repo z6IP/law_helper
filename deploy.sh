@@ -18,10 +18,9 @@ git reset --hard origin/main
 git clean -fd  # 清理未跟踪文件（frontend/dist/ 已被 .gitignore 忽略，不会误删上传的产物）
 
 echo ""
-echo "===== 1.5 安全前置：TLS 证书与访问口令 ====="
-# 域名与 Basic Auth 用户名（可覆盖为真实值）
+echo "===== 1.5 安全前置：TLS 证书 ====="
+# 域名（可覆盖为真实值）
 DOMAIN="${DOMAIN:-your-domain.com}"
-BASIC_AUTH_USER="${BASIC_AUTH_USER:-admin}"
 
 # 1) TLS 证书：优先 certbot 正式证书 → 其次手动上传的证书 → 最后自签名占位
 CERT_DIR="/etc/nginx/certs"
@@ -39,24 +38,6 @@ else
   sudo openssl req -x509 -nodes -days 90 -newkey rsa:2048 \
     -keyout "$CERT_DIR/privkey.pem" -out "$CERT_DIR/fullchain.pem" \
     -subj "/CN=${DOMAIN}" 2>/dev/null
-fi
-
-# 2) Basic Auth 口令文件（首次生成；已存在则跳过）
-HTPASSWD_FILE="nginx/.htpasswd"
-if [ ! -f "$HTPASSWD_FILE" ]; then
-  if [ -z "${BASIC_AUTH_PASS:-}" ]; then
-    echo "首次部署需设置访问口令（用户：${BASIC_AUTH_USER}）："
-    read -rsp "请输入访问口令: " BASIC_AUTH_PASS || true
-    echo
-  fi
-  if [ -z "$BASIC_AUTH_PASS" ]; then
-    echo "口令不能为空。请设置 BASIC_AUTH_PASS 环境变量后重试，或手动生成："
-    echo "  printf '${BASIC_AUTH_USER}:' > nginx/.htpasswd && openssl passwd -apr1 >> nginx/.htpasswd"
-    exit 1
-  fi
-  printf '%s:%s\n' "$BASIC_AUTH_USER" "$(openssl passwd -apr1 "$BASIC_AUTH_PASS")" > "$HTPASSWD_FILE"
-  chmod 644 "$HTPASSWD_FILE"
-  echo "已生成 $HTPASSWD_FILE"
 fi
 
 echo ""
