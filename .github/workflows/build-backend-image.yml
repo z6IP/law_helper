@@ -39,6 +39,34 @@ jobs:
       - name: 配置 Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: 校验仓库配置
+        env:
+          CFG_REGISTRY: ${{ secrets.ACR_REGISTRY }}
+          CFG_NAMESPACE: ${{ secrets.ACR_NAMESPACE }}
+          CFG_USERNAME: ${{ secrets.ACR_USERNAME }}
+          CFG_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+        run: |
+          # 逐个点名缺失项。否则 docker/login-action 只会抛出
+          # "Username and password required"，无法判断缺的是哪个，
+          # 也看不出是不是建到了 Variables / Environments 下导致 secrets.* 读不到。
+          missing=""
+          for pair in ACR_REGISTRY:CFG_REGISTRY ACR_NAMESPACE:CFG_NAMESPACE ACR_USERNAME:CFG_USERNAME ACR_PASSWORD:CFG_PASSWORD; do
+            name="${pair%%:*}"
+            var="${pair##*:}"
+            if [ -z "${!var}" ]; then
+              missing="${missing} ${name}"
+            fi
+          done
+          if [ -n "${missing}" ]; then
+            echo "::error::缺少仓库配置:${missing}"
+            echo ""
+            echo "请到 GitHub 仓库 → Settings → Secrets and variables → Actions"
+            echo "→【Secrets】标签页 →【Repository secrets】补齐上述名称（大小写与下划线逐字一致）。"
+            echo "常见错误：建到了 Variables 标签页或 Environments 下，此时 secrets.* 取不到值。"
+            exit 1
+          fi
+          echo "4 项仓库配置均已就位"
+
       - name: 登录 ACR
         uses: docker/login-action@v3
         with:
