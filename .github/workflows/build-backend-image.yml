@@ -91,6 +91,13 @@ jobs:
           # 规避每次跨境重传约 2GB。mode=max 会把中间层也纳入缓存，这是增量推送的前提。
           cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
           cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
+          # 关闭 provenance / SBOM 证明。开启时 BuildKit 推送的不是普通镜像，
+          # 而是带 application/vnd.oci.empty.v1+json 空描述符的 attestation 索引，
+          # 阿里云 ACR 不支持该 manifest 类别，会直接拒绝：
+          #   denied: unknown manifest class for application/vnd.oci.empty.v1+json
+          # 关闭后推送普通单架构镜像清单，ACR 可正常接收。
+          provenance: false
+          sbom: false
 
       - name: 输出构建结果
         run: |
