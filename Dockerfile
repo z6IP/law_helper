@@ -1,12 +1,26 @@
+# 构建参数：镜像源可切换。
+# 默认走 Debian / PyPI 官方源——构建已迁移到 GitHub Actions（境外 runner），
+# 官方源最快。如需在国内构建，用 --build-arg 传回阿里云源：
+#   --build-arg APT_MIRROR=mirrors.aliyun.com \
+#   --build-arg APT_SECURITY_MIRROR=mirrors.aliyun.com \
+#   --build-arg PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+ARG APT_MIRROR=deb.debian.org
+ARG APT_SECURITY_MIRROR=security.debian.org
+ARG PIP_INDEX_URL=https://pypi.org/simple
+
 # ===== Stage 1: builder（装 Python 依赖）=====
 FROM python:3.11-slim AS builder
+
+# ARG 在 FROM 之后需重新声明，才能被本阶段的 RUN 使用
+ARG APT_MIRROR
+ARG APT_SECURITY_MIRROR
+ARG PIP_INDEX_URL
 
 WORKDIR /app
 
 # 系统依赖：编译工具 + OpenMP（pymupdf/chromadb 可能需要）
-# 使用阿里云镜像源加速国内构建
-RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources && \
-    sed -i 's|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources && \
+RUN sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources && \
+    sed -i "s|security.debian.org|${APT_SECURITY_MIRROR}|g" /etc/apt/sources.list.d/debian.sources && \
     apt-get update && apt-get install -y --no-install-recommends \
     build-essential libgomp1 \
     && rm -rf /var/lib/apt/lists/*
@@ -16,20 +30,27 @@ COPY requirements.txt .
 # BuildKit 缓存 pip 下载目录：跨构建复用已下载的 wheel，
 # requirements 变化导致该层缓存失效时，未变动的包无需重新下载，大幅缩短重装时间。
 # 注意：使用缓存挂载时不能再传 --no-cache-dir（否则禁写缓存、缓存挂载失效）。
+# 装完清理 __pycache__/*.pyc：它们对运行无用，但会被 COPY --from=builder 一并搬进
+# 运行时镜像，属于可直接省掉的体积。
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -m venv /opt/venv && \
-    /opt/venv/bin/pip install --upgrade pip -i https://mirrors.aliyun.com/pypi/simple/ && \
-    /opt/venv/bin/pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
+    /opt/venv/bin/pip install --upgrade pip -i "${PIP_INDEX_URL}" && \
+    /opt/venv/bin/pip install -r requirements.txt -i "${PIP_INDEX_URL}" && \
+    find /opt/venv -type d -name '__pycache__' -prune -exec rm -rf {} + && \
+    find /opt/venv -type f -name '*.pyc' -delete
 
 # ===== Stage 2: runner（运行时镜像）=====
 FROM python:3.11-slim AS runner
 
+# 同上：ARG 需在本阶段重新声明
+ARG APT_MIRROR
+ARG APT_SECURITY_MIRROR
+
 WORKDIR /app
 
 # 运行时系统依赖（仅保留 libgomp1）
-# 使用阿里云镜像源加速国内构建
-RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources && \
-    sed -i 's|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources && \
+RUN sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources && \
+    sed -i "s|security.debian.org|${APT_SECURITY_MIRROR}|g" /etc/apt/sources.list.d/debian.sources && \
     apt-get update && apt-get install -y --no-install-recommends libgomp1 \
     && rm -rf /var/lib/apt/lists/* && apt-get clean
 

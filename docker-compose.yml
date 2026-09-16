@@ -1,10 +1,11 @@
 # /opt/law_helper/docker-compose.yml
 services:
   backend:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: law-helper-backend:latest
+    # 镜像由 GitHub Actions 构建并推送到阿里云 ACR，服务器只拉取。
+    # 这里刻意不保留 build: 字段——只要它存在，docker compose up -d 在本地无该镜像时
+    # 就会隐式触发服务器本地构建，正是导致 2G 机器内存颠簸卡死的根因。
+    # BACKEND_IMAGE 由 deploy.sh 读取 deploy.env 后导出（形如 <ACR>/<命名空间>/<仓库>:<标签>）。
+    image: ${BACKEND_IMAGE:-law-helper-backend:latest}
     container_name: law-helper-backend
     restart: unless-stopped
     env_file:

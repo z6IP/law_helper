@@ -3,6 +3,10 @@
 .env.*
 !.env.example
 
+# 部署期配置（ACR 地址/命名空间等，服务器本地维护）
+# 注意：上面的 .env.* 通配不匹配 deploy.env，必须单独列出
+deploy.env
+
 # 证书与私钥（敏感，不入仓库；正式证书仅存放于服务器 /etc/letsencrypt）
 *.pem
 *.key
