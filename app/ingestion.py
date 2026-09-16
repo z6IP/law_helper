@@ -739,7 +739,7 @@ def ingest() -> IngestResult:
     # 场景：切换嵌入模型（如 qwen3.7-text-embedding 1024维 → BGE-base-zh-v1.5 768维）。
     # 直接运行 python -m app.ingestion 时 main.py 的 preload 重建逻辑不会触发，
     # 因此在此处显式检测，保证 CLI 直接导入也能自动处理维度变更。
-    existing = collection.get(include=["embeddings"])
+    existing = collection.get(include=["embeddings"], limit=1)
     existing_emb = existing.get("embeddings")
     if existing_emb is not None and len(existing_emb) > 0:
         actual_dim = len(existing_emb[0])
