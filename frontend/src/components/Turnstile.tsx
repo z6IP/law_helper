@@ -111,13 +111,16 @@ export function Turnstile({
   onErrorRef.current = onError
   onReadyRef.current = onReady
 
-  // 序列化为字符串再作依赖：数组字面量每次渲染都是新引用，直接进依赖会反复重建 widget
-  const srcsKey = (scriptSrcs && scriptSrcs.length > 0 ? scriptSrcs : DEFAULT_SCRIPT_SRCS).join(',')
+  // 依赖指纹用 JSON 而非 join(',')：URL 的查询串允许出现逗号（如 ?render=explicit,onload），
+  // 用逗号拼拆会把一个地址切成两个不存在的地址，导致脚本加载必然失败且重试无效。
+  const srcsKey = JSON.stringify(
+    scriptSrcs && scriptSrcs.length > 0 ? scriptSrcs : DEFAULT_SCRIPT_SRCS,
+  )
 
   useEffect(() => {
     let cancelled = false
     if (retryRef) retryRef.current = () => setAttempt((n) => n + 1)
-    loadScript(srcsKey.split(','))
+    loadScript(JSON.parse(srcsKey) as string[])
       .then(() => {
         if (cancelled) return
         const container = containerRef.current

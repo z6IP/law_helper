@@ -537,9 +537,19 @@ body {
   display: flex;
   width: 100%;
   /* 屏幕外历史消息跳过渲染，降低长会话布局成本。
-     流式中的最后一条始终被自动滚动到视口内，不会被跳过。 */
+     注意：content-visibility: auto 隐含 contain: size layout style paint ——
+     1) 它同时是后代 position: fixed 的包含块，任何浮层（如图片预览）必须留在 .message 之外；
+     2) 被跳过的子树不参与 Ctrl+F 与部分读屏器，历史内容搜不到。 */
   content-visibility: auto;
   contain-intrinsic-size: auto 400px;
+}
+
+/* 流式中的最后一条必须始终参与布局：否则自动滚动时它可能仍被跳过，
+   用 400px 估算高度会让 scrollIntoView 落点跳动。
+   注：.message-list 的最后一个子节点是滚动锚点 <div ref={bottomRef} />，
+   因此真正的最后一条消息是倒数第二个子元素。 */
+.message:nth-last-child(2) {
+  content-visibility: visible;
 }
 
 .message-user {

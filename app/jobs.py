@@ -28,12 +28,15 @@ class JobConflictError(LawHelperError):
 
 # delta/reasoning 事件微批合并阈值：避免每个 LLM 字符 chunk 独立成事件，
 # 减少 Condition 锁竞争、线程池调度与 HTTP chunk 数量，从而降低前端渲染压力。
-# 阈值进一步调低（24→2 字符、20→16ms、2→1 字符）以接近逐 chunk flush：
-# 快速输出每 ~10ms flush 2 字符，慢速输出单字符即 flush；
-# 前端 rAF 每 16ms 合并显示 2-6 字符，视觉上匀速逐字流出。
-_DELTA_MERGE_CHARS = 2
+# 合并策略：字符阈值是「快速通道」，时间阈值只对不足阈值的残留缓冲生效。
+# 原 32 字符阈值会让首字等攒够 32 字符才下发，长回答首屏明显卡顿；
+# 但降到 2 会让微批合并整体失效（字符阈值命中即 flush，≈逐 chunk），
+# 事件数约为原 16 倍，Condition 锁竞争、线程唤醒与 HTTP chunk 数同步放大，
+# 在 2G 机器上得不偿失。取 6 作折中：常见 1-3 字符/token 下约 2-3 个 token
+# 合并为一次事件，首字延迟约 1 帧，同时仍保留数量级的合并收益。
+_DELTA_MERGE_CHARS = 6
 _DELTA_MERGE_INTERVAL = 0.016  # 16ms，对齐前端 rAF 一帧（60fps）
-# 时间阈值 flush 时的最小字符数：降至 1，允许慢速输出的单字符 chunk 立即下发
+# 时间阈值 flush 时的最小字符数：1，允许慢速输出的单字符 chunk 及时下发
 _MIN_FLUSH_CHARS = 1
 
 

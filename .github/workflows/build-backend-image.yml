@@ -27,6 +27,12 @@ concurrency:
 env:
   IMAGE_NAME: ${{ secrets.ACR_REGISTRY }}/${{ secrets.ACR_NAMESPACE }}/law-helper-backend
 
+# 本工作流只需读代码 + 向 ACR 推送，显式收窄 GITHUB_TOKEN 权限，
+# 避免默认的宽权限被第三方 action 利用（构建供应链最小权限原则）。
+# 另建议：将下方各 uses 固定到具体 commit SHA（tag 可被上游重新指向）。
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest

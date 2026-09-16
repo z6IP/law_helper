@@ -55,6 +55,17 @@ fi
 # 先记住命令行传入的 IMAGE_TAG，避免被 deploy.env 中的同名变量覆盖
 _CLI_IMAGE_TAG="${IMAGE_TAG:-}"
 
+# deploy.env 会被 source 成 shell 脚本执行，而本脚本以 root 运行：
+# 若该文件可被同组或其他用户写入，等于开放一个 root 级任意命令执行入口。
+# stat -c %A 形如 -rw-r--r--：第 6 位是组写、第 9 位是其他写，任一为 w 即拒绝。
+case "$(stat -c '%A' deploy.env 2>/dev/null || echo '')" in
+  ?????w* | ????????w*)
+    echo "[错误] deploy.env 可被同组或其他用户写入，存在提权风险，拒绝执行"
+    echo "       请先执行：chmod 600 deploy.env && chown $(id -un) deploy.env"
+    exit 1
+    ;;
+esac
+
 # set -a 使 deploy.env 中的变量自动导出，供 docker compose 做 ${BACKEND_IMAGE} 插值
 set -a
 # shellcheck disable=SC1091
@@ -65,6 +76,13 @@ set +a
 : "${ACR_NAMESPACE:?deploy.env 缺少 ACR_NAMESPACE}"
 BACKEND_IMAGE_REPO="${BACKEND_IMAGE_REPO:-law-helper-backend}"
 IMAGE_TAG="${_CLI_IMAGE_TAG:-latest}"
+# 把顶部注释里的约定变成实际拦截：短 sha 会一路走到 pull 失败，
+# 再被引导去排查登录/网络/标签，与真实原因（标签不存在）完全不符。
+if [ "$IMAGE_TAG" != "latest" ] && ! printf '%s' "$IMAGE_TAG" | grep -Eq '^[0-9a-f]{40}$'; then
+  echo "[错误] IMAGE_TAG 必须是 latest 或完整 40 位 commit sha，当前：${IMAGE_TAG}"
+  echo "       获取方式：git rev-parse HEAD，或 ACR 控制台标签列表"
+  exit 1
+fi
 export BACKEND_IMAGE="${ACR_REGISTRY_HOST}/${ACR_NAMESPACE}/${BACKEND_IMAGE_REPO}:${IMAGE_TAG}"
 echo "目标镜像: ${BACKEND_IMAGE}"
 
