@@ -578,7 +578,11 @@ def chat_stream(req: ChatRequest, request: Request):
     except jobs.JobConflictError as exc:
         raise HTTPException(status_code=409, detail=exc.message)
 
-    return StreamingResponse(_job_event_stream(req.session_id), media_type="application/x-ndjson")
+    return StreamingResponse(
+        _job_event_stream(req.session_id),
+        media_type="application/x-ndjson",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    )
 
 
 def _job_event_stream(session_id: str):
@@ -604,7 +608,11 @@ def _job_event_stream(session_id: str):
 def job_stream(session_id: str, request: Request):
     """订阅某个会话的后台生成事件（用于刷新/关闭标签页后恢复展示进行中的回答）。"""
     _ensure_session_access(request, session_id)
-    return StreamingResponse(_job_event_stream(session_id), media_type="application/x-ndjson")
+    return StreamingResponse(
+        _job_event_stream(session_id),
+        media_type="application/x-ndjson",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    )
 
 
 @app.get("/api/v1/chat/jobs/running", response_model=RunningJobsResponse, dependencies=[Depends(auth.require_authorized_user)])

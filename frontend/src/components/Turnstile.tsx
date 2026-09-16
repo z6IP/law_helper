@@ -10,7 +10,7 @@ declare global {
   }
 }
 
-const SCRIPT_SRC = 'https://challenges-china.cloudflare.com/turnstile/v0/api.js?render=explicit'
+const SCRIPT_SRC = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit'
 // 与后端 app/turnstile.py 的 EXPECTED_ACTION 保持一致
 const ACTION = 'chat'
 

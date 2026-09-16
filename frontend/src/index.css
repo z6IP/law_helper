@@ -511,6 +511,10 @@ body {
 .message {
   display: flex;
   width: 100%;
+  /* 屏幕外历史消息跳过渲染，降低长会话布局成本。
+     流式中的最后一条始终被自动滚动到视口内，不会被跳过。 */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 400px;
 }
 
 .message-user {
@@ -619,17 +623,33 @@ body {
   text-align: left;
   font-size: 16px;
   line-height: 1.7;
+  /* 隔离重排范围：流式更新时只在本块内重新布局，不触发整页 layout */
+  contain: content;
+  /* 纯文本 + 标题轻量渲染：保留换行，##/### 标题已由 renderText 转为 h2/h3 */
+  white-space: pre-wrap;
 }
 
+/* 回答与推理过程使用「纯文本 + 标题」轻量渲染（见 MessageItem.tsx renderText），
+   white-space: pre-wrap 已并入 .markdown-body / .reasoning-body 基础样式 */
+
 .markdown-body h2 {
-  margin: 1.15em 0 0.4em;
+  margin: 0.75em 0 0.3em;
   font-size: 22px;
   line-height: 1.4;
   font-weight: 700;
   color: var(--text);
 }
 
-.markdown-body h2:first-child {
+.markdown-body h3 {
+  margin: 0.65em 0 0.22em;
+  font-size: 18px;
+  line-height: 1.4;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.markdown-body h2:first-child,
+.markdown-body h3:first-child {
   margin-top: 0;
 }
 
@@ -719,6 +739,9 @@ body {
   color: var(--text-secondary);
   font-size: 14px;
   line-height: 1.6;
+  /* 思考过程流式增长时同样隔离重排，避免与正文解析叠加造成抖动 */
+  contain: content;
+  white-space: pre-wrap;
 }
 
 /* ===== 引用法条 ===== */

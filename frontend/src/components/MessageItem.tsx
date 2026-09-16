@@ -1,14 +1,35 @@
-import { memo, useEffect, useMemo, useRef, useState } from 'react'
-import { marked } from 'marked'
-import DOMPurify from 'dompurify'
+import { Fragment, memo, useEffect, useRef, useState } from 'react'
+import type { ReactNode } from 'react'
 import { ChevronDown, FileText, Image } from 'lucide-react'
 import { References } from './References'
 import type { Attachment, SessionMessage } from '../types'
 
-function renderMarkdown(src: string): string {
-  const raw = marked.parse(src, { async: false }) as string
-  return DOMPurify.sanitize(raw)
+// 轻量渲染：仅将 ## / ### 标题转为 h2 / h3，其余按纯文本输出。
+// 返回 React 元素数组（而非 HTML 字符串 + dangerouslySetInnerHTML），
+// 让 React 只增量更新变化的 text node，避免流式期间每帧重建整个 DOM；
+// 标题始终 22px，且流式结束无切换、无闪屏。React 自动转义文本，无 XSS 风险。
+function renderLines(src: string): ReactNode[] {
+  const lines = src.split('\n')
+  const nodes: ReactNode[] = []
+  let prevIsHeading = false
+  lines.forEach((line, i) => {
+    if (line.startsWith('## ')) {
+      nodes.push(<h2 key={i}>{line.slice(3)}</h2>)
+      prevIsHeading = true
+    } else if (line.startsWith('### ')) {
+      nodes.push(<h3 key={i}>{line.slice(4)}</h3>)
+      prevIsHeading = true
+    } else {
+      // 普通文本行：紧跟块级标题后时不补换行（标题自身已换行），
+      // 避免 white-space: pre-wrap 下渲染出多余空行。
+      const sep = nodes.length > 0 && !prevIsHeading ? '\n' : ''
+      nodes.push(<Fragment key={i}>{sep}{line}</Fragment>)
+      prevIsHeading = false
+    }
+  })
+  return nodes
 }
+
 
 const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif'])
 
@@ -197,15 +218,8 @@ export const MessageItem = memo(function MessageItem({ message, isCurrentLoading
   const [preview, setPreview] = useState<PreviewInfo | null>(null)
   const isUser = message.role === 'user'
 
-  const html = useMemo(() => {
-    if (isUser) return ''
-    return renderMarkdown(message.content)
-  }, [message.content, isUser])
-
-  const reasoningHtml = useMemo(
-    () => (message.reasoning ? renderMarkdown(message.reasoning) : ''),
-    [message.reasoning],
-  )
+  // 回答与推理过程使用「纯文本 + 标题」轻量渲染（renderLines 仅将 ##/### 转为 h2/h3），
+  // 不调用 marked.parse + DOMPurify，标题始终 22px，React 增量 diff 无切换闪屏、无 DOM 重建。
 
   if (isUser) {
     const hasAttachments = message.attachments && message.attachments.length > 0
@@ -259,10 +273,7 @@ export const MessageItem = memo(function MessageItem({ message, isCurrentLoading
               )}
             </button>
             {reasoningOpen && (
-              <div
-                className="reasoning-body"
-                dangerouslySetInnerHTML={{ __html: reasoningHtml }}
-              />
+              <div className="reasoning-body">{renderLines(message.reasoning || '')}</div>
             )}
           </div>
         )}
@@ -272,10 +283,7 @@ export const MessageItem = memo(function MessageItem({ message, isCurrentLoading
             <span className="spinner" />
           </div>
         )}
-        <div
-          className="markdown-body"
-          dangerouslySetInnerHTML={{ __html: html }}
-        />
+        <div className="markdown-body">{renderLines(message.content)}</div>
         {!isCurrentLoading && <References references={message.references || []} />}
       </div>
     </div>

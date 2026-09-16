@@ -17,9 +17,9 @@ class TestMergeStreamEvents:
         chunks = ["你", "好", "，", "请", "问"]
         events = [{"type": "delta", "content": c} for c in chunks]
         out = collect(events)
-        assert len(out) == 1
-        assert out[0]["type"] == "delta"
-        assert out[0]["content"] == "".join(chunks)
+        # 阈值降低后小 chunk 可能合并为多个事件，但拼接文本必须与原文一致
+        assert all(e["type"] == "delta" for e in out)
+        assert "".join(e["content"] for e in out) == "".join(chunks)
 
     def test_non_delta_events_flush_and_pass_through(self):
         events = [

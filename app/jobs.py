@@ -28,8 +28,13 @@ class JobConflictError(LawHelperError):
 
 # delta/reasoning 事件微批合并阈值：避免每个 LLM 字符 chunk 独立成事件，
 # 减少 Condition 锁竞争、线程池调度与 HTTP chunk 数量，从而降低前端渲染压力。
-_DELTA_MERGE_CHARS = 32
-_DELTA_MERGE_INTERVAL = 0.05  # 50ms
+# 阈值进一步调低（24→2 字符、20→16ms、2→1 字符）以接近逐 chunk flush：
+# 快速输出每 ~10ms flush 2 字符，慢速输出单字符即 flush；
+# 前端 rAF 每 16ms 合并显示 2-6 字符，视觉上匀速逐字流出。
+_DELTA_MERGE_CHARS = 2
+_DELTA_MERGE_INTERVAL = 0.016  # 16ms，对齐前端 rAF 一帧（60fps）
+# 时间阈值 flush 时的最小字符数：降至 1，允许慢速输出的单字符 chunk 立即下发
+_MIN_FLUSH_CHARS = 1
 
 
 def merge_stream_events(stream):
@@ -70,7 +75,10 @@ def merge_stream_events(stream):
             buf_len += len(text)
             if (
                 buf_len >= _DELTA_MERGE_CHARS
-                or (time.monotonic() - last_flush) >= _DELTA_MERGE_INTERVAL
+                or (
+                    buf_len >= _MIN_FLUSH_CHARS
+                    and (time.monotonic() - last_flush) >= _DELTA_MERGE_INTERVAL
+                )
             ):
                 yield from flush()
         else:
@@ -129,9 +137,13 @@ class Job:
             self._cond.notify_all()
 
     def read_from(self, cursor: int) -> tuple[list[dict], str]:
-        """无阻塞快照：返回 [cursor:] 事件与当前状态。"""
+        """无阻塞快照：返回 [cursor:] 事件与当前状态。
+
+        切片 self.events[cursor:] 本身已产生新 list 快照，且复制在持锁期间完成，
+        释放锁后不再受后台 append_event 影响，无需再包一层 list()。
+        """
         with self._cond:
-            return list(self.events[cursor:]), self.status
+            return self.events[cursor:], self.status
 
     def wait_for(self, cursor: int) -> None:
         """阻塞直到出现新事件或任务结束。"""
