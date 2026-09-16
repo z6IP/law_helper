@@ -1,11 +1,15 @@
 # Web 框架
 fastapi>=0.135.0
 uvicorn[standard]>=0.41.0
+python-multipart>=0.0.9  # FastAPI File/Form 文件上传（main.py chat_upload 使用 UploadFile/File）
 
 # 配置与校验
 pydantic>=2.12.0
 pydantic-settings>=2.13.0
 python-dotenv>=1.2.0
+
+# 数值计算（代码直接 import numpy；此前由 chromadb 间接提供，显式声明避免隐式依赖）
+numpy>=1.24
 
 # 向量库（1.x 起不再依赖 chroma-hnswlib 编译，兼容 Python 3.13 / Windows）
 chromadb==1.5.5

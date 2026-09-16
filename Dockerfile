@@ -13,9 +13,13 @@ RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debia
 
 # 先复制 requirements 加速缓存
 COPY requirements.txt .
-RUN python -m venv /opt/venv && \
+# BuildKit 缓存 pip 下载目录：跨构建复用已下载的 wheel，
+# requirements 变化导致该层缓存失效时，未变动的包无需重新下载，大幅缩短重装时间。
+# 注意：使用缓存挂载时不能再传 --no-cache-dir（否则禁写缓存、缓存挂载失效）。
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m venv /opt/venv && \
     /opt/venv/bin/pip install --upgrade pip -i https://mirrors.aliyun.com/pypi/simple/ && \
-    /opt/venv/bin/pip install --no-cache-dir -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
+    /opt/venv/bin/pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
 
 # ===== Stage 2: runner（运行时镜像）=====
 FROM python:3.11-slim AS runner
