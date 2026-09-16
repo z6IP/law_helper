@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
 # 部署脚本：在服务器 /opt/law_helper/ 下执行
 # 用法: bash deploy.sh
-#       IMAGE_TAG=<git-sha> bash deploy.sh   # 回滚/切换到指定镜像版本
+#       IMAGE_TAG=<完整sha> bash deploy.sh   # 回滚/切换到指定镜像版本
+#
+#   ⚠️ IMAGE_TAG 必须是**完整 40 位 commit sha**，不能用 7 位短 sha。
+#      CI 是以 ${{ github.sha }} 打标签的，那是完整的 40 位值；
+#      传短 sha 会得到 manifest unknown（标签确实不存在，而非权限问题）。
+#      完整 sha 的三个来源（任选其一）：
+#        - ACR 控制台 → 命名空间 → 镜像仓库 → 标签列表，直接复制
+#        - 本地执行 git rev-parse HEAD
+#        - GitHub Actions 运行日志中「输出构建结果」那一步
 #
 # ===== 后端镜像不在本机构建 =====
 #   构建链路：GitHub Actions 构建 → 推送阿里云 ACR → 本脚本只负责拉取与重启。
@@ -203,4 +211,4 @@ docker compose ps
 echo ""
 echo "===== 部署完成 ====="
 echo "当前镜像: ${BACKEND_IMAGE}"
-echo "回滚方式: IMAGE_TAG=<git-sha> bash deploy.sh"
+echo "回滚方式: IMAGE_TAG=<完整40位sha> bash deploy.sh"
