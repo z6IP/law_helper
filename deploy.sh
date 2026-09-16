@@ -20,7 +20,7 @@ git clean -fd  # 清理未跟踪文件（frontend/dist/ 已被 .gitignore 忽略
 echo ""
 echo "===== 1.5 安全前置：TLS 证书 ====="
 # 域名（可覆盖为真实值）
-DOMAIN="${DOMAIN:-your-domain.com}"
+DOMAIN="${DOMAIN:-lawhelper.xyz}"
 
 # 1) TLS 证书：优先 certbot 正式证书 → 其次手动上传的证书 → 最后自签名占位
 CERT_DIR="/etc/nginx/certs"
