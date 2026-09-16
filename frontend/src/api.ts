@@ -31,6 +31,8 @@ export async function fetchLLMModel(): Promise<string> {
 export interface SecuritySettings {
   turnstile_enabled: boolean
   turnstile_site_key: string
+  /** 验证脚本地址候选列表（按顺序回退）；后端未下发时前端用内置默认源 */
+  turnstile_script_srcs?: string[]
 }
 
 export async function fetchSecuritySettings(): Promise<SecuritySettings> {

@@ -645,11 +645,12 @@ def llm_model():
 
 @app.get("/api/v1/settings/security")
 def security_settings():
-    """返回 Turnstile 是否启用及 sitekey（公开），供前端决定是否渲染验证组件。"""
+    """返回 Turnstile 是否启用、sitekey（公开）与脚本源，供前端决定是否渲染验证组件。"""
     s = get_settings()
     return {
         "turnstile_enabled": turnstile.is_enabled(),
         "turnstile_site_key": s.turnstile_site_key,
+        "turnstile_script_srcs": turnstile.script_sources(),
     }
 
 

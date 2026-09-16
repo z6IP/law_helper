@@ -8,11 +8,17 @@ import pytest
 from app import turnstile
 
 
-def _settings(site_key: str = "", secret_key: str = "", hostnames: str = ""):
+def _settings(
+    site_key: str = "",
+    secret_key: str = "",
+    hostnames: str = "",
+    script_src: str = "",
+):
     return types.SimpleNamespace(
         turnstile_site_key=site_key,
         turnstile_secret_key=secret_key,
         turnstile_hostnames=hostnames,
+        turnstile_script_src=script_src,
     )
 
 
@@ -49,6 +55,32 @@ def test_verify_disabled_passes_through(monkeypatch):
     """未启用（缺 secret）时恒通过，行为不变。"""
     monkeypatch.setattr("app.turnstile.get_settings", lambda: _settings(site_key="s"))
     assert turnstile.verify("whatever-token") is True
+
+
+def test_script_sources_default_when_unset(monkeypatch):
+    """未配置脚本源时回退到内置默认源（单源，不会引入额外等待）。"""
+    monkeypatch.setattr("app.turnstile.get_settings", lambda: _settings())
+    assert turnstile.script_sources() == [turnstile.DEFAULT_SCRIPT_SRC]
+
+
+def test_script_sources_ordered_dedup_and_trim(monkeypatch):
+    """多源按配置顺序去重、去空白，首个为主源。"""
+    monkeypatch.setattr(
+        "app.turnstile.get_settings",
+        lambda: _settings(
+            script_src=" https://a.example/api.js ,https://b.example/api.js,https://a.example/api.js "
+        ),
+    )
+    assert turnstile.script_sources() == [
+        "https://a.example/api.js",
+        "https://b.example/api.js",
+    ]
+
+
+def test_script_sources_blank_falls_back_to_default(monkeypatch):
+    """只配空白字符时回退到内置默认源，避免前端拿到空列表导致加载逻辑空转。"""
+    monkeypatch.setattr("app.turnstile.get_settings", lambda: _settings(script_src=" , "))
+    assert turnstile.script_sources() == [turnstile.DEFAULT_SCRIPT_SRC]
 
 
 def test_verify_missing_token_fails(patched):
