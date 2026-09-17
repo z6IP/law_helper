@@ -92,11 +92,21 @@ jobs:
           tags: |
             ${{ env.IMAGE_NAME }}:latest
             ${{ env.IMAGE_NAME }}:${{ github.sha }}
-          # 层缓存存回 ACR：requirements.txt 未变时依赖层直接命中，
-          # 后续构建只需推送变化的层（通常几 MB 到几十 MB），
-          # 规避每次跨境重传约 2GB。mode=max 会把中间层也纳入缓存，这是增量推送的前提。
-          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
-          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
+          # 层缓存改用 GitHub Actions 缓存后端，不再存回 ACR。
+          # 原因：BuildKit 的 registry 缓存清单，其 config 描述符媒体类型固定为
+          # application/vnd.buildkit.cacheconfig.v0 —— 它不是镜像配置类型，
+          # 阿里云 ACR 个人版按 media type 给清单分类时判定为未知类别并拒收：
+          #   denied: unknown manifest class for application/vnd.buildkit.cacheconfig.v0
+          # 该限制与上方的 oci.empty.v1+json 同源：ACR 个人版只收标准镜像清单，
+          # 不收 OCI artifact 类清单；且缓存导出器的参数（oci-mediatypes /
+          # image-manifest）只改清单自身类型，改不了 config 描述符类型，调参无法绕过。
+          # 改用 gha 后缓存落在 GitHub，既绕开该限制，也不再跨境传输缓存。
+          # mode=max 会把中间层也纳入缓存：本项目是多阶段构建，只有 max 才能让
+          # 最终镜像的 COPY --from=builder 命中缓存、跳过重复的 pip install。
+          # ignore-error：缓存导出失败（超出 GitHub 缓存配额 / 导出超时）时只丢缓存，
+          # 不阻断镜像推送——缓存是加速手段，不该让整个部署失败。
+          cache-from: type=gha
+          cache-to: type=gha,mode=max,ignore-error=true
           # 关闭 provenance / SBOM 证明。开启时 BuildKit 推送的不是普通镜像，
           # 而是带 application/vnd.oci.empty.v1+json 空描述符的 attestation 索引，
           # 阿里云 ACR 不支持该 manifest 类别，会直接拒绝：
