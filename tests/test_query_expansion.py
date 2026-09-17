@@ -46,3 +46,41 @@ def test_classify_scenario_intent():
     assert "scenario" in classify_query_intents("轻微事故怎么处理")
     assert "scenario" in classify_query_intents("财产损失事故自行协商")
     assert "scenario" not in classify_query_intents("醉酒驾驶怎么处罚")
+
+
+def test_fight_scenario_no_traffic_escape_false_positive():
+    """误命中修复：打架后离开现场不应触发交通逃逸扩展与法律效力意图。"""
+    q = "我朋友跟人冲突，两人互打了一圈，朋友跑了，骑的电动车时"
+
+    expansions = expand_query(q)
+
+    assert "造成交通事故后逃逸" not in expansions
+    assert "validity" not in classify_query_intents(q)
+    # 应产出人身权利/治安领域的桥接扩展，而非交通条款
+    assert any("殴打他人" in enhancement for enhancement in expansions)
+    assert any("结伙斗殴" in enhancement for enhancement in expansions)
+
+
+def test_fight_scenario_bridges_to_legal_terms():
+    """打架类口语词应桥接到治安/刑事法条术语，并命中 personal_injury 意图。"""
+    from app.retrieval import _resolve_bm25_weight
+
+    q = "朋友打架把人打成轻伤怎么办"
+    synonyms = expand_synonyms(q)
+
+    assert any("殴打他人" in synonym for synonym in synonyms)
+    assert any("故意伤害罪" in synonym for synonym in synonyms)
+    assert "personal_injury" in classify_query_intents(q)
+    assert _resolve_bm25_weight(q) == 0.7
+
+
+def test_escape_expansion_still_hits_real_traffic_case():
+    """收紧 requires 后，真实交通事故逃逸场景仍应命中扩展。"""
+    assert "造成交通事故后逃逸" in expand_query("撞人后跑了算逃逸吗")
+    assert "造成交通事故后逃逸" in expand_query("发生事故后逃逸怎么处罚")
+
+
+def test_legal_conflict_still_hits_validity_intent():
+    """改为法律语境正则后，真正的法律冲突问句仍应命中 validity 意图。"""
+    assert "validity" in classify_query_intents("地方规定和国家法律冲突怎么办")
+    assert "validity" not in classify_query_intents("我朋友跟人冲突了")

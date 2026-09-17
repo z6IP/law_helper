@@ -194,6 +194,39 @@ def _restrict_to_primary_source(
     ]
 
 
+def _apply_context_gates(query: str, candidates: list[dict]) -> list[dict]:
+    """按检索策略配置的场景门槛过滤候选项。
+
+    部分条款有法定适用前提，仅凭词项/语义相似度会误召回：例如「逃逸」类条款以
+    「发生道路交通事故」为前提，当用户问题不含任何事故语境词时，「电动车」「跑了」
+    等词项的语义相似度不足以适用这些条款，应剔除，避免交通条款挤占非交通事故问题
+    （如打架后骑车离开现场）的上下文。门槛由 policy.json 的
+    retrieval.context_gates 管理，新增场景只需改配置。
+    """
+    gates = get_policy()["retrieval"].get("context_gates") or []
+    if not gates or not candidates:
+        return candidates
+
+    kept: list[dict] = []
+    dropped = 0
+    for candidate in candidates:
+        text = candidate.get("text") or ""
+        blocked = any(
+            gate.get("required_context_keywords")
+            and not any(kw in query for kw in gate["required_context_keywords"])
+            and any(kw in text for kw in gate.get("blocked_text_keywords") or [])
+            for gate in gates
+        )
+        if blocked:
+            dropped += 1
+            continue
+        kept.append(candidate)
+
+    if dropped:
+        event("retrieval.context_gated", dropped=dropped, kept=len(kept))
+    return kept
+
+
 @lru_cache(maxsize=1)
 def _system_prompt() -> str:
     """加载主法律问答模板，并注入当前语料中的法规名称。"""
@@ -699,6 +732,7 @@ def _retrieve_contexts(
             law_source=law_source,
             article_no=article_no,
         )
+    candidates = _apply_context_gates(resolved, candidates)
     candidates = _restrict_to_primary_source(candidates, law_source)
     event("retrieval.candidates", count=len(candidates))
     with span("rerank", top_n=settings.rerank_top_n, min_score=settings.rerank_min_score):

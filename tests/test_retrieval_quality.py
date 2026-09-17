@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from app.config import get_settings
 from app.ingestion import Article, _expand_article_chunks, _parent_article_no
 from app.policy import get_policy
-from app.qa import _restrict_to_primary_source
+from app.qa import _apply_context_gates, _match_domains, _restrict_to_primary_source
 from app.query_expansion import classify_query_intents, expand_query_by_intent
 from app.rerank import apply_role_adjustment
 from app.retrieval import _tokenize
@@ -231,6 +231,66 @@ def test_inject_penalty_context_when_parent_missing():
 
     assert "一次记6分" in out[0]["text"]
     assert out[0]["text"].startswith("机动车驾驶人有下列交通违法行为之一，一次记6分")
+
+
+def test_policy_domain_bridges_are_extensible():
+    """跨领域桥接：每组需同构提供 rules 与 synonyms，供统一展平合并。"""
+    bridges = get_policy()["query"]["domain_bridges"]
+
+    assert {"personal_rights", "criminal", "civil"} <= set(bridges)
+    for name, bridge in bridges.items():
+        assert "rules" in bridge, f"{name} 缺少 rules"
+        assert "synonyms" in bridge, f"{name} 缺少 synonyms"
+    assert any(
+        "殴打他人" in rule["enhancement"]
+        for rule in bridges["personal_rights"]["rules"]
+    )
+
+
+def test_domains_register_non_traffic_sources():
+    """新增领域段的 law_keywords 必须与向量库 source 字段子串一致。"""
+    domains = get_policy()["domains"]
+
+    for name, source_keyword in (
+        ("personal_rights", "治安管理处罚法"),
+        ("criminal", "中华人民共和国刑法"),
+    ):
+        assert domains[name]["prompt"]
+        assert domains[name]["law_keywords"] == [source_keyword]
+
+
+def test_match_domains_detects_non_traffic_sources():
+    """检索命中治安管理处罚法/刑法时，应注入对应领域段。"""
+    contexts = [
+        {"metadata": {"source": "中华人民共和国治安管理处罚法"}},
+        {"metadata": {"source": "中华人民共和国刑法"}},
+    ]
+
+    assert _match_domains(contexts) == ("personal_rights", "criminal")
+
+
+def test_context_gate_drops_traffic_escape_without_accident_context():
+    """无事故语境时排除交通逃逸条款，有事故语境时保留。"""
+    candidates = [
+        {
+            "id": "escape",
+            "text": "（十）造成致人轻微伤或者财产损失的交通事故后逃逸，尚不构成犯罪的；",
+            "metadata": {},
+        },
+        {
+            "id": "fight",
+            "text": "殴打他人的，或者故意伤害他人身体的，处五日以上十日以下拘留。",
+            "metadata": {},
+        },
+    ]
+
+    kept = _apply_context_gates("我朋友跟人冲突，两人互打了一圈，朋友跑了", candidates)
+
+    assert [c["id"] for c in kept] == ["fight"]
+
+    kept = _apply_context_gates("撞人后跑了算逃逸吗", candidates)
+
+    assert [c["id"] for c in kept] == ["escape", "fight"]
 
 
 def test_inject_penalty_context_skips_when_parent_present():

@@ -1,6 +1,8 @@
 """查询改写：把口语化问题扩展为更贴近法条表述的检索查询。
 
 查询扩展规则由 config/policy.json 管理，代码只负责执行通用的触发条件和查询生成。
+跨领域桥接：query.domain_bridges 按领域（治安/刑事/民事…）提供 rules 与 synonyms，
+由 _merged_expansion_rules / _merged_synonym_map 展平合并后统一执行，新增领域只改配置。
 
 新增 multi_query_rewrite：LLM 多查询改写（Multi-Query Retrieval），
 针对用户口语化提问与法条术语不匹配的问题。LLM 只做语言层改写，
@@ -17,6 +19,40 @@ from app.llm import get_llm
 from app.prompt_loader import render_prompt
 from app.policy import get_policy
 from app.tracing import event
+
+
+def _merged_expansion_rules() -> list[dict]:
+    """展平 expansion_rules 与 domain_bridges[*].rules，返回统一的扩展规则列表。
+
+    既有交通/立法规则在前，跨领域桥接规则（治安/刑事/民事…）在后。
+    新增一个领域只需在 policy.json 的 domain_bridges 下加一个键，无需改代码。
+    """
+    query_policy = get_policy()["query"]
+    rules = list(query_policy["expansion_rules"])
+    for bridge in (query_policy.get("domain_bridges") or {}).values():
+        rules.extend(bridge.get("rules") or [])
+    return rules
+
+
+def _merged_synonym_map() -> dict[str, list[str]]:
+    """合并 synonym_map 与 domain_bridges[*].synonyms（同键拼接去重）。
+
+    与扩展规则不同：同义词保留原问题结构、仅替换口语关键词，因此同一口语词
+    可能同时来自通用表与领域桥接，需按键合并而不是整体覆盖。
+    """
+    query_policy = get_policy()["query"]
+    merged: dict[str, list[str]] = {
+        term: list(paraphrases)
+        for term, paraphrases in (query_policy.get("synonym_map") or {}).items()
+    }
+    for bridge in (query_policy.get("domain_bridges") or {}).values():
+        for term, paraphrases in (bridge.get("synonyms") or {}).items():
+            bucket = merged.setdefault(term, [])
+            for paraphrase in paraphrases:
+                if paraphrase not in bucket:
+                    bucket.append(paraphrase)
+    return merged
+
 
 def expand_query(question: str) -> list[str]:
     """返回用于检索/重排的扩展查询列表（关键词注入）。
@@ -38,7 +74,7 @@ def expand_query(question: str) -> list[str]:
     q = (question or "").strip()
     if not q:
         return []
-    policy_rules = get_policy()["query"]["expansion_rules"]
+    policy_rules = _merged_expansion_rules()
     expansions: list[str] = []
     seen: set[str] = set()
     for rule in policy_rules:
@@ -102,7 +138,7 @@ def expand_synonyms(question: str) -> list[str]:
     q = (question or "").strip()
     if not q:
         return []
-    synonym_map = get_policy()["query"].get("synonym_map", {})
+    synonym_map = _merged_synonym_map()
     results: list[str] = []
     seen: set[str] = {q}
     for term, paraphrases in synonym_map.items():
