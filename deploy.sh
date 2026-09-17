@@ -191,12 +191,25 @@ fi
 
 echo ""
 echo "===== 6. 重启服务 ====="
-docker compose up -d
+# SKIP_BACKEND_START=1：只更新代码与镜像并停掉旧后端，暂不启动。
+# 用途：语料变更时先让新镜像就位，再由 sync_index.ps1 同步本地构建好的向量库并启动后端，
+# 使后端启动时 manifest 命中、跳过重复 embedding（避免本地与服务器各嵌一次）。
+SKIP_BACKEND_START="${SKIP_BACKEND_START:-0}"
+if [ "$SKIP_BACKEND_START" = "1" ]; then
+  echo "[提示] 已停止后端（SKIP_BACKEND_START=1），待 sync_index.ps1 同步索引后再启动"
+  docker compose stop backend || true
+else
+  docker compose up -d
+fi
 
 echo ""
 echo "===== 7. 等待后端健康检查 ====="
-echo "后端预热中（embedding/rerank warmup + 索引校验），约需 1-2 分钟..."
-timeout 180 bash -c 'until docker compose ps backend | grep -q "healthy"; do sleep 5; echo "  等待中..."; done' || echo "  超时，请手动检查: docker compose logs backend"
+if [ "$SKIP_BACKEND_START" = "1" ]; then
+  echo "[跳过] 后端未启动，由 sync_index.ps1 负责启动"
+else
+  echo "后端预热中（embedding/rerank warmup + 索引校验），约需 1-2 分钟..."
+  timeout 180 bash -c 'until docker compose ps backend | grep -q "healthy"; do sleep 5; echo "  等待中..."; done' || echo "  超时，请手动检查: docker compose logs backend"
+fi
 
 echo ""
 echo "===== 8. 清理悬空镜像（安全）====="
@@ -209,18 +222,22 @@ echo ""
 echo "===== 9. 验证新镜像已生效 ====="
 # /settings/security 的 turnstile_script_srcs 字段只有本次改造后的后端才会返回，
 # 用它确认容器确实跑在新拉取的镜像上，而不是旧容器残留。
-_SEC=$(docker compose exec -T backend python -c \
-  "import urllib.request;print(urllib.request.urlopen('http://localhost:8000/api/v1/settings/security',timeout=5).read().decode())" \
-  2>/dev/null || true)
-case "$_SEC" in
-  *turnstile_script_srcs*)
-    echo "新镜像已生效：$_SEC"
-    ;;
-  *)
-    echo "[提示] 未能确认新镜像字段，请手动检查："
-    echo "  curl -s localhost:8000/api/v1/settings/security"
-    ;;
-esac
+if [ "$SKIP_BACKEND_START" = "1" ]; then
+  echo "[跳过] 后端未启动，镜像生效验证延后到 sync_index.ps1 之后"
+else
+  _SEC=$(docker compose exec -T backend python -c \
+    "import urllib.request;print(urllib.request.urlopen('http://localhost:8000/api/v1/settings/security',timeout=5).read().decode())" \
+    2>/dev/null || true)
+  case "$_SEC" in
+    *turnstile_script_srcs*)
+      echo "新镜像已生效：$_SEC"
+      ;;
+    *)
+      echo "[提示] 未能确认新镜像字段，请手动检查："
+      echo "  curl -s localhost:8000/api/v1/settings/security"
+      ;;
+  esac
+fi
 
 echo ""
 echo "===== 10. 查看服务状态 ====="

@@ -1,0 +1,106 @@
+<#
+.SYNOPSIS
+    将本地构建好的向量库（chroma/）同步到服务器，避免服务器重复消耗 embedding token。
+
+.DESCRIPTION
+    流程：本地重建索引 → 停服务器后端（释放 chroma.sqlite3 文件句柄）
+          → tar 打包上传 → 远端整目录替换 → 启动后端。
+    后端启动时 manifest 与容器内 statute/ 哈希一致，ingest() 判定「未变化」直接跳过，
+    因此服务器侧零 embedding 开销。
+
+    仅使用 Windows 10+ 自带的 tar / scp / ssh（OpenSSH 客户端），不依赖 rsync。
+
+    使用前：把本文件复制为 sync_index.ps1（该文件已被 .gitignore 忽略，仅存本机），
+    并把下方的 $Server 换成你的服务器地址。模板用占位符，故可安全入库。
+
+.PARAMETER Server
+    SSH 目标，形如 root@<服务器地址>。
+
+.PARAMETER RemoteDir
+    服务器上的部署目录（含 docker-compose.yml），默认 /opt/law_helper。
+
+.PARAMETER Python
+    本地重建索引使用的解释器，默认项目 conda 环境。
+
+.PARAMETER SkipBuild
+    跳过本地重建，直接同步现有 chroma/。
+
+.EXAMPLE
+    .\sync_index.ps1
+    重建本地索引并同步到服务器。
+
+.EXAMPLE
+    .\sync_index.ps1 -SkipBuild
+    本地索引已是最新时跳过重建，直接同步。
+#>
+[CmdletBinding()]
+param(
+    [string]$Server    = "root@<服务器地址>",
+    [string]$RemoteDir = "/opt/law_helper",
+    [string]$Python    = "D:\miniconda3\envs\law_helper_env\python.exe",
+    [switch]$SkipBuild
+)
+
+$ErrorActionPreference = "Stop"
+
+$ProjectRoot = $PSScriptRoot
+$RemoteDir = $RemoteDir.TrimEnd("/")
+$Tarball = Join-Path ([System.IO.Path]::GetTempPath()) "chroma.tar.gz"
+
+foreach ($cmd in @("tar", "scp", "ssh")) {
+    if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
+        throw "缺少命令 $cmd：请启用 Windows 的 OpenSSH 客户端（设置 → 应用 → 可选功能）后重试"
+    }
+}
+
+# 1) 本地重建索引（一次 embedding）
+if ($SkipBuild) {
+    Write-Host "[1/5] 跳过本地重建（-SkipBuild）" -ForegroundColor DarkGray
+}
+else {
+    Write-Host "[1/5] 本地重建索引（$Python -m app.ingestion）..." -ForegroundColor Cyan
+    Push-Location $ProjectRoot
+    try {
+        & $Python -m app.ingestion
+        if ($LASTEXITCODE -ne 0) { throw "本地索引构建失败（exit $LASTEXITCODE）" }
+    }
+    finally {
+        Pop-Location
+    }
+}
+
+# 2) 停服务器后端：容器持有 chroma.sqlite3，运行中覆盖可能写坏库
+Write-Host "[2/5] 停止服务器后端..." -ForegroundColor Cyan
+# 必须走服务器上的 compose.sh：docker-compose.yml 的 backend.image 依赖 ${BACKEND_IMAGE}，
+# 该变量由 deploy.env 拼装，直接执行 docker compose 会报「BACKEND_IMAGE 未设置」。
+& ssh $Server "test -f $RemoteDir/compose.sh || { echo 'compose.sh 缺失，请先在服务器执行 bash deploy.sh'; exit 1; }; bash $RemoteDir/compose.sh stop backend || true"
+if ($LASTEXITCODE -ne 0) { throw "停止服务器后端失败" }
+
+$synced = $false
+try {
+    # 3) 打包：远端先删再解，等价于 rsync --delete 的全量替换，避免残留旧文件
+    Write-Host "[3/5] 打包本地 chroma/ ..." -ForegroundColor Cyan
+    & tar -czf $Tarball -C $ProjectRoot chroma
+    if ($LASTEXITCODE -ne 0) { throw "打包 chroma/ 失败" }
+
+    # 4) 上传到服务器 /tmp
+    Write-Host "[4/5] 上传索引到 $Server ..." -ForegroundColor Cyan
+    & scp $Tarball "${Server}:/tmp/chroma.tar.gz"
+    if ($LASTEXITCODE -ne 0) { throw "上传索引失败" }
+
+    # 5) 远端替换并启动后端（启动时 ingest 判定未变化 → 跳过 embedding）
+    Write-Host "[5/5] 替换服务器索引并启动后端..." -ForegroundColor Cyan
+    & ssh $Server "rm -rf $RemoteDir/chroma && tar -xzf /tmp/chroma.tar.gz -C $RemoteDir && rm -f /tmp/chroma.tar.gz && bash $RemoteDir/compose.sh up -d"
+    if ($LASTEXITCODE -ne 0) { throw "替换索引或启动服务器后端失败" }
+
+    $synced = $true
+    Write-Host "完成：向量库已同步到 $Server，服务器启动不会重复 embedding。" -ForegroundColor Green
+    Write-Host "查看后端预热日志： ssh $Server `"bash $RemoteDir/compose.sh logs -f backend`"" -ForegroundColor DarkGray
+}
+finally {
+    Remove-Item $Tarball -ErrorAction SilentlyContinue
+    if (-not $synced) {
+        Write-Warning "同步未完成，尝试恢复服务器后端..."
+        & ssh $Server "bash $RemoteDir/compose.sh up -d"
+    }
+}
