@@ -2,7 +2,9 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <!-- ?v= 用于绕过 nginx 对 .svg 的 30 天 immutable 缓存（favicon 文件名固定不带 hash），
+         更换图标时把版本号 +1 即可让所有访客立即拿到新图标 -->
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=2" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>小Z · 道路交通安全法助手</title>
     <script>
