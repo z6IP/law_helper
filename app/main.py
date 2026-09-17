@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Stre
 from fastapi_throttle import RateLimiter
 from starsessions import CookieStore, SessionAutoloadMiddleware, SessionMiddleware
 
-from app import answer_cache, auth, ingestion, jobs, session_db, session_store, turnstile
+from app import answer_cache, auth, ingestion, jobs, session_db, session_store
 from app.config import get_settings, USER_DATA_DIR
 from app.document_parser import parse_document
 from app.errors import LawHelperError
@@ -214,8 +214,7 @@ async def law_error_handler(request, exc: LawHelperError):
 def _user_id_key(req: Request) -> str:
     """以匿名 user_id 作为限流 key。
 
-    注意：user_id 随 session cookie 持久化，清 cookie 即换新身份、重置限流与配额；
-    该漏洞由可选启用的 Turnstile 人机验证兜底（见 docs/auth.md）。
+    注意：user_id 随 session cookie 持久化，清 cookie 即换新身份、重置限流与配额。
     """
     return auth.get_or_create_user(req)
 
@@ -325,16 +324,6 @@ def _ensure_preload_ready() -> None:
             status_code=503,
             detail=f"模型加载中（阶段：{_PRELOAD_STATE['stage']}），请稍后再试",
         )
-
-
-def _verify_turnstile(token: str | None) -> None:
-    """Turnstile 人机验证门禁：未启用时直接放行，启用但未通过时返回 403。
-
-    不传 remoteip：反代后 request.client.host 是 nginx 容器内网 IP 而非真实客户端 IP，
-    传错反而可能导致 siteverify 误判；IP 级防护已由 nginx limit_req 承担。
-    """
-    if not turnstile.verify(token):
-        raise HTTPException(status_code=403, detail="人机验证未通过，请刷新页面后重试")
 
 
 def _user_input_title(content: str, max_length: int = 18) -> str:
@@ -519,8 +508,7 @@ def get_upload(filename: str, request: Request):
 )
 def chat(req: ChatRequest, request: Request):
     _ensure_session_access(request, req.session_id)
-    _verify_turnstile(req.turnstile_token)
-    # 配额在会话校验与人机验证之后递增：被拒绝的请求不应消耗每日额度
+    # 配额在会话校验之后递增：被拒绝的请求不应消耗每日额度
     auth.enforce_daily_chat_quota(request)
     question = _effective_question(req.question, req.document_text)
     # answer_cache 已永久禁用（get/put 均 no-op），移除死代码分支。
@@ -554,8 +542,7 @@ def chat_stream(req: ChatRequest, request: Request):
     完成后自动写入会话存储。
     """
     _ensure_session_access(request, req.session_id)
-    _verify_turnstile(req.turnstile_token)
-    # 配额在会话校验与人机验证之后递增：被拒绝的请求不应消耗每日额度
+    # 配额在会话校验之后递增：被拒绝的请求不应消耗每日额度
     auth.enforce_daily_chat_quota(request)
     question = _effective_question(req.question, req.document_text)
     if not req.session_id:
@@ -641,17 +628,6 @@ def ingest():
 @app.get("/api/v1/settings/llm_model")
 def llm_model():
     return {"llm_model": get_settings().llm_model}
-
-
-@app.get("/api/v1/settings/security")
-def security_settings():
-    """返回 Turnstile 是否启用、sitekey（公开）与脚本源，供前端决定是否渲染验证组件。"""
-    s = get_settings()
-    return {
-        "turnstile_enabled": turnstile.is_enabled(),
-        "turnstile_site_key": s.turnstile_site_key,
-        "turnstile_script_srcs": turnstile.script_sources(),
-    }
 
 
 @app.get("/api/v1/traces", response_model=TracesResponse, dependencies=[Depends(_local_only)])

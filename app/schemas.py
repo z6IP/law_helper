@@ -70,11 +70,6 @@ class ChatRequest(_BaseSchema):
         False,
         description="是否开启深度思考（LLM 推理思考），默认关闭；由前端输入框按钮控制",
     )
-    turnstile_token: str | None = Field(
-        None,
-        max_length=2048,
-        description="Cloudflare Turnstile 一次性人机验证 token（后端启用验证时必填）",
-    )
 
 
 class Reference(_BaseSchema):

@@ -130,18 +130,6 @@ class Settings(BaseSettings):
     # 管理员生成授权令牌的默认有效期（天）；<=0 表示永不过期
     access_token_default_days: int = 30
 
-    # Cloudflare Turnstile 人机验证（防刷兜底，默认禁用）
-    # site_key 与 secret_key 同时配置才启用；sitekey 公开，secret 机密（勿进 git）
-    # 紧急停用：把这两个值同时清空即整体关闭验证（纯服务端行为，客户端无法伪造），
-    # 因此不再提供可被伪造的 fail-open 降级开关。
-    turnstile_site_key: str = ""
-    turnstile_secret_key: str = ""
-    # 前端 hostname 白名单（逗号分隔）；生产建议配置，空则跳过 hostname 校验
-    turnstile_hostnames: str = ""
-    # 验证脚本地址（逗号分隔可配多个，按顺序回退，首个为主源）；留空用内置默认源。
-    # 由后端下发而非前端硬编码：更换验证域名时无需重新构建并上传前端产物。
-    turnstile_script_src: str = ""
-
     # CORS：开发时前端在 http://localhost:5173；生产通过逗号分隔配置多个来源
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
 

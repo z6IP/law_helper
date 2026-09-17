@@ -4,7 +4,6 @@ import { Sidebar } from './components/Sidebar'
 import { MessageList } from './components/MessageList'
 import { ChatInput } from './components/ChatInput'
 import { ThemeToggle } from './components/ThemeToggle'
-import { Turnstile } from './components/Turnstile'
 import { useSessions } from './hooks/useSessions'
 import * as api from './api'
 import type { Attachment, Reference } from './types'
@@ -17,11 +16,6 @@ const SIDEBAR_AUTO_THRESHOLD = 1060
 const MAX_DRAG_FILES = 3
 const MAX_DRAG_FILE_SIZE = 5 * 1024 * 1024
 const EMPTY_FILES: File[] = []
-// 安全配置加载重试次数：该请求失败会让前端不渲染人机验证组件，
-// 而后端仍要求 token，导致用户每次发送都被 403 拒绝
-const SECURITY_SETTINGS_MAX_ATTEMPTS = 3
-
-
 
 function App() {
   const {
@@ -58,16 +52,6 @@ function App() {
     const saved = localStorage.getItem(DEEP_THINKING_KEY)
     return saved ? saved === 'true' : false
   })
-  // Turnstile 人机验证：后端启用时才渲染；token 单次有效，消费后 reset
-  const [turnstileSiteKey, setTurnstileSiteKey] = useState<string | null>(null)
-  const [turnstileScriptSrcs, setTurnstileScriptSrcs] = useState<string[] | undefined>(undefined)
-  // 加载失败时给出可恢复的提示与重试入口，避免用户被永久拦住无法发送
-  const [turnstileStatus, setTurnstileStatus] = useState<'loading' | 'ready' | 'failed'>('loading')
-  // /settings/security 拉取失败：既拿不到 sitekey，也无法确认验证是否启用
-  const [securitySettingsError, setSecuritySettingsError] = useState(false)
-  const turnstileTokenRef = useRef('')
-  const turnstileResetRef = useRef<(() => void) | null>(null)
-  const turnstileRetryRef = useRef<(() => void) | null>(null)
   // 主题状态以 DOM（<html data-theme>）为唯一事实来源，不在 App 中订阅，
   // 避免切换主题时整棵 React 树重渲染（2K 全屏下卡顿的主因）。
   const [animated, setAnimated] = useState(false)
@@ -356,37 +340,6 @@ function App() {
     setMounted(true)
   }, [])
 
-  // 加载安全配置：后端启用 Turnstile 时才渲染验证组件。
-  // 该请求失败会让前端不渲染验证组件、而后端仍要求 token（每次发送 403），
-  // 因此失败必须重试并暴露可见错误态，不能像原先那样静默吞掉。
-  const loadSecuritySettings = useCallback(async () => {
-    setSecuritySettingsError(false)
-    for (let attempt = 1; attempt <= SECURITY_SETTINGS_MAX_ATTEMPTS; attempt++) {
-      try {
-        const s = await api.fetchSecuritySettings()
-        const enabled = s.turnstile_enabled && !!s.turnstile_site_key
-        setTurnstileSiteKey(enabled ? s.turnstile_site_key : null)
-        if (enabled) {
-          setTurnstileScriptSrcs(s.turnstile_script_srcs)
-          setTurnstileStatus('loading')
-        }
-        return
-      } catch (err) {
-        if (attempt === SECURITY_SETTINGS_MAX_ATTEMPTS) {
-          console.error('安全配置加载失败', err)
-          setSecuritySettingsError(true)
-          return
-        }
-        // 瞬时抖动居多，退避重试；仍失败则交给用户手动重试
-        await new Promise((resolve) => setTimeout(resolve, 500 * attempt))
-      }
-    }
-  }, [])
-
-  useEffect(() => {
-    loadSecuritySettings()
-  }, [loadSecuritySettings])
-
   // 切换会话时不再中止生成：仅关闭输入框位移动画。
   // 后台生成按 sessionId 独立继续，写回对应会话，不受当前界面影响。
   useEffect(() => {
@@ -505,18 +458,6 @@ function App() {
   const handleSend = useCallback(
     async (text: string, files?: File[]) => {
       if (!currentSession) return
-      // Turnstile 一次性 token：启用时发送前校验，消费后立即 reset 供下次使用
-      const turnstileToken = turnstileTokenRef.current || undefined
-      if (turnstileSiteKey && !turnstileToken) {
-        alert(
-          turnstileStatus === 'failed'
-            ? '人机验证组件加载失败，请点击输入框下方的「重新验证」后重试'
-            : '人机验证进行中，请稍候片刻再发送',
-        )
-        return
-      }
-      turnstileTokenRef.current = ''
-      turnstileResetRef.current?.()
       const sessionId = currentSession.id
       const isFirst = currentSession.title === '新对话'
       const hasFiles = files && files.length > 0
@@ -621,7 +562,6 @@ function App() {
             files?.map((f) => f.name),
             uploadedAttachments,
             deepThinking,
-            turnstileToken,
           ),
         )
       })()
@@ -637,8 +577,6 @@ function App() {
       clearPendingFiles,
       clearPendingText,
       deepThinking,
-      turnstileSiteKey,
-      turnstileStatus,
     ],
   )
 
@@ -816,54 +754,6 @@ function App() {
               deepThinking={deepThinking}
               onDeepThinkingChange={handleDeepThinkingChange}
             />
-            {turnstileSiteKey && (
-              <>
-                <Turnstile
-                  siteKey={turnstileSiteKey}
-                  scriptSrcs={turnstileScriptSrcs}
-                  onToken={(token) => {
-                    turnstileTokenRef.current = token
-                  }}
-                  onReady={() => setTurnstileStatus('ready')}
-                  onError={(err) => {
-                    console.error('Turnstile 加载失败', err)
-                    setTurnstileStatus('failed')
-                  }}
-                  resetRef={turnstileResetRef}
-                  retryRef={turnstileRetryRef}
-                />
-                {turnstileStatus === 'failed' && (
-                  <div className="turnstile-notice" role="alert">
-                    <span>人机验证组件加载失败，暂时无法发送消息。</span>
-                    <button
-                      type="button"
-                      className="turnstile-retry-btn"
-                      onClick={() => {
-                        turnstileTokenRef.current = ''
-                        setTurnstileStatus('loading')
-                        turnstileRetryRef.current?.()
-                      }}
-                    >
-                      重新验证
-                    </button>
-                  </div>
-                )}
-              </>
-            )}
-            {securitySettingsError && (
-              <div className="turnstile-notice" role="alert">
-                <span>安全配置加载失败，可能无法发送消息。</span>
-                <button
-                  type="button"
-                  className="turnstile-retry-btn"
-                  onClick={() => {
-                    loadSecuritySettings()
-                  }}
-                >
-                  重试
-                </button>
-              </div>
-            )}
           </div>
         </div>
       </main>

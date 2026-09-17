@@ -455,39 +455,6 @@ body {
   background: var(--bg);
 }
 
-/* Turnstile 验证组件插槽：interaction-only 模式下正常情况不占位 */
-.turnstile-slot {
-  display: flex;
-  justify-content: center;
-  margin-top: 8px;
-  min-height: 0;
-}
-
-/* 验证组件加载失败提示：给出重试入口，避免用户被永久拦住无法发送 */
-.turnstile-notice {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  margin-top: 8px;
-  font-size: 13px;
-  color: var(--danger);
-}
-
-.turnstile-retry-btn {
-  padding: 2px 8px;
-  border: 1px solid currentColor;
-  border-radius: 4px;
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  cursor: pointer;
-}
-
-.turnstile-retry-btn:hover {
-  background: var(--hover-bg);
-}
-
 /* 首次渲染无动画，避免刷新时输入框从底部闪到中间 */
 .chat-layout.animated .input-area {
   transition: transform 0.45s cubic-bezier(0.25, 0.46, 0.45, 0.94);

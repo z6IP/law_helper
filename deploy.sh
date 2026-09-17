@@ -219,22 +219,20 @@ echo "===== 8. 清理悬空镜像（安全）====="
 docker image prune -f
 
 echo ""
-echo "===== 9. 验证新镜像已生效 ====="
-# /settings/security 的 turnstile_script_srcs 字段只有本次改造后的后端才会返回，
-# 用它确认容器确实跑在新拉取的镜像上，而不是旧容器残留。
+echo "===== 9. 验证后端已就绪 ====="
 if [ "$SKIP_BACKEND_START" = "1" ]; then
-  echo "[跳过] 后端未启动，镜像生效验证延后到 sync_index.ps1 之后"
+  echo "[跳过] 后端未启动，就绪验证延后到 sync_index.ps1 之后"
 else
-  _SEC=$(docker compose exec -T backend python -c \
-    "import urllib.request;print(urllib.request.urlopen('http://localhost:8000/api/v1/settings/security',timeout=5).read().decode())" \
+  _HEALTH=$(docker compose exec -T backend python -c \
+    "import urllib.request;print(urllib.request.urlopen('http://localhost:8000/api/v1/health',timeout=5).read().decode())" \
     2>/dev/null || true)
-  case "$_SEC" in
-    *turnstile_script_srcs*)
-      echo "新镜像已生效：$_SEC"
+  case "$_HEALTH" in
+    *ok*)
+      echo "后端已就绪：$_HEALTH"
       ;;
     *)
-      echo "[提示] 未能确认新镜像字段，请手动检查："
-      echo "  curl -s localhost:8000/api/v1/settings/security"
+      echo "[提示] 未能获取健康检查响应，请手动检查："
+      echo "  curl -s localhost:8000/api/v1/health"
       ;;
   esac
 fi
