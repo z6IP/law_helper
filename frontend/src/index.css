@@ -640,8 +640,10 @@ body {
   color: var(--text);
 }
 
-/* 分析/结论/建议三段视觉独立：第二个 h2 起加分隔线并加大间距 */
-.markdown-body h2:not(:first-child) {
+/* 分析/结论/建议三段视觉独立：第二个 h2 起加分隔线并加大间距。
+   用 :not(:first-of-type) 而非 :not(:first-child)：回答常以普通段落开头，
+   按 first-child 判定会让第一个 h2 也被误加分隔线。 */
+.markdown-body h2:not(:first-of-type) {
   margin-top: 1.4em;
   padding-top: 0.9em;
   border-top: 1px solid var(--border);

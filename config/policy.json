@@ -155,7 +155,8 @@
     "context_gates": [
       {
         "name": "traffic_escape",
-        "required_context_keywords": ["撞", "事故", "肇事", "车祸", "相撞", "碰撞", "追尾", "剐蹭", "伤亡", "死亡"],
+        "chunk_types": ["clause"],
+        "required_context_keywords": ["撞车", "撞人", "撞到", "撞了", "被撞", "相撞", "碰撞", "追尾", "剐蹭", "刮蹭", "擦碰", "事故", "肇事", "车祸", "伤亡", "死亡"],
         "blocked_text_keywords": ["交通事故后逃逸", "交通肇事逃逸", "交通运输肇事后逃逸", "肇事后逃逸"]
       }
     ],

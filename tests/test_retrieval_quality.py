@@ -3,7 +3,12 @@ from types import SimpleNamespace
 from app.config import get_settings
 from app.ingestion import Article, _expand_article_chunks, _parent_article_no
 from app.policy import get_policy
-from app.qa import _apply_context_gates, _match_domains, _restrict_to_primary_source
+from app.qa import (
+    _apply_context_gates,
+    _is_trivial_query,
+    _match_domains,
+    _restrict_to_primary_source,
+)
 from app.query_expansion import classify_query_intents, expand_query_by_intent
 from app.rerank import apply_role_adjustment
 from app.retrieval import _tokenize
@@ -291,6 +296,41 @@ def test_context_gate_drops_traffic_escape_without_accident_context():
     kept = _apply_context_gates("撞人后跑了算逃逸吗", candidates)
 
     assert [c["id"] for c in kept] == ["escape", "fight"]
+
+
+def test_context_gate_keeps_article_level_chunks():
+    """父条块把多个违法情形合并在一条里，不能因其中一项涉及逃逸就整块剔除。
+
+    例：记分办法第十条既含「（八）不按信号灯指示通行」也含
+    「（十）造成…交通事故后逃逸，尚不构成犯罪的」，问「闯红灯怎么处罚」时
+    父条必须保留，否则 _ensure_parent_articles 无法补回，
+    「一次记6分」等处罚前置句会随父条一起丢失；条款级仍应被剔除。
+    """
+    candidates = [
+        {
+            "id": "article",
+            "text": "机动车驾驶人有下列交通违法行为之一，一次记6分：…"
+            "（十）造成致人轻微伤或者财产损失的交通事故后逃逸，尚不构成犯罪的；",
+            "metadata": {"chunk_type": "article"},
+        },
+        {
+            "id": "clause",
+            "text": "（十）造成致人轻微伤或者财产损失的交通事故后逃逸，尚不构成犯罪的；",
+            "metadata": {"chunk_type": "clause"},
+        },
+    ]
+
+    kept = _apply_context_gates("闯红灯怎么处罚", candidates)
+
+    assert [c["id"] for c in kept] == ["article"]
+
+
+def test_short_civil_question_is_not_trivial():
+    """桥接触发词（借钱/借条/赖账）应让 ≤4 字短问句进入检索，不被 trivial 拒答。"""
+    assert _is_trivial_query("借钱不还") is False
+    assert _is_trivial_query("借条") is False
+    # 非法律短问句仍应被拦截
+    assert _is_trivial_query("今天天气") is True
 
 
 def test_inject_penalty_context_skips_when_parent_present():

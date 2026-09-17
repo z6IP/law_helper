@@ -49,6 +49,11 @@ def test_sync_call_keeps_thinking_disabled(monkeypatch):
 
 
 def test_stream_call_uses_configured_thinking_strategy(monkeypatch):
+    """思考关闭时只下发 enable_thinking，不带无意义的 thinking_budget。
+
+    百炼仅在 enable_thinking=True 时读取预算，关闭思考还传预算只会污染请求体
+    （d52ab54 起的实现即如此），故此处断言预算字段缺席。
+    """
     settings = SimpleNamespace(
         llm_model="test-model",
         answer_temperature=0.15,
@@ -67,7 +72,37 @@ def test_stream_call_uses_configured_thinking_strategy(monkeypatch):
 
     call = client.chat.completions.calls[0]
     assert call["temperature"] == 0.15
-    assert call["extra_body"] == {
-        "enable_thinking": False,
+    assert call["extra_body"] == {"enable_thinking": False}
+
+
+def test_stream_call_passes_budget_only_when_thinking_on(monkeypatch):
+    """思考开启时才下发 thinking_budget，预算取自 Settings。"""
+    settings = SimpleNamespace(
+        llm_model="test-model",
+        answer_temperature=0.15,
+        thinking_enabled=True,
+        thinking_budget=987,
+    )
+    client = FakeClient()
+    model = llm_module.BailianClient()
+    model._client = client
+    monkeypatch.setattr(llm_module, "get_settings", lambda: settings)
+
+    list(model.chat_stream("system", "user"))
+
+    assert client.chat.completions.calls[0]["extra_body"] == {
+        "enable_thinking": True,
+        "thinking_budget": 987,
+    }
+
+    # 调用方显式开启时同样生效（Settings 关闭也应带上预算）
+    settings.thinking_enabled = False
+    override_client = FakeClient()
+    model._client = override_client
+
+    list(model.chat_stream("system", "user", enable_thinking=True))
+
+    assert override_client.chat.completions.calls[0]["extra_body"] == {
+        "enable_thinking": True,
         "thinking_budget": 987,
     }

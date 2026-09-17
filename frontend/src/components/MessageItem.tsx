@@ -33,22 +33,30 @@ function renderPlain(src: string): ReactNode[] {
 // 大标题 ## -> h2(22px)；小标题 ### 或独占一行的 **xxx** -> h3(18px)；
 // 列表 - / * -> ul，1. -> ol（连续行合并为一个列表）；其余非空行 -> p(16px)。
 // React 自动转义文本，无 XSS 风险，且保留增量 diff 无 DOM 重建。
-const INLINE_RE = /(\*\*[^*\n]+\*\*|\*[^*\n]+\*|`[^`\n]+`)/g
-
 // 行内解析：**加粗** / *斜体* / `代码`
+// 正则建在函数内：模块级 /g 正则带 lastIndex 状态，跨调用复用必须手动归零，
+// 一旦漏置零或中途 return 就会静默错位（漏掉首个匹配）。
 function renderInline(text: string, keyBase: string): ReactNode[] {
   const out: ReactNode[] = []
-  INLINE_RE.lastIndex = 0
+  const inlineRe = /(\*\*[^*\n]+\*\*|\*[^*\n]+\*|`[^`\n]+`)/g
   let last = 0
   let n = 0
   let m: RegExpExecArray | null
-  while ((m = INLINE_RE.exec(text)) !== null) {
+  while ((m = inlineRe.exec(text)) !== null) {
     if (m.index > last) out.push(text.slice(last, m.index))
     const token = m[0]
     const key = `${keyBase}-i${n++}`
-    if (token.startsWith('**')) out.push(<strong key={key}>{token.slice(2, -2)}</strong>)
-    else if (token.startsWith('`')) out.push(<code key={key}>{token.slice(1, -1)}</code>)
-    else out.push(<em key={key}>{token.slice(1, -1)}</em>)
+    if (token.startsWith('**')) {
+      out.push(<strong key={key}>{token.slice(2, -2)}</strong>)
+    } else if (token.startsWith('`')) {
+      out.push(<code key={key}>{token.slice(1, -1)}</code>)
+    } else if (/\d$/.test(text.slice(0, m.index)) || /^\d/.test(text.slice(m.index + token.length))) {
+      // 单星号两侧紧邻数字时视为算式（如 2*3*4），按原文输出，不渲染 <em>；
+      // 用相邻字符判断而非正则 lookbehind，避免旧版 Safari 解析字面量直接抛错。
+      out.push(token)
+    } else {
+      out.push(<em key={key}>{token.slice(1, -1)}</em>)
+    }
     last = m.index + token.length
   }
   if (last < text.length) out.push(text.slice(last))

@@ -89,8 +89,11 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "上传索引失败" }
 
     # 5) 远端替换并启动后端（启动时 ingest 判定未变化 → 跳过 embedding）
+    # 先解到临时目录并校验 sqlite 存在，再整目录替换：直接 rm -rf 后解包一旦失败，
+    # 旧索引已丢，finally 仍会 up -d 启动后端 → 服务器侧全量 embedding（本方案要避免的开销）。
     Write-Host "[5/5] 替换服务器索引并启动后端..." -ForegroundColor Cyan
-    & ssh $Server "rm -rf $RemoteDir/chroma && tar -xzf /tmp/chroma.tar.gz -C $RemoteDir && rm -f /tmp/chroma.tar.gz && bash $RemoteDir/compose.sh up -d"
+    $staging = "$RemoteDir/chroma.new"
+    & ssh $Server "rm -rf $staging && mkdir -p $staging && tar -xzf /tmp/chroma.tar.gz -C $staging --strip-components=1 && test -f $staging/chroma.sqlite3 && rm -rf $RemoteDir/chroma && mv $staging $RemoteDir/chroma && rm -f /tmp/chroma.tar.gz && bash $RemoteDir/compose.sh up -d"
     if ($LASTEXITCODE -ne 0) { throw "替换索引或启动服务器后端失败" }
 
     $synced = $true

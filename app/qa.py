@@ -201,15 +201,32 @@ def _apply_context_gates(query: str, candidates: list[dict]) -> list[dict]:
     「发生道路交通事故」为前提，当用户问题不含任何事故语境词时，「电动车」「跑了」
     等词项的语义相似度不足以适用这些条款，应剔除，避免交通条款挤占非交通事故问题
     （如打架后骑车离开现场）的上下文。门槛由 policy.json 的
-    retrieval.context_gates 管理，新增场景只需改配置。
+    retrieval.context_gates 管理，新增场景只需改配置；默认只作用于条款级（clause）
+    候选，需放宽到父条块时在配置里显式声明 chunk_types。
     """
     gates = get_policy()["retrieval"].get("context_gates") or []
     if not gates or not candidates:
         return candidates
 
+    # 门槛默认只作用于条款级（clause）候选：父条（article）正文把同一条下的多个
+    # 违法情形合并在一个块里（如记分办法第十条同时含「不按信号灯指示通行」与
+    # 「交通事故后逃逸」），只要其中一项命中 blocked 关键词就整块剔除，会连带误杀
+    # 同一法条下与逃逸无关的情形；且剔除发生在 rerank 之前，_ensure_parent_articles
+    # 无法再从 candidates 中补回父条，处罚前置句与条号锚点会一起丢失。
+    # 需要放宽到父条时，在 policy.json 的 context_gates 中显式配置 chunk_types。
+    gate_chunk_types = {
+        chunk_type
+        for gate in gates
+        for chunk_type in (gate.get("chunk_types") or ["clause"])
+    }
     kept: list[dict] = []
     dropped = 0
     for candidate in candidates:
+        # 缺省按 clause 处理：保持既有配置与回归用例的语义不变
+        chunk_type = (candidate.get("metadata") or {}).get("chunk_type", "clause")
+        if chunk_type not in gate_chunk_types:
+            kept.append(candidate)
+            continue
         text = candidate.get("text") or ""
         blocked = any(
             gate.get("required_context_keywords")
@@ -317,7 +334,16 @@ _TRIVIAL_TOKENS = set(get_policy()["query"]["trivial_tokens"])
 
 # 法律相关关键词：短 query 命中任一关键词才进入 RAG，否则视为无意义输入
 # 道路交通安全 + 立法法/通用法律语境关键词，确保不同法规的短问句都能进入检索
-_LAW_KEYWORDS = tuple(get_policy()["query"]["law_keywords"])
+# 并入 domain_bridges 的触发词：桥接规则的触发词（如"借钱""借条""赖账"）若不在
+# law_keywords 中，长度 ≤4 的常见短问句（如"借钱不还"）会被 trivial 分支直接拒答，
+# 新增的领域桥接在短问句场景下等同死配置。
+_BRIDGE_TRIGGERS = tuple(
+    trigger
+    for bridge in (get_policy()["query"].get("domain_bridges") or {}).values()
+    for rule in (bridge.get("rules") or [])
+    for trigger in (rule.get("triggers") or [])
+)
+_LAW_KEYWORDS = tuple(get_policy()["query"]["law_keywords"]) + _BRIDGE_TRIGGERS
 
 
 def _is_trivial_query(query: str) -> bool:

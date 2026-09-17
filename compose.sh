@@ -29,7 +29,16 @@ set +a
 
 : "${ACR_REGISTRY_HOST:?deploy.env 缺少 ACR_REGISTRY_HOST}"
 : "${ACR_NAMESPACE:?deploy.env 缺少 ACR_NAMESPACE}"
+# 未显式指定 IMAGE_TAG 时，沿用当前运行容器所用的标签，绝不回退 :latest：
+# 回退 latest 会让 sync_index.ps1 的 `compose.sh up -d` 把后端换成服务器上
+# 遗留的旧镜像（或直接找不到镜像），与 docker-compose.yml 的设计意图冲突。
+if [ -z "${IMAGE_TAG:-}" ]; then
+  # 末尾的 || true：容器不存在时 docker inspect 返回非 0，set -o pipefail + set -e
+  # 会让赋值语句直接终止脚本并吞掉下面的可读报错，这里先兜住退出码。
+  IMAGE_TAG="$(docker inspect -f '{{.Config.Image}}' law-helper-backend 2>/dev/null | sed 's/.*://' || true)"
+fi
+: "${IMAGE_TAG:?无法确定镜像标签：请显式传 IMAGE_TAG=<完整 sha>，或先执行 bash deploy.sh}"
 # 与 deploy.sh 中 BACKEND_IMAGE 的拼装保持一致，修改此处需同步 deploy.sh
-export BACKEND_IMAGE="${ACR_REGISTRY_HOST}/${ACR_NAMESPACE}/${BACKEND_IMAGE_REPO:-law-helper-backend}:${IMAGE_TAG:-latest}"
+export BACKEND_IMAGE="${ACR_REGISTRY_HOST}/${ACR_NAMESPACE}/${BACKEND_IMAGE_REPO:-law-helper-backend}:${IMAGE_TAG}"
 
 exec docker compose "$@"
