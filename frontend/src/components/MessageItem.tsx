@@ -4,11 +4,10 @@ import { ChevronDown, FileText, Image } from 'lucide-react'
 import { References } from './References'
 import type { Attachment, SessionMessage } from '../types'
 
-// 轻量渲染：仅将 ## / ### 标题转为 h2 / h3，其余按纯文本输出。
+// 思考过程专用：仅将 ## / ### 标题转为 h2 / h3，其余按纯文本输出（配合 pre-wrap 保留换行）。
 // 返回 React 元素数组（而非 HTML 字符串 + dangerouslySetInnerHTML），
-// 让 React 只增量更新变化的 text node，避免流式期间每帧重建整个 DOM；
-// 标题始终 22px，且流式结束无切换、无闪屏。React 自动转义文本，无 XSS 风险。
-function renderLines(src: string): ReactNode[] {
+// 让 React 只增量更新变化的 text node，避免流式期间每帧重建整个 DOM。
+function renderPlain(src: string): ReactNode[] {
   const lines = src.split('\n')
   const nodes: ReactNode[] = []
   let prevIsHeading = false
@@ -27,6 +26,85 @@ function renderLines(src: string): ReactNode[] {
       prevIsHeading = false
     }
   })
+  return nodes
+}
+
+// ===== 正文轻量 Markdown：块级 + 行内，全部产出 React 节点（无 innerHTML、无 XSS）=====
+// 大标题 ## -> h2(22px)；小标题 ### 或独占一行的 **xxx** -> h3(18px)；
+// 列表 - / * -> ul，1. -> ol（连续行合并为一个列表）；其余非空行 -> p(16px)。
+// React 自动转义文本，无 XSS 风险，且保留增量 diff 无 DOM 重建。
+const INLINE_RE = /(\*\*[^*\n]+\*\*|\*[^*\n]+\*|`[^`\n]+`)/g
+
+// 行内解析：**加粗** / *斜体* / `代码`
+function renderInline(text: string, keyBase: string): ReactNode[] {
+  const out: ReactNode[] = []
+  INLINE_RE.lastIndex = 0
+  let last = 0
+  let n = 0
+  let m: RegExpExecArray | null
+  while ((m = INLINE_RE.exec(text)) !== null) {
+    if (m.index > last) out.push(text.slice(last, m.index))
+    const token = m[0]
+    const key = `${keyBase}-i${n++}`
+    if (token.startsWith('**')) out.push(<strong key={key}>{token.slice(2, -2)}</strong>)
+    else if (token.startsWith('`')) out.push(<code key={key}>{token.slice(1, -1)}</code>)
+    else out.push(<em key={key}>{token.slice(1, -1)}</em>)
+    last = m.index + token.length
+  }
+  if (last < text.length) out.push(text.slice(last))
+  return out
+}
+
+function renderMarkdown(src: string): ReactNode[] {
+  const lines = src.split('\n')
+  const nodes: ReactNode[] = []
+  let listBuf: { text: string; key: number }[] = []
+  let listTag: 'ul' | 'ol' = 'ul'
+
+  const flushList = () => {
+    if (listBuf.length === 0) return
+    const items = listBuf.map((it) => <li key={it.key}>{renderInline(it.text, `li-${it.key}`)}</li>)
+    const Tag = listTag
+    nodes.push(<Tag key={`${listTag}-${listBuf[0].key}`}>{items}</Tag>)
+    listBuf = []
+  }
+
+  lines.forEach((line, i) => {
+    if (line.startsWith('### ')) {
+      flushList()
+      nodes.push(<h3 key={i}>{renderInline(line.slice(4), `h3-${i}`)}</h3>)
+      return
+    }
+    if (line.startsWith('## ')) {
+      flushList()
+      nodes.push(<h2 key={i}>{renderInline(line.slice(3), `h2-${i}`)}</h2>)
+      return
+    }
+    // 独占一行的 **xxx** 视为小标题（模型常以其代替 ### 作小标题）
+    const bold = /^\s*\*\*([^*]{1,40})\*\*\s*$/.exec(line)
+    if (bold) {
+      flushList()
+      nodes.push(<h3 key={i}>{renderInline(bold[1], `bh-${i}`)}</h3>)
+      return
+    }
+    const ul = /^\s*[-*]\s+(.*)$/.exec(line)
+    const ol = /^\s*\d+[.、)]\s+(.*)$/.exec(line)
+    if (ul || ol) {
+      const tag: 'ul' | 'ol' = ul ? 'ul' : 'ol'
+      if (listTag !== tag) flushList()
+      listTag = tag
+      listBuf.push({ text: (ul ? ul[1] : ol![1]).trim(), key: i })
+      return
+    }
+    // 空行：仅作块间分隔，不产出节点
+    if (line.trim() === '') {
+      flushList()
+      return
+    }
+    flushList()
+    nodes.push(<p key={i}>{renderInline(line, `p-${i}`)}</p>)
+  })
+  flushList()
   return nodes
 }
 
@@ -218,8 +296,9 @@ export const MessageItem = memo(function MessageItem({ message, isCurrentLoading
   const [preview, setPreview] = useState<PreviewInfo | null>(null)
   const isUser = message.role === 'user'
 
-  // 回答与推理过程使用「纯文本 + 标题」轻量渲染（renderLines 仅将 ##/### 转为 h2/h3），
-  // 不调用 marked.parse + DOMPurify，标题始终 22px，React 增量 diff 无切换闪屏、无 DOM 重建。
+  // 正文用 renderMarkdown（块级 + 行内，标题/列表/加粗均产出 React 节点），
+  // 思考过程用 renderPlain（纯文本 + h2/h3）；
+  // 均不调用 marked.parse + DOMPurify，React 增量 diff 无切换闪屏、无 DOM 重建。
 
   if (isUser) {
     const hasAttachments = message.attachments && message.attachments.length > 0
@@ -273,7 +352,7 @@ export const MessageItem = memo(function MessageItem({ message, isCurrentLoading
               )}
             </button>
             {reasoningOpen && (
-              <div className="reasoning-body">{renderLines(message.reasoning || '')}</div>
+              <div className="reasoning-body">{renderPlain(message.reasoning || '')}</div>
             )}
           </div>
         )}
@@ -283,7 +362,7 @@ export const MessageItem = memo(function MessageItem({ message, isCurrentLoading
             <span className="spinner" />
           </div>
         )}
-        <div className="markdown-body">{renderLines(message.content)}</div>
+        <div className="markdown-body">{renderMarkdown(message.content)}</div>
         {!isCurrentLoading && <References references={message.references || []} />}
       </div>
     </div>

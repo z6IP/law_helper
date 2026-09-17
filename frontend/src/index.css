@@ -627,12 +627,10 @@ body {
   line-height: 1.7;
   /* 隔离重排范围：流式更新时只在本块内重新布局，不触发整页 layout */
   contain: content;
-  /* 纯文本 + 标题轻量渲染：保留换行，##/### 标题已由 renderText 转为 h2/h3 */
-  white-space: pre-wrap;
+  /* 正文由 renderMarkdown 生成 <p>/<ul>/<ol> 块级元素控制间距，不再依赖 pre-wrap；
+     思考过程 .reasoning-body 仍为 renderPlain + pre-wrap，保持纯文本样式 */
+  white-space: normal;
 }
-
-/* 回答与推理过程使用「纯文本 + 标题」轻量渲染（见 MessageItem.tsx renderText），
-   white-space: pre-wrap 已并入 .markdown-body / .reasoning-body 基础样式 */
 
 .markdown-body h2 {
   margin: 0.75em 0 0.3em;
@@ -640,6 +638,13 @@ body {
   line-height: 1.4;
   font-weight: 700;
   color: var(--text);
+}
+
+/* 分析/结论/建议三段视觉独立：第二个 h2 起加分隔线并加大间距 */
+.markdown-body h2:not(:first-child) {
+  margin-top: 1.4em;
+  padding-top: 0.9em;
+  border-top: 1px solid var(--border);
 }
 
 .markdown-body h3 {
