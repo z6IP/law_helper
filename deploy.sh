@@ -11,8 +11,10 @@
 #        - 本地执行 git rev-parse HEAD
 #        - GitHub Actions 运行日志中「输出构建结果」那一步
 #
-# ===== 后端镜像不在本机构建 =====
-#   构建链路：GitHub Actions 构建 → 推送阿里云 ACR → 本脚本只负责拉取与重启。
+# ===== 后端镜像不在服务器构建 =====
+#   构建链路：本地 docker build → docker push 阿里云 ACR → 本脚本负责拉取与重启。
+#   （.github/workflows/build-backend-image.yml 保留了手动触发的 CI 构建作为兜底，
+#     已不再由 push 自动触发，避免 CI 推的 :latest 覆盖本地推送的镜像。）
 #   原因：2G 内存机器上构建 2GB 级镜像会与运行中的后端容器争抢内存（后端加载
 #   embedding/rerank 模型常驻约 1.4G），触发内存颠簸导致整机卡死。构建搬离服务器后，
 #   这类事故在结构上不再可能发生。

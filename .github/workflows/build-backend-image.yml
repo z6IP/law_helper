@@ -1,22 +1,14 @@
 name: Build and push backend image
 
-# 后端镜像只在 CI 构建，服务器不再承担构建负载。
-# 背景：2G 内存的生产 ECS 上构建 2GB 级镜像会与运行中的容器争抢内存导致整机卡死，
-# 因此构建整体迁移到 GitHub Actions，产物推送到阿里云 ACR，服务器只做 docker pull。
+# 后端镜像默认在本地构建后手动 docker push 到阿里云 ACR（国内网络，通常 1~3 分钟），
+# 服务器只做 docker pull；本工作流保留为手动兜底（workflow_dispatch），
+# 不再由 push 自动触发——避免 CI 推的 :latest 覆盖本地推送的镜像。
+# 背景：2G 内存的生产 ECS 上构建镜像会与运行中的后端容器争抢内存导致整机卡死，
+# 因此构建一律不在服务器上进行（本地构建推送，或手动触发本工作流）。
 
 on:
-  push:
-    branches: [main]
-    paths:
-      # 只有会影响镜像内容或构建方式的改动才触发，避免纯文档改动也跑一次重型构建
-      - 'app/**'
-      - 'config/**'
-      - 'prompts/**'
-      - 'statute/**'
-      - 'requirements.txt'
-      - 'Dockerfile'
-      - '.dockerignore'
-      - '.github/workflows/build-backend-image.yml'
+  # 构建默认在本地完成并手动 docker push 到 ACR；CI 仅保留手动触发作为兜底，
+  # 避免 push 触发的 CI 构建推 :latest 覆盖本地推送的镜像。
   workflow_dispatch:
 
 # 同一分支只保留最新一次构建：避免并发推送互相覆盖 latest 标签与层缓存
@@ -26,6 +18,9 @@ concurrency:
 
 env:
   IMAGE_NAME: ${{ secrets.ACR_REGISTRY }}/${{ secrets.ACR_NAMESPACE }}/law-helper-backend
+  # 纯文本进度输出：exporting 阶段会逐层打印上传进度与体积，
+  # 便于区分「正在跨境传输」与「真的卡死」（默认进度模式下该阶段无任何输出）。
+  BUILDKIT_PROGRESS: plain
 
 # 本工作流只需读代码 + 向 ACR 推送，显式收窄 GITHUB_TOKEN 权限，
 # 避免默认的宽权限被第三方 action 利用（构建供应链最小权限原则）。
