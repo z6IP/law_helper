@@ -373,6 +373,47 @@ def _is_trivial_query(query: str) -> bool:
     return False
 
 
+# ── 公共服务号码常识问答 ──
+# 「报警电话」这类问题本质是常识查询而非法律适用：一旦放进检索，会因条文正文恰好
+# 出现「报警电话」字样（如「电话报警的还应当记录报警电话」）而召回一堆不相关条款，
+# 再被 legal_system 的逐条论证要求放大成偏题长文。故命中即直接返回固定答案，
+# 不进检索、不附引用。规则维护在 config/policy.json 的 public_service 段。
+_PUBLIC_SERVICE = get_policy().get("public_service") or {}
+
+
+def _normalize_text(text: str) -> str:
+    """归一化文本：去空白与常见标点并转小写，便于子串匹配。"""
+    return re.sub(r"[\s\u3000，。！？、,.!?;；:：()（）]+", "", (text or "").lower())
+
+
+def _match_public_service_answer(query: str) -> str | None:
+    """命中公共服务号码问题时返回固定答案，否则返回 None。
+
+    三道闸门避免误伤真正的法律问题：
+    1. 长度不超过 max_length（「我在驾驶时拨打110报警算违法吗」这类长句不命中）；
+    2. 不含法律语境排除词（含「处罚/责任/违法」等一律走正常检索）；
+    3. 命中任一 match 关键词（按配置顺序短路，更具体的规则需排在前面）。
+    """
+    q = _normalize_text(query)
+    if not q:
+        return None
+    if len(q) > int(_PUBLIC_SERVICE.get("max_length", 15)):
+        return None
+    if any(
+        kw and _normalize_text(kw) in q
+        for kw in _PUBLIC_SERVICE.get("exclude_keywords", [])
+    ):
+        return None
+    for rule in _PUBLIC_SERVICE.get("rules", []):
+        reply = rule.get("reply") or ""
+        if not reply:
+            continue
+        for keyword in rule.get("match", []):
+            if keyword and _normalize_text(keyword) in q:
+                return reply
+    return None
+
+
 # 多轮历史感知改写（condense question）：把追问 + 最近历史改写成独立完整的问题，
 # 再进入检索与生成；与 GitHub 高星实践（LangChain create_history_aware_retriever）等价
 @lru_cache(maxsize=1)
@@ -790,6 +831,13 @@ def answer(
 ) -> tuple[str, list[Reference]]:
     history = history or []
 
+    # 公共服务号码常识问答（如「报警电话」）：命中即直接回答，不进检索、不附引用
+    if not document_text and not law_source and not article_no:
+        reply = _match_public_service_answer(question)
+        if reply:
+            event("public_service_answer", question=question)
+            return reply, []
+
     # 多轮：先做历史感知改写，trivial 判定与检索均使用改写后的独立问题
     # （防止「那扣几分？」这类追问被 trivial 拦截误杀）；
     # 改写失败（rewrite_ok=False）时跳过 trivial 拒答直接进检索，由重排阈值兜底；
@@ -881,6 +929,15 @@ def answer_stream(
     """
     t0 = time.perf_counter()
     history = history or []
+
+    # 公共服务号码常识问答（如「报警电话」）：命中即直接回答，不进检索、不附引用
+    if not document_text and not law_source and not article_no:
+        reply = _match_public_service_answer(question)
+        if reply:
+            event("public_service_answer", question=question)
+            yield {"type": "references", "references": []}
+            yield {"type": "delta", "content": reply}
+            return
 
     # 无意义输入（无历史时的单字 / 纯数字 / 问候 / 短词无法律关键词）：
     # 不发预热思考，直接走拒答分支，前端不会出现思考区域
