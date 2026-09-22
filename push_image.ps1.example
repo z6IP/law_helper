@@ -108,6 +108,19 @@ foreach ($pair in @(@("ACR_REGISTRY_HOST", $RegistryHost), @("ACR_NAMESPACE", $N
     if ([string]::IsNullOrWhiteSpace($pair[1])) {
         throw "配置缺失：$($pair[0]) 未设置（请填写 push.env 或通过参数传入）"
     }
+    # 镜像地址按 <host>/<namespace>/<repo> 三段拼接，任一段混入多余路径都会拼出
+    # ACR 上不存在的仓库，症状是 push 报 insufficient_scope / repository does not exist。
+    # 最常见的误填：把控制台显示的完整镜像地址整段粘进 ACR_REGISTRY_HOST。
+    if ($pair[1].Contains('/') -or $pair[1].Contains('\')) {
+        Write-Host ""
+        Write-Host "[错误] $($pair[0]) 含路径分隔符或协议前缀，只应填纯名称。" -ForegroundColor Red
+        Write-Host "       当前值：$($pair[1])" -ForegroundColor Yellow
+        Write-Host "       控制台镜像地址形如 <域名>/<命名空间>/<仓库名>:<标签>，三段分开填：" -ForegroundColor Yellow
+        Write-Host "         ACR_REGISTRY_HOST  = <域名>" -ForegroundColor Yellow
+        Write-Host "         ACR_NAMESPACE      = <命名空间>" -ForegroundColor Yellow
+        Write-Host "         BACKEND_IMAGE_REPO = <仓库名>" -ForegroundColor Yellow
+        throw "$($pair[0]) 格式错误"
+    }
 }
 
 # ===== 2. 校验 git 工作区干净 + 取完整 sha =====
