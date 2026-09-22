@@ -13,6 +13,8 @@
 #
 # ===== 后端镜像不在服务器构建 =====
 #   构建链路：本地 docker build → docker push 阿里云 ACR → 本脚本负责拉取与重启。
+#   本地构建推送入口：push_image.ps1.example（复制为 push_image.ps1 并填 push.env 后执行），
+#   它负责 amd64 构建、打 latest + <sha> 双标签并推送，与本脚本的标签约定一致。
 #   （.github/workflows/build-backend-image.yml 保留了手动触发的 CI 构建作为兜底，
 #     已不再由 push 自动触发，避免 CI 推的 :latest 覆盖本地推送的镜像。）
 #   原因：2G 内存机器上构建 2GB 级镜像会与运行中的后端容器争抢内存（后端加载

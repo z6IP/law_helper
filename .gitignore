@@ -6,8 +6,12 @@
 # 部署期配置（ACR 地址/命名空间等，服务器本地维护）
 # 注意：上面的 .env.* 通配不匹配 deploy.env，必须单独列出
 deploy.env
+# 本地推送配置（ACR 地址/命名空间等，仅存本机；模板见 push.env.example）
+push.env
 # 索引同步脚本（含真实服务器地址，仅存本机；可入库的模板见 sync_index.ps1.example）
 sync_index.ps1
+# 本地构建推送脚本（仅存本机；可入库的模板见 push_image.ps1.example）
+push_image.ps1
 
 # 证书与私钥（敏感，不入仓库；正式证书仅存放于服务器 /etc/letsencrypt）
 *.pem

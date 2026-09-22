@@ -1,0 +1,224 @@
+<#
+.SYNOPSIS
+    本地构建后端镜像并推送到阿里云容器镜像服务（ACR）。
+
+.DESCRIPTION
+    补齐部署链路的本地一环：本地 docker build → docker push 阿里云 ACR，
+    服务器再通过 deploy.sh 拉取重启（本脚本不触碰服务器）。
+
+    镜像打两个标签：完整 40 位 commit sha + latest。sha 标签用于回滚，
+    latest 用于正式部署。为保证 sha 标签与真实提交一一对应，构建前强制
+    校验 git 工作区干净，脏工作区直接中止。
+
+    生产 ECS 为 linux/amd64，本脚本显式 --platform linux/amd64；同时关闭
+    provenance / SBOM（阿里云 ACR 个人版只收标准镜像清单，不收 attestation
+    索引，详见 .github/workflows/build-backend-image.yml 注释）。国内网络
+    构建传入阿里云镜像源 build-args（Dockerfile 默认官方源是为境外 CI 优化）。
+
+    ACR 凭证不落盘：密码仅通过 docker login 存入 ~/.docker/config.json，
+    本脚本只检测目标 registry 是否已有登录凭证，未登录则提示命令并退出。
+
+    仅使用 Windows 自带的 git / docker，不依赖额外工具。
+
+    使用前：把本文件复制为 push_image.ps1（该文件已被 .gitignore 忽略，仅存本机），
+    并复制 push.env.example 为 push.env 后填写 ACR 地址/命名空间。模板用占位符，
+    故可安全入库。
+
+.PARAMETER PushEnv
+    push.env 配置文件路径，默认脚本同目录下的 push.env。
+
+.PARAMETER RegistryHost
+    覆盖 push.env 中的 ACR_REGISTRY_HOST。
+
+.PARAMETER Namespace
+    覆盖 push.env 中的 ACR_NAMESPACE。
+
+.PARAMETER Repo
+    覆盖 push.env 中的 BACKEND_IMAGE_REPO。
+
+.EXAMPLE
+    .\push_image.ps1
+    构建并推送 latest + <sha> 双标签。
+
+.EXAMPLE
+    .\push_image.ps1 -RegistryHost registry.cn-shanghai.aliyuncs.com -Namespace my-ns
+    覆盖仓库地址与命名空间。
+#>
+[CmdletBinding()]
+param(
+    [string]$PushEnv      = (Join-Path $PSScriptRoot "push.env"),
+    [string]$RegistryHost = "",
+    [string]$Namespace    = "",
+    [string]$Repo         = ""
+)
+
+$ErrorActionPreference = "Stop"
+
+# 纯文本进度输出：exporting 阶段会逐层打印上传进度与体积，
+# 便于区分「正在传输」与「真的卡死」（与 CI 保持一致）。
+$env:BUILDKIT_PROGRESS = "plain"
+
+# ===== 读取 push.env（KEY=VALUE，跳过空行与 # 注释）=====
+function Read-PushEnv([string]$Path) {
+    $map = @{}
+    if (Test-Path $Path) {
+        foreach ($line in Get-Content $Path) {
+            $t = $line.Trim()
+            if ($t -eq "" -or $t.StartsWith("#")) { continue }
+            $idx = $t.IndexOf("=")
+            if ($idx -le 0) { continue }
+            $key = $t.Substring(0, $idx).Trim()
+            $val = $t.Substring($idx + 1).Trim()
+            $map[$key] = $val
+        }
+    }
+    return $map
+}
+
+# ===== 0. 前置检查：命令可用性 =====
+foreach ($cmd in @("docker", "git")) {
+    if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
+        throw "缺少命令 $cmd：请先安装 Docker Desktop 与 git 后重试"
+    }
+}
+# docker daemon 是否在运行
+& docker info *> $null
+if ($LASTEXITCODE -ne 0) {
+    throw "docker 未运行或未登录：请先启动 Docker Desktop"
+}
+
+# ===== 1. 加载配置 =====
+Write-Host "[1/6] 加载本地配置..." -ForegroundColor Cyan
+if (-not (Test-Path $PushEnv)) {
+    Write-Host ""
+    Write-Host "[错误] 缺少 $PushEnv" -ForegroundColor Red
+    Write-Host "请先复制模板并填写：" -ForegroundColor Yellow
+    Write-Host "  Copy-Item push.env.example push.env" -ForegroundColor DarkGray
+    Write-Host "  notepad push.env" -ForegroundColor DarkGray
+    throw "缺少 push.env 配置"
+}
+$cfg = Read-PushEnv $PushEnv
+
+$RegistryHost = if ($RegistryHost) { $RegistryHost } else { $cfg["ACR_REGISTRY_HOST"] }
+$Namespace    = if ($Namespace)    { $Namespace }    else { $cfg["ACR_NAMESPACE"] }
+$Repo         = if ($Repo)         { $Repo }         else { $cfg["BACKEND_IMAGE_REPO"] }
+if (-not $Repo) { $Repo = "law-helper-backend" }
+
+foreach ($pair in @(@("ACR_REGISTRY_HOST", $RegistryHost), @("ACR_NAMESPACE", $Namespace), @("BACKEND_IMAGE_REPO", $Repo))) {
+    if ([string]::IsNullOrWhiteSpace($pair[1])) {
+        throw "配置缺失：$($pair[0]) 未设置（请填写 push.env 或通过参数传入）"
+    }
+}
+
+# ===== 2. 校验 git 工作区干净 + 取完整 sha =====
+Write-Host "[2/6] 校验 git 工作区并获取 commit sha..." -ForegroundColor Cyan
+Push-Location $PSScriptRoot
+try {
+    $dirty = & git status --porcelain
+    if ($LASTEXITCODE -ne 0) { throw "git status 执行失败（exit $LASTEXITCODE）" }
+    if ($dirty) {
+        Write-Host ""
+        Write-Host "[错误] git 工作区有未提交改动，已中止。" -ForegroundColor Red
+        Write-Host "       镜像 sha 标签必须对应真实提交（回滚语义依赖此不变量），" -ForegroundColor Yellow
+        Write-Host "       请先提交或暂存改动： git status" -ForegroundColor DarkGray
+        throw "工作区不干净"
+    }
+    $sha = & git rev-parse HEAD
+    if ($LASTEXITCODE -ne 0) { throw "git rev-parse 执行失败（exit $LASTEXITCODE）" }
+}
+finally {
+    Pop-Location
+}
+if ($sha -notmatch '^[0-9a-f]{40}$') {
+    throw "git rev-parse 返回的不是完整 40 位 sha：$sha"
+}
+
+$ImageBase = "$RegistryHost/$Namespace/$Repo"
+$ShaTag  = "$ImageBase`:$sha"
+$LatestTag = "$ImageBase`:latest"
+Write-Host "目标镜像: $ImageBase" -ForegroundColor DarkGray
+Write-Host "  sha 标签 : $ShaTag" -ForegroundColor DarkGray
+Write-Host "  latest   : $LatestTag" -ForegroundColor DarkGray
+
+# ===== 3. 检测 ACR 登录状态 =====
+Write-Host "[3/6] 检测 ACR 登录状态..." -ForegroundColor Cyan
+$DockerConfig = Join-Path $env:USERPROFILE ".docker\config.json"
+$loggedIn = $false
+if (Test-Path $DockerConfig) {
+    try {
+        $dc = Get-Content $DockerConfig -Raw | ConvertFrom-Json
+        # 两种形态：auths（明文 base64 或空对象）与 credsStore（外部凭据助手）
+        if ($dc.auths -and ($dc.auths.PSObject.Properties.Name -contains $RegistryHost)) {
+            $loggedIn = $true
+        }
+        elseif ($dc.credsStore) {
+            # 有外部凭据助手时，此处无法离线判断具体 registry 是否已登录，
+            # 视为可能已登录，交由后续 push 失败给出明确指引。
+            $loggedIn = $true
+        }
+    }
+    catch {
+        Write-Warning "读取 $DockerConfig 失败，跳过登录预检（后续 push 失败会给出指引）"
+    }
+}
+if (-not $loggedIn) {
+    Write-Host ""
+    Write-Host "[错误] 未检测到 $RegistryHost 的登录凭证。" -ForegroundColor Red
+    Write-Host "请先执行（密码仅存入 ~/.docker/config.json，不落盘到项目）：" -ForegroundColor Yellow
+    Write-Host "  docker login $RegistryHost" -ForegroundColor DarkGray
+    throw "ACR 未登录"
+}
+
+# ===== 4. 构建镜像（linux/amd64，关闭 provenance/sbom，阿里云源）=====
+Write-Host "[4/6] 构建镜像（linux/amd64，国内源）..." -ForegroundColor Cyan
+
+# 检测当前 docker build 是否支持 --provenance / --sbom（较老版本不支持时，
+# 其默认也不产出 attestation 索引，降级为不带这两个参数）。
+$buildHelp = (& docker build --help 2>&1 | Out-String)
+$extraFlags = @()
+if ($buildHelp -match '--provenance') {
+    $extraFlags += "--provenance=false"
+}
+if ($buildHelp -match '--sbom') {
+    $extraFlags += "--sbom=false"
+}
+
+Push-Location $PSScriptRoot
+try {
+    $buildArgs = @(
+        "build",
+        "--platform", "linux/amd64",
+        "--build-arg", "APT_MIRROR=mirrors.aliyun.com",
+        "--build-arg", "APT_SECURITY_MIRROR=mirrors.aliyun.com",
+        "--build-arg", "PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/",
+        "-t", $ShaTag,
+        "-t", $LatestTag,
+        "."
+    ) + $extraFlags
+
+    & docker @buildArgs
+    if ($LASTEXITCODE -ne 0) { throw "docker build 失败（exit $LASTEXITCODE）" }
+}
+finally {
+    Pop-Location
+}
+
+# ===== 5. 推送：先 sha 后 latest =====
+Write-Host "[5/6] 推送 sha 标签..." -ForegroundColor Cyan
+& docker push $ShaTag
+if ($LASTEXITCODE -ne 0) { throw "推送 $ShaTag 失败（exit $LASTEXITCODE）" }
+
+Write-Host "[5/6] 推送 latest 标签..." -ForegroundColor Cyan
+& docker push $LatestTag
+if ($LASTEXITCODE -ne 0) { throw "推送 $LatestTag 失败（exit $LASTEXITCODE）" }
+
+# ===== 6. 输出服务器侧部署提示 =====
+Write-Host "[6/6] 完成。" -ForegroundColor Green
+Write-Host ""
+Write-Host "已推送镜像：" -ForegroundColor Green
+Write-Host "  $ShaTag"
+Write-Host "  $LatestTag"
+Write-Host ""
+Write-Host "服务器部署（deploy.env 已配置的前提下，在服务器 /opt/law_helper 执行）：" -ForegroundColor Yellow
+Write-Host "  bash deploy.sh                     # 部署 latest"
+Write-Host "  IMAGE_TAG=$sha bash deploy.sh      # 部署/回滚到本次构建" -ForegroundColor DarkGray
