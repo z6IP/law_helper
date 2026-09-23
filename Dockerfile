@@ -9,7 +9,7 @@ ARG APT_SECURITY_MIRROR=security.debian.org
 ARG PIP_INDEX_URL=https://pypi.org/simple
 
 # ===== Stage 1: builder（装 Python 依赖）=====
-FROM python:3.11-slim AS builder
+FROM python:3.13-slim AS builder
 
 # ARG 在 FROM 之后需重新声明，才能被本阶段的 RUN 使用
 ARG APT_MIRROR
@@ -40,7 +40,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     find /opt/venv -type f -name '*.pyc' -delete
 
 # ===== Stage 2: runner（运行时镜像）=====
-FROM python:3.11-slim AS runner
+FROM python:3.13-slim AS runner
 
 # 同上：ARG 需在本阶段重新声明
 ARG APT_MIRROR

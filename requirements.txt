@@ -1,32 +1,45 @@
+# Python 版本：3.13（本地 conda 环境 law_helper_env 与 Docker 基础镜像 python:3.13-slim 均为此版本）
 # Web 框架
-fastapi>=0.135.0
-uvicorn[standard]>=0.41.0
-python-multipart>=0.0.9  # FastAPI File/Form 文件上传（main.py chat_upload 使用 UploadFile/File）
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+python-multipart==0.0.32  # FastAPI File/Form 文件上传（main.py chat_upload 使用 UploadFile/File）
 
 # 配置与校验
-pydantic>=2.12.0
-pydantic-settings>=2.13.0
-python-dotenv>=1.2.0
+pydantic==2.13.4
+pydantic-settings==2.15.0
+python-dotenv==1.2.3
 
 # 数值计算（代码直接 import numpy；此前由 chromadb 间接提供，显式声明避免隐式依赖）
-numpy>=1.24
+numpy==2.5.2
 
 # 向量库（1.x 起不再依赖 chroma-hnswlib 编译，兼容 Python 3.13 / Windows）
 chromadb==1.5.5
 
 # 稀疏检索
 rank-bm25==0.2.2
-jieba>=0.42.1
+jieba==0.42.1
 
 # LLM & Embedding & Rerank（阿里云百炼 API）
-openai>=1.50.0
-requests>=2.31.0
-dashscope>=1.13.0  # DashScope 原生 SDK（embedding_backend=dashscope 时使用）
+openai==3.3.1
+requests==2.34.2
+dashscope==1.27.5  # DashScope 原生 SDK（embedding_backend=dashscope 时使用）
 
 # 会话、限流
-starsessions>=2.2.0
-fastapi-throttle>=0.1.8
+starsessions==2.2.1
+fastapi-throttle==0.1.8
 
 # 文档解析
-python-docx>=1.1.2
+python-docx==1.2.0
 pymupdf==1.28.0      # PDF 版面解析（GB 19522-2024 等国家标准）
+
+# ==================== 可选依赖（生产环境默认不安装） ====================
+# 本地 embedding 模式（embedding_backend=local）需要，懒加载于 app/embeddings.py。
+# 会连带安装 torch（约 800MB+）、transformers 等重依赖，Docker 镜像（2GB 内存服务器）
+# 默认不安装。如需本地向量化，手动执行：
+#   pip install sentence-transformers==3.2.1
+# sentence-transformers==3.2.1
+
+# ==================== 开发依赖（生产环境默认不安装） ====================
+# 测试（tests/ 目录使用）：
+#   pip install pytest==9.1.1
+# pytest==9.1.1
