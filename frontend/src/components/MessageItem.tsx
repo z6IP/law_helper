@@ -63,56 +63,160 @@ function renderInline(text: string, keyBase: string): ReactNode[] {
   return out
 }
 
+// 列表项内容片段：para 为延续说明行，sub 为嵌套圆点子项。
+// 用有序数组保存，渲染时才能保持与模型输出一致的先后顺序。
+type ListPart = { kind: 'para' | 'sub'; nodes: ReactNode[] }
+
+// 渲染列表项片段：连续 sub 归并为一个嵌套 <ul>，para 以 <br/> 换行接在项内。
+function renderListParts(parts: ListPart[], keyBase: number): ReactNode[] {
+  const out: ReactNode[] = []
+  let subs: ReactNode[] = []
+  let subCount = 0
+  const flushSubs = () => {
+    if (subs.length === 0) return
+    out.push(<ul key={`${keyBase}-ul${subCount}`}>{subs}</ul>)
+    subs = []
+  }
+  for (const part of parts) {
+    if (part.kind === 'sub') {
+      subs.push(<li key={`${keyBase}-sub${subCount}`}>{part.nodes}</li>)
+      subCount += 1
+      continue
+    }
+    flushSubs()
+    out.push(
+      <Fragment key={`${keyBase}-para${out.length}`}>
+        <br />
+        {part.nodes}
+      </Fragment>,
+    )
+  }
+  flushSubs()
+  return out
+}
+
 function renderMarkdown(src: string): ReactNode[] {
   const lines = src.split('\n')
   const nodes: ReactNode[] = []
-  let listBuf: { text: string; key: number }[] = []
-  let listTag: 'ul' | 'ol' = 'ul'
 
-  const flushList = () => {
-    if (listBuf.length === 0) return
-    const items = listBuf.map((it) => <li key={it.key}>{renderInline(it.text, `li-${it.key}`)}</li>)
-    const Tag = listTag
-    nodes.push(<Tag key={`${listTag}-${listBuf[0].key}`}>{items}</Tag>)
-    listBuf = []
+  const headingRe = /^\s*\*\*([^*]{1,40})\*\*\s*$/
+  const ulRe = /^\s*[-*]\s+(.*)$/
+  const olRe = /^\s*\d+[.、)]\s+(.*)$/
+  const matchItem = (line: string): { tag: 'ul' | 'ol'; text: string } | null => {
+    const ul = ulRe.exec(line)
+    if (ul) return { tag: 'ul', text: ul[1].trim() }
+    const ol = olRe.exec(line)
+    if (ol) return { tag: 'ol', text: ol[1].trim() }
+    return null
+  }
+  const isHeading = (line: string) =>
+    line.startsWith('### ') || line.startsWith('## ') || headingRe.test(line)
+
+  let i = 0
+  while (i < lines.length) {
+    const line = lines[i]
+    const head = matchItem(line)
+
+    if (!head) {
+      if (line.startsWith('### ')) {
+        nodes.push(<h3 key={i}>{renderInline(line.slice(4), `h3-${i}`)}</h3>)
+      } else if (line.startsWith('## ')) {
+        nodes.push(<h2 key={i}>{renderInline(line.slice(3), `h2-${i}`)}</h2>)
+      } else {
+        // 独占一行的 **xxx** 视为小标题（模型常以其代替 ### 作小标题）
+        const bold = headingRe.exec(line)
+        if (bold) {
+          nodes.push(<h3 key={i}>{renderInline(bold[1], `bh-${i}`)}</h3>)
+        } else if (line.trim() !== '') {
+          // 空行：仅作块间分隔，不产出节点
+          nodes.push(<p key={i}>{renderInline(line, `p-${i}`)}</p>)
+        }
+      }
+      i += 1
+      continue
+    }
+
+    // 列表块收集：模型常把「编号. 标题」与其下的说明段落、圆点子项之间插入空行，
+    // 若逐行 flush 会把一个列表切成多个单项列表，浏览器会把每个单项 <ol> 都重新
+    // 编号为 1.。这里以索引循环 + lookahead 把松散列表合并为单个列表：
+    //   - 同标记列表项 → 新条目
+    //   - 异标记列表项（编号项下的圆点子项）→ 并入当前条目的嵌套子列表
+    //   - 空行 / 普通段落 → 向前探测，若最终仍接列表项则并入当前条目，否则结束列表块
+    const tag = head.tag
+    const startKey = i
+    const items: { key: number; text: string; parts: ListPart[] }[] = [
+      { key: i, text: head.text, parts: [] },
+    ]
+    i += 1
+
+    while (i < lines.length) {
+      const cur = lines[i]
+      const curItem = matchItem(cur)
+      if (curItem) {
+        const last = items[items.length - 1]
+        if (curItem.tag === tag) {
+          items.push({ key: i, text: curItem.text, parts: [] })
+        } else {
+          last.parts.push({
+            kind: 'sub',
+            nodes: renderInline(curItem.text, `li-${last.key}-s${last.parts.length}`),
+          })
+        }
+        i += 1
+        continue
+      }
+      // 标题终止列表，列表不跨标题延续
+      if (isHeading(cur)) break
+      // 空行：跳过连续空行后若仍是列表项则继续收集，否则结束列表块
+      if (cur.trim() === '') {
+        let j = i
+        while (j < lines.length && lines[j].trim() === '') j += 1
+        if (j < lines.length && matchItem(lines[j])) {
+          i = j
+          continue
+        }
+        break
+      }
+      // 普通段落：向前探测（跳过段落与空行），若最终仍接列表项则并入当前条目
+      let j = i
+      while (j < lines.length) {
+        const probe = lines[j]
+        if (probe.trim() === '') {
+          j += 1
+          continue
+        }
+        if (isHeading(probe) || matchItem(probe)) break
+        j += 1
+      }
+      if (j < lines.length && matchItem(lines[j])) {
+        const last = items[items.length - 1]
+        for (let k = i; k < j; k += 1) {
+          if (lines[k].trim() !== '') {
+            last.parts.push({
+              kind: 'para',
+              nodes: renderInline(lines[k], `li-${last.key}-p${last.parts.length}`),
+            })
+          }
+        }
+        i = j
+        continue
+      }
+      break
+    }
+
+    const Tag = tag
+    nodes.push(
+      <Tag key={`${tag}-${startKey}`}>
+        {items.map((it) => (
+          <li key={it.key}>
+            {renderInline(it.text, `li-${it.key}`)}
+            {renderListParts(it.parts, it.key)}
+          </li>
+        ))}
+      </Tag>,
+    )
   }
 
-  lines.forEach((line, i) => {
-    if (line.startsWith('### ')) {
-      flushList()
-      nodes.push(<h3 key={i}>{renderInline(line.slice(4), `h3-${i}`)}</h3>)
-      return
-    }
-    if (line.startsWith('## ')) {
-      flushList()
-      nodes.push(<h2 key={i}>{renderInline(line.slice(3), `h2-${i}`)}</h2>)
-      return
-    }
-    // 独占一行的 **xxx** 视为小标题（模型常以其代替 ### 作小标题）
-    const bold = /^\s*\*\*([^*]{1,40})\*\*\s*$/.exec(line)
-    if (bold) {
-      flushList()
-      nodes.push(<h3 key={i}>{renderInline(bold[1], `bh-${i}`)}</h3>)
-      return
-    }
-    const ul = /^\s*[-*]\s+(.*)$/.exec(line)
-    const ol = /^\s*\d+[.、)]\s+(.*)$/.exec(line)
-    if (ul || ol) {
-      const tag: 'ul' | 'ol' = ul ? 'ul' : 'ol'
-      if (listTag !== tag) flushList()
-      listTag = tag
-      listBuf.push({ text: (ul ? ul[1] : ol![1]).trim(), key: i })
-      return
-    }
-    // 空行：仅作块间分隔，不产出节点
-    if (line.trim() === '') {
-      flushList()
-      return
-    }
-    flushList()
-    nodes.push(<p key={i}>{renderInline(line, `p-${i}`)}</p>)
-  })
-  flushList()
   return nodes
 }
 

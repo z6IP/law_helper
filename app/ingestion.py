@@ -244,13 +244,102 @@ _LEAF_RE = re.compile(r"^(\d+)(.*)$")     # 条款号末段，后面可能紧跟
 _PAGENUM_RE = re.compile(r"^[0-9ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ]{1,3}$")
 _PDF_TITLE_LINES = {"车辆驾驶人员血液、呼气酒精含量", "阈值与检验"}
 
+# PDF 文本层偶发的字形映射错乱修复表：部分标准文件 PDF 将 GBK 全角标点区
+# （A3A1~A3BF）的字符错误映射到彝文音节区（如 "，"→"\ua3ac"、"。"→"\ua3ae"、
+# "；"→"\ua3bb"），或将《》映射为 «»，直接入库会让引用法条出现乱码。
+# 表内未覆盖的彝文区字符按 GBK 全角标点区的码点偏移量通用还原。
+_GLYPH_FIX = {
+    "\uA3AE": "。",  # GBK A3AE 在中文语境应为句号（通用还原会得到全角句点）
+    "\u00AB": "《",
+    "\u00BB": "》",
+    "\uFFE3": "—",  # "￣" 实为破折号（多见于发布日期 2019￣05￣30）
+}
+# 目录点线导引行特征：3 个及以上连续省略号 / 全角句点 / 间隔号
+_DOTS_RE = re.compile(r"[….．·]{3,}")
+# 单页点线导引行达到该数量即判定为目录页，整页丢弃
+_TOC_DOT_LINE_MIN = 3
+# 跨页重复短行的剔除阈值（页眉标准号、正文页顶部重复的文档标题等）
+_REPEATED_LINE_MIN = 3
+_REPEATED_LINE_MAX_LEN = 30
+# 纯数字 / 条款号片段行（如 "5."、"1"）：条款号组成部分，不参与重复行剔除
+_NUMBER_ONLY_RE = re.compile(r"^[\d.\s]+$")
+# 条款号内被误插入空格的还原，如 "3. 1" → "3.1"
+_CLAUSE_SPACE_RE = re.compile(r"(\d)\.\s+(?=\d)")
+
+
+def _normalize_pdf_line(line: str) -> str:
+    """归一化 PDF 提取文本：还原错位字形、全角转半角，保证切分与检索质量。
+
+    - 彝文区错位标点（U+A3A1~U+A3BF）还原为全角标点，U+A3AE → 中文句号；
+    - "￣"、"«»" 等错位符号还原；
+    - 全角数字 / 字母转半角（"６０００ｍｍ" → "6000mm"）；
+    - 条款号内点后空格还原（"3. 1" → "3.1"），使条款号正则正常命中。
+    """
+    if not line:
+        return line
+    # 彝文音节区（U+A000~U+A4CF）与 GBK 全角标点错位码点（A3A1~A3BF）区间重叠，
+    # 而彝文是真实文字块。若行内出现 A3 区之外的真实彝文音节且占比过半，判定为
+    # 彝文文本，跳过 A3 区还原以免破坏；纯错位标点行（仅 A3A1~A3BF）不受影响，
+    # 仍按字形错乱处理。
+    yi_only = sum(
+        1
+        for ch in line
+        if 0xA000 <= ord(ch) <= 0xA4CF and not 0xA3A1 <= ord(ch) <= 0xA3BF
+    )
+    if yi_only * 2 >= len(line):
+        return _CLAUSE_SPACE_RE.sub(r"\1.", line)
+    chars = []
+    for ch in line:
+        code = ord(ch)
+        if ch in _GLYPH_FIX:
+            chars.append(_GLYPH_FIX[ch])
+        elif 0xA3B0 <= code <= 0xA3B9:  # 错位的全角数字 ０~９
+            chars.append(chr(0x30 + code - 0xA3B0))
+        elif 0xA3A1 <= code <= 0xA3BF:  # 错位的 GBK 全角标点区
+            chars.append(chr(0xFF00 + (code - 0xA3A0)))
+        elif (
+            0xFF10 <= code <= 0xFF19
+            or 0xFF21 <= code <= 0xFF3A
+            or 0xFF41 <= code <= 0xFF5A
+        ):  # 全角数字 / 字母 → 半角
+            chars.append(chr(code - 0xFEE0))
+        else:
+            chars.append(ch)
+    return _CLAUSE_SPACE_RE.sub(r"\1.", "".join(chars))
+
+
+def _is_dot_leader(line: str) -> bool:
+    """判断是否为纯点线导引行（目录条目间的 "………"）。"""
+    return bool(_DOTS_RE.search(line)) and not _DOTS_RE.sub("", line).strip()
+
+
+def _drop_repeated_lines(rows: list[tuple[str, int]]) -> list[str]:
+    """剔除跨页重复出现的短行（页眉标准号、正文页顶部重复的文档标题等）。
+
+    纯数字 / 纯条款号片段行（如 "5."、"1"）是条款号的组成部分，不参与重复
+    统计，否则会被误删而导致条款切分错乱（如 "5." 在同章各条款前重复出现）。
+    以「出现过的不同页数」而非「总出现次数」判定：页眉 / 页顶标题每页都出现，
+    必然跨页重复；正文合法短行（如独立成行的项号「（一）」）通常只出现在同页
+    或少数页，不会被误删。rows 为 (行文本, 页码) 序列。
+    """
+    pages_by_line: dict[str, set[int]] = {}
+    for text, page in rows:
+        if len(text) <= _REPEATED_LINE_MAX_LEN and not _NUMBER_ONLY_RE.match(text):
+            pages_by_line.setdefault(text, set()).add(page)
+    return [
+        text
+        for text, _ in rows
+        if len(pages_by_line.get(text, ())) < _REPEATED_LINE_MIN
+    ]
+
 
 def _clause_level(no: str) -> int:
     return len(no.split("."))
 
 
 def _clean_table_cell(cell) -> str:
-    return " ".join((cell or "").replace("\n", " ").split())
+    text = " ".join((cell or "").replace("\n", " ").split())
+    return _normalize_pdf_line(text)
 
 
 def _format_table(rows) -> str:
@@ -275,6 +364,12 @@ def _lines_to_events(body_lines: list[str]) -> list[tuple]:
     if start is None:
         return []
     body_lines = body_lines[start:]
+
+    # 「参考文献」是正文之后的附录性内容，截断以免混入条款文本
+    for i, ln in enumerate(body_lines):
+        if ln.strip() == "参考文献":
+            body_lines = body_lines[:i]
+            break
 
     # 还原被换行拆开的条款号片段（"5.\n2.\n1 ..." -> "5.2.1"）
     events: list[tuple] = []
@@ -395,7 +490,11 @@ def _ocr_pdf(pdf_path) -> list[Article]:
             pix = page.get_pixmap(matrix=pymupdf.Matrix(settings.ocr_dpi / 72, settings.ocr_dpi / 72))
             b64 = base64.b64encode(pix.tobytes("png")).decode("utf-8")
             text = llm.ocr_images([b64])
-            all_lines.extend(line.strip() for line in text.splitlines() if line.strip())
+            all_lines.extend(
+                _normalize_pdf_line(line.strip())
+                for line in text.splitlines()
+                if line.strip()
+            )
             event("ingest.ocr_page", source=source, page=page_idx, total=total)
 
         events = _lines_to_events(all_lines)
@@ -425,11 +524,13 @@ def parse_pdf(pdf_path) -> list[Article]:
     except Exception as exc:  # noqa: BLE001
         raise DocumentNotFoundError(f"无法读取文档：{pdf_path}") from exc
 
+    source = _clean_source_name(pdf_path)
     with doc:
         # 1) 逐页提取：版面文本行（过滤页眉/页脚/重复标题/表格单元格）+ 表格
-        body_lines: list[str] = []
+        # body_rows 保留 (行文本, 页码)，供跨页重复行剔除按页维度统计
+        body_rows: list[tuple[str, int]] = []
         tables: list[str] = []
-        for page in doc:
+        for page_no, page in enumerate(doc, 1):
             page_h = page.rect.height
             table_rects = []
             page_tables = []
@@ -449,7 +550,10 @@ def parse_pdf(pdf_path) -> list[Article]:
                     continue
                 for line in block["lines"]:
                     bbox = pymupdf.Rect(line["bbox"])
-                    text = "".join(s["text"] for s in line["spans"]).strip()
+                    # 归一化修复文本层错位字形，避免乱码随条款入库
+                    text = _normalize_pdf_line(
+                        "".join(s["text"] for s in line["spans"]).strip()
+                    )
                     if not text:
                         continue
                     if "GB19522" in text:  # 页眉/页脚标准号
@@ -465,6 +569,7 @@ def parse_pdf(pdf_path) -> list[Article]:
             # 版面是「条款号左槽 + 正文右缩进」，编号相对正文块垂直居中而导致 y 错位
             # （如左槽号 y=403、正文首行 y=401）。按 y 邻近归组成同一视觉行、组内按 x
             # 排序，才能还原「编号在前、正文在后」的阅读序。
+            page_rows: list[str] = []
             y_tol = 5.0
             row_buf: list[tuple[float, str]] = []
             row_y: float | None = None
@@ -474,13 +579,34 @@ def parse_pdf(pdf_path) -> list[Article]:
                     if row_y is None:
                         row_y = y
                 else:
-                    body_lines.extend(t for _, t in sorted(row_buf, key=lambda p: p[0]))
+                    page_rows.extend(t for _, t in sorted(row_buf, key=lambda p: p[0]))
                     row_buf = [(x, t)]
                     row_y = y
             if row_buf:
-                body_lines.extend(t for _, t in sorted(row_buf, key=lambda p: p[0]))
+                page_rows.extend(t for _, t in sorted(row_buf, key=lambda p: p[0]))
 
-        source = _clean_source_name(pdf_path)
+            # 目录页识别：整页充斥「标题………页码」点线导引行。目录条目形如
+            # 「1 范围」会被章标题正则误判，产生"………/1"垃圾条款，故整页丢弃。
+            # 加占比条件（点线行须过半）：正文页偶现几行长省略号（引用省略）时
+            # 不满足过半条件，避免整页正文被静默丢弃。
+            dot_lines = sum(1 for t in page_rows if _DOTS_RE.search(t))
+            if (
+                dot_lines >= _TOC_DOT_LINE_MIN
+                and dot_lines * 2 >= max(len(page_rows), 1)
+            ):
+                event(
+                    "ingest.pdf_skip_toc_page",
+                    source=source,
+                    page=page_no,
+                    lines=len(page_rows),
+                )
+                continue
+            body_rows.extend(
+                (t, page_no) for t in page_rows if not _is_dot_leader(t)
+            )
+
+        # 页眉标准号 / 正文页顶部重复标题等跨页短行剔除
+        body_lines = _drop_repeated_lines(body_rows)
         events = _lines_to_events(body_lines)
         if not events:
             return _ocr_pdf(pdf_path)  # 无文本层 → OCR 兜底
@@ -526,7 +652,8 @@ MANIFEST_FILENAME = "ingestion_manifest.db"
 # v4: 切换嵌入模型 qwen3.7-text-embedding(1024维) → BGE-base-zh-v1.5(768维)
 # v6: 增加法条父块/款项子块 metadata
 # v7: 子款继承父条处罚上下文 penalty_context
-METADATA_SCHEMA_VERSION = 7
+# v8: PDF 文本归一化（乱码字形还原 / 全角转半角）+ 目录页与重复行过滤
+METADATA_SCHEMA_VERSION = 8
 
 
 # file_hash 不设 UNIQUE：允许同一文档内容出现在多个分类子文件夹（不同 source）。
@@ -704,9 +831,24 @@ def _ingest_single_file(
             meta["role"] = _classify_role(meta)
         ids = _make_unique_ids(articles, source)
         embeddings = embedding_model.embed_documents(documents)
+        # 解析规则变化后条号集合可能改变（如目录垃圾条目被过滤、条款切分变细），
+        # 仅 upsert 会残留已不存在的旧 chunk（旧文本仍可被检索到），此处显式清除。
+        # 先 upsert 后 delete：upsert 失败时旧 chunk 完整保留可检索；delete 失败仅
+        # 残留 stale，幂等重跑可再清，两个失败方向都不会丢数据。
         collection.upsert(
             ids=ids, documents=documents, metadatas=metadatas, embeddings=embeddings
         )
+        new_ids = set(ids)
+        stale_ids = [
+            chunk_id
+            for chunk_id in collection.get(where={"source": source}, include=[]).get(
+                "ids", []
+            )
+            if chunk_id not in new_ids
+        ]
+        if stale_ids:
+            collection.delete(ids=stale_ids)
+            event("ingest.purge_stale", source=source, count=len(stale_ids))
     return source, len(articles)
 
 

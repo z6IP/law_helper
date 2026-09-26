@@ -272,22 +272,24 @@ class EmbeddingModel:
     ):
         """构造 DashScope embedding 请求。
 
-        - 视觉模型（模型名含 "vl"，如 qwen3-vl-embedding）走 MultiModalEmbedding，
-          输入按 contents 格式传入文本；
+        - 视觉模型（模型名含 "vl"，如 qwen3-vl-embedding）走 MultiModalEmbedding：
+          该 SDK 接口的 input 即 HTTP 的 input.contents，必须是元素列表
+          （[{"text": ...}] / [{"image": ...}]），不可再套一层 "contents" 字典；
+          其默认输出 2560 维，必须显式传 dimension 才能与配置维度一致。
         - 文本模型走 TextEmbedding，支持 dimension 参数。
         """
         if is_vl:
+            # embedding_dimensions 为必填 int（config.py 无默认值），直接传入
             return dashscope.MultiModalEmbedding.call(
                 model=settings.embedding_model_id,
-                input={"contents": [{"text": t} for t in texts]},
+                input=[{"text": text} for text in texts],
+                dimension=settings.embedding_dimensions,
             )
-        kwargs = {
-            "model": settings.embedding_model_id,
-            "input": texts,
-        }
-        if settings.embedding_dimensions:
-            kwargs["dimension"] = settings.embedding_dimensions
-        return dashscope.TextEmbedding.call(**kwargs)
+        return dashscope.TextEmbedding.call(
+            model=settings.embedding_model_id,
+            input=texts,
+            dimension=settings.embedding_dimensions,
+        )
 
     @staticmethod
     def _extract_dashscope_embeddings(resp, is_vl: bool) -> list[list[float]]:

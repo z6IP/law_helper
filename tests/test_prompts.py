@@ -88,11 +88,14 @@ def test_legal_prompt_defaults_to_concise_visible_answer(monkeypatch):
 
     prompt = prompt_loader.render_prompt("legal_system", law_list="《测试法规》")
 
-    assert "结论只写 2-3 句话" in prompt
-    assert "不能为了简短而省略解释" in prompt
+    assert "结论是对分析内容的简洁总结" in prompt
+    assert "涉及的法条依据必须清楚" in prompt
+    assert "不得在最终回答中单独成段点名复述" in prompt
+    assert "必须在“结论”部分同时点明" not in prompt
+    assert "编号必须连续递增" in prompt
     assert "建议是回答中最重要的部分" in prompt
-    assert "必须按以下三个分类输出" in prompt
-    assert "## 分析" in prompt
+    assert "必须按以下两个分类输出" in prompt
+    assert "## 分析" not in prompt
     assert "## 结论" in prompt
     assert "## 建议" in prompt
     assert "分类标题必须独占一行" in prompt
